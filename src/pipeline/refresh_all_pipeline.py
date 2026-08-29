@@ -18,6 +18,7 @@ from src.participation_store import load_participations
 from src.pipeline.classify_step import ClassifyOutcome, classify_new_link
 from src.pipeline.status_step import apply_initial_status
 from src.sources.common import CheckResult, normalize_activity_id
+from src.dead_links import is_http_not_found
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -69,6 +70,7 @@ def run_new_links_pipeline(
 ) -> PipelineResult:
     """Step 2～5：仅处理新链接（内存流转，末步落库）。"""
     dynamic_ids = _dedupe_new_dynamic_ids(raw_urls)
+
     if not dynamic_ids:
         return PipelineResult(
             ok=True,
@@ -93,15 +95,47 @@ def run_new_links_pipeline(
 
     with BilibiliClient() as shared_client:
         done = 0
+
         for dynamic_id in dynamic_ids:
-            outcome = classify_new_link(shared_client, dynamic_id)
+            try:
+                outcome = classify_new_link(shared_client, dynamic_id)
+
+            except Exception as exc:
+                # 明确的 404 / Not Found：
+                # 当前动态已经删除或不可访问，只跳过这一条。
+                if is_http_not_found(exc):
+                    reason = "链接失效"
+
+                # 动态没有被 API 明确判定删除，
+                # 但所有正文抓取路径都失败。
+                elif (
+                    isinstance(exc, RuntimeError)
+                    and str(exc).startswith("无法获取动态正文:")
+                ):
+                    reason = "正文不可读取"
+
+                # 其他异常不能吞掉
+                else:
+                    raise
+
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                done += 1
+
+                if on_progress:
+                    on_progress(done, total, f"跳过 {dynamic_id}：{reason}")
+
+                continue
+
             done += 1
+
             if outcome.skipped:
                 reason = outcome.skip_reason or "skipped"
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
             elif outcome.lottery_type in ("互动抽奖", "预约抽奖", "转发抽奖"):
                 tasks.append((outcome.dynamic_id, outcome.lottery_type))
                 classify_outcome_by_id[outcome.dynamic_id] = outcome
+
             if on_progress:
                 on_progress(done, total, "分类进度")
 
@@ -157,29 +191,47 @@ def run_new_links_pipeline(
                 ): did
                 for did, lt in tasks
             }
+
             done = 0
+
             for future in as_completed(futures):
                 try:
                     activity = future.result()
+
                 except EnrichSkippedError:
-                    skip_reasons[ENRICH_SKIP_REASON] = skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
+                    skip_reasons[ENRICH_SKIP_REASON] = (
+                        skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
+                    )
                     done += 1
+
                     if on_progress:
                         on_progress(done, enrich_total, "详情进度")
+
                     continue
+
                 except RuntimeError as exc:
                     if is_enrich_detail_skip_error(exc):
-                        skip_reasons[ENRICH_SKIP_REASON] = skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
+                        skip_reasons[ENRICH_SKIP_REASON] = (
+                            skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
+                        )
                         done += 1
+
                         if on_progress:
                             on_progress(done, enrich_total, "详情进度")
+
                         continue
+
                     raise
+
                 if activity.skipped:
-                    raise RuntimeError(f"活动 {activity.dynamic_id} 不应为 skipped")
+                    raise RuntimeError(
+                        f"活动 {activity.dynamic_id} 不应为 skipped"
+                    )
+
                 row = apply_initial_status(activity.to_dict())
                 enriched_rows.append(row)
                 done += 1
+
                 if on_progress:
                     on_progress(done, enrich_total, "详情进度")
 
@@ -187,6 +239,7 @@ def run_new_links_pipeline(
         on_progress(0, len(enriched_rows), "正在写入活动库…")
 
     persisted = append_activities(enriched_rows)
+
     if on_progress and enriched_rows:
         on_progress(
             persisted,
