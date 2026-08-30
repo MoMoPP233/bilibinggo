@@ -10,6 +10,7 @@ from typing import Any
 
 from starlette.responses import StreamingResponse
 
+from src.restart_control import restart_control
 from web.event_hub import EventHub, HubEvent, Subscriber, event_hub
 
 HEARTBEAT_INTERVAL_SEC = 15.0
@@ -55,7 +56,7 @@ def iter_sse_frames(
             frame = _trim_auto_logs(auto_snapshot)
             frame.setdefault("ts", int(time.time()))
             yield format_sse("auto.snapshot", frame, event_id=frame.get("seq"))
-        while True:
+        while not restart_control.is_restart_pending():
             if sub.closed:
                 break
             now = time.monotonic()

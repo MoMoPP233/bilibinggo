@@ -89,6 +89,8 @@ def test_active_profile_persists_but_database_switch_waits_for_restart_and_switc
     assert data_paths.get_runtime_profile_id() == "account-1"
 
     account_1_database = _write_database_marker("only-account-1")
+    account_1_cookie = data_paths.get_cookie_path()
+    account_1_cookie.write_text("SESSDATA=only-account-1\n", encoding="utf-8")
     selected = profile_manager.set_active_profile("account-2")
     assert selected["profile_id"] == "account-2"
     assert json.loads(
@@ -101,9 +103,14 @@ def test_active_profile_persists_but_database_switch_waits_for_restart_and_switc
     _restart_profile_runtime()
     assert data_paths.get_runtime_profile_id() == "account-2"
     account_2_database = _write_database_marker("only-account-2")
+    account_2_cookie = data_paths.get_cookie_path()
+    account_2_cookie.write_text("SESSDATA=only-account-2\n", encoding="utf-8")
     assert account_2_database != account_1_database
+    assert account_2_cookie != account_1_cookie
     assert _read_database_markers(account_1_database) == ["only-account-1"]
     assert _read_database_markers(account_2_database) == ["only-account-2"]
+    assert account_1_cookie.read_text(encoding="utf-8") == "SESSDATA=only-account-1\n"
+    assert account_2_cookie.read_text(encoding="utf-8") == "SESSDATA=only-account-2\n"
 
     profile_manager.set_active_profile("account-1")
     assert data_paths.get_selected_profile_id() == "account-1"
@@ -115,6 +122,9 @@ def test_active_profile_persists_but_database_switch_waits_for_restart_and_switc
     assert db_path() == account_1_database
     assert _read_database_markers(db_path()) == ["only-account-1"]
     assert _read_database_markers(account_2_database) == ["only-account-2"]
+    assert data_paths.get_cookie_path() == account_1_cookie
+    assert account_1_cookie.read_text(encoding="utf-8") == "SESSDATA=only-account-1\n"
+    assert account_2_cookie.read_text(encoding="utf-8") == "SESSDATA=only-account-2\n"
 
 
 def test_profile_metadata_and_delete_guards(profile_data_root: Path) -> None:

@@ -2,6 +2,7 @@ import { fetchJSON } from "../api/client";
 import { state } from "../state";
 import { openAppConfirm } from "../shell/confirm";
 import { showToast } from "../shell/toast";
+import { setButtonLoading } from "../utils/motion";
 import { escapeHtml, sanitizeUserText } from "../utils/text";
 
 type Profile = {
@@ -23,6 +24,19 @@ type JobSnapshot = {
   state?: string;
 } | null | undefined;
 
+type RestartWaitOptions = {
+  timeoutMs?: number;
+  intervalMs?: number;
+  probe?: () => Promise<ProfilesPayload>;
+  sleep?: (milliseconds: number) => Promise<void>;
+  now?: () => number;
+  reload?: () => void;
+};
+
+const PROFILE_RESTART_TIMEOUT_MS = 60000;
+const PROFILE_RESTART_POLL_INTERVAL_MS = 650;
+const PROFILE_RESTART_PROBE_TIMEOUT_MS = 2000;
+
 const profileCreate = document.getElementById("profile-create") as HTMLButtonElement | null;
 const profileCurrent = document.getElementById("profile-current");
 const profileList = document.getElementById("profile-list");
@@ -30,6 +44,55 @@ const profileRestartNotice = document.getElementById("profile-restart-notice");
 
 let currentPayload: ProfilesPayload | null = null;
 let mutating = false;
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function showRestartNotice(message: string): void {
+  if (!profileRestartNotice) return;
+  profileRestartNotice.textContent = message;
+  profileRestartNotice.hidden = false;
+}
+
+export async function waitForProfileRestart(
+  profileId: string,
+  options: RestartWaitOptions = {},
+): Promise<ProfilesPayload> {
+  const timeoutMs = options.timeoutMs ?? PROFILE_RESTART_TIMEOUT_MS;
+  const intervalMs = options.intervalMs ?? PROFILE_RESTART_POLL_INTERVAL_MS;
+  const probe =
+    options.probe ??
+    (() =>
+      fetchJSON<ProfilesPayload>("/api/profiles", {
+        timeoutMs: PROFILE_RESTART_PROBE_TIMEOUT_MS,
+      }));
+  const wait = options.sleep ?? sleep;
+  const now = options.now ?? Date.now;
+  const reload = options.reload ?? (() => window.location.reload());
+  const startedAt = now();
+
+  while (now() - startedAt < timeoutMs) {
+    try {
+      const payload = await probe();
+      if (
+        payload.runtime_profile_id === profileId &&
+        payload.active_profile_id === profileId
+      ) {
+        reload();
+        return payload;
+      }
+    } catch {
+      // 旧进程退出、新进程绑定端口期间的连接失败属于预期状态。
+    }
+
+    const remainingMs = timeoutMs - (now() - startedAt);
+    if (remainingMs <= 0) break;
+    await wait(Math.min(intervalMs, remainingMs));
+  }
+
+  throw new Error("Binggo 自动重新启动超时，请手动重新启动后刷新页面。");
+}
 
 function errorMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
@@ -72,6 +135,12 @@ function renderProfiles(payload: ProfilesPayload): void {
       const isRuntime = profile.profile_id === payload.runtime_profile_id;
       const isActive = profile.profile_id === payload.active_profile_id;
       const deleteDisabled = isRuntime || isActive;
+      const switchDisabled = isRuntime && isActive;
+      const switchLabel = switchDisabled
+        ? "已选择"
+        : isActive
+          ? "重启生效"
+          : "切换账号";
       const badges = [
         isRuntime ? '<span class="profile-badge is-runtime">当前运行</span>' : "",
         isActive && !isRuntime
@@ -88,7 +157,7 @@ function renderProfiles(payload: ProfilesPayload): void {
             <p>${escapeHtml(profile.profile_id)} · MID ${escapeHtml(profile.mid || "—")}</p>
           </div>
           <div class="profile-row-actions">
-            <button type="button" class="btn btn-secondary btn-compact btn-pill" data-profile-activate="${escapeHtml(profile.profile_id)}" ${isActive ? "disabled" : ""}>${isActive ? "已选择" : "切换账号"}</button>
+            <button type="button" class="btn btn-secondary btn-compact btn-pill" data-profile-activate="${escapeHtml(profile.profile_id)}" ${switchDisabled ? "disabled" : ""}>${switchLabel}</button>
             <button type="button" class="btn btn-ghost btn-compact btn-pill profile-delete" data-profile-delete="${escapeHtml(profile.profile_id)}" ${deleteDisabled ? "disabled" : ""}>删除</button>
           </div>
         </div>`;
@@ -126,32 +195,45 @@ async function createProfile(): Promise<void> {
   }
 }
 
-async function activateProfile(profileId: string): Promise<void> {
+async function activateProfile(
+  profileId: string,
+  button: HTMLButtonElement | null,
+): Promise<void> {
   const profile = currentPayload?.profiles.find((item) => item.profile_id === profileId);
   if (!profile || mutating) return;
-  const confirmed = await openAppConfirm({
-    eyebrow: "账号 Profile",
-    title: `切换到 ${displayName(profile)}？`,
-    desc: "本次只修改下次启动使用的账号；当前数据库和 Cookie 会保持不变。",
-    confirmLabel: "切换账号",
-    cancelLabel: "取消",
-  });
-  if (!confirmed) return;
-
   mutating = true;
+  let restartRequested = false;
+  let restartReady = false;
   try {
-    await fetchJSON(`/api/profiles/${encodeURIComponent(profileId)}/activate`, {
+    const confirmed = await openAppConfirm({
+      eyebrow: "账号 Profile",
+      title: `确定切换到 ${displayName(profile)} 吗？`,
+      desc: "Binggo 将自动重新启动。当前正在运行的账号将安全退出，重启后加载目标账号的数据与登录状态。",
+      confirmLabel: "切换并重启",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) return;
+
+    setButtonLoading(button, true, { label: "正在切换..." });
+    await fetchJSON(`/api/profiles/${encodeURIComponent(profileId)}/switch`, {
       method: "POST",
     });
-    const payload = await loadProfiles();
-    showToast(
-      payload.restart_required ? "账号配置已切换，请重新启动 Binggo 后生效。" : "已恢复当前运行账号",
-      "success",
-    );
+    restartRequested = true;
+    showRestartNotice("正在切换账号并重新启动 Binggo...");
+    await waitForProfileRestart(profileId);
+    restartReady = true;
   } catch (error) {
+    if (restartRequested) {
+      showRestartNotice(
+        "自动切换未完成。若 Binggo 未自动恢复，请手动重新启动后刷新页面。",
+      );
+    }
     showToast(errorMessage(error), "error");
   } finally {
-    mutating = false;
+    if (!restartReady) {
+      mutating = false;
+      setButtonLoading(button, false);
+    }
   }
 }
 
@@ -191,7 +273,7 @@ export function bindProfiles(): void {
     if (!(target instanceof HTMLButtonElement) || target.disabled) return;
     const activateId = target.dataset.profileActivate;
     const deleteId = target.dataset.profileDelete;
-    if (activateId) activateProfile(activateId).catch(() => undefined);
+    if (activateId) activateProfile(activateId, target).catch(() => undefined);
     if (deleteId) deleteProfile(deleteId).catch(() => undefined);
   });
 }

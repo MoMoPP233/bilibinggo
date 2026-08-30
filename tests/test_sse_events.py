@@ -43,6 +43,20 @@ def test_iter_sse_frames_emits_snapshots_then_events() -> None:
     frames.close()
 
 
+def test_iter_sse_frames_closes_when_restart_is_pending() -> None:
+    hub = event_hub
+    hub.reset_for_tests()
+    frames = iter_sse_frames(
+        hub=hub,
+        job_snapshot={"id": 1, "state": "idle"},
+        heartbeat_interval_sec=3600,
+    )
+    assert "event: job.snapshot" in next(frames).decode("utf-8")
+
+    with patch("web.sse.restart_control.is_restart_pending", return_value=True):
+        assert list(frames) == []
+
+
 def test_api_events_content_type() -> None:
     event_hub.reset_for_tests()
     client = TestClient(app)

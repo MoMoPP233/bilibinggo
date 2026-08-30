@@ -21,6 +21,7 @@ from src.job_store import (
 )
 from src.log_context import job_log_context
 from src.log_span import log_event
+from src.restart_control import RestartPendingError, restart_control
 from web.actions import run_action
 from web.event_hub import event_hub
 from web.user_messages import JOB_ACTION_LABELS, friendly_error, sanitize_log
@@ -211,22 +212,29 @@ class JobRunner:
         now = int(time.time())
         source_s = str(source or "ui")
 
-        with self._lock:
-            if self._status.state == "running":
-                return None
-            previous = _copy_status(self._status)
-            self._cancel_event = threading.Event()
-            self._last_db_flush_at = 0.0
-            # 先占槽再写库，避免持锁做 IO；id 稍后回填
-            self._status = JobStatus(
-                id=None,
-                state="running",
-                action=action,
-                label=label,
-                source=source_s,
-                started_at=now,
-                message="任务已启动…",
-            )
+        try:
+            # 与 Profile restart transition 共用同一把 gate。只有在 gate 内
+            # 把 runner 槽位标为 running 后才释放，消除「已检查空闲但新 Job
+            # 随即启动」的 TOCTOU 窗口。
+            with restart_control.new_work_guard():
+                with self._lock:
+                    if self._status.state == "running":
+                        return None
+                    previous = _copy_status(self._status)
+                    self._cancel_event = threading.Event()
+                    self._last_db_flush_at = 0.0
+                    # 先占槽再写库，避免持锁做 IO；id 稍后回填
+                    self._status = JobStatus(
+                        id=None,
+                        state="running",
+                        action=action,
+                        label=label,
+                        source=source_s,
+                        started_at=now,
+                        message="任务已启动…",
+                    )
+        except RestartPendingError:
+            return None
 
         try:
             job_id = insert_running_job(

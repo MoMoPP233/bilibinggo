@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from src.app_logging import get_logger
+from src.restart_control import restart_control
 from web.auto_config import (
     ACTION_LABELS,
     ALLOWED_CLICK_ACTIONS,
@@ -135,21 +136,28 @@ class AutoScheduler:
             return self._status.to_dict()
 
     def start(self) -> dict[str, Any]:
-        with self._lock:
-            if self._thread and self._thread.is_alive() and self._status.state == "running":
-                raise RuntimeError("调度器已在运行")
-            if self._status.state == "fatal":
+        # 在 restart gate 内先把调度器状态变为 running；Profile 切换随后
+        # 取得同一 gate 时一定能看到该状态，不能在 idle 检查后抢跑。
+        with restart_control.new_work_guard():
+            with self._lock:
+                if self._thread and self._thread.is_alive() and self._status.state == "running":
+                    raise RuntimeError("调度器已在运行")
+                if self._status.state == "fatal":
+                    self._status.fatal_error = None
+                self._stop_event.clear()
+                self._status.state = "running"
+                self._status.message = "调度器运行中"
+                self._status.started_at = _now_iso()
+                self._status.stopped_at = None
                 self._status.fatal_error = None
-            self._stop_event.clear()
-            self._status.state = "running"
-            self._status.message = "调度器运行中"
-            self._status.started_at = _now_iso()
-            self._status.stopped_at = None
-            self._status.fatal_error = None
-            self._status.current_phase = "等待下一刻度"
-            self._status.refresh_pipeline = _idle_pipeline()
-            self._thread = threading.Thread(target=self._loop, name="binggo-auto-scheduler", daemon=True)
-            self._thread.start()
+                self._status.current_phase = "等待下一刻度"
+                self._status.refresh_pipeline = _idle_pipeline()
+                self._thread = threading.Thread(
+                    target=self._loop,
+                    name="binggo-auto-scheduler",
+                    daemon=True,
+                )
+                self._thread.start()
         self._log("info", "调度器已启动（仅点击 4 个按钮，不干涉抽奖程序其它功能）")
         self._schedule_auto_snapshot(force=True)
         return self.get_status()

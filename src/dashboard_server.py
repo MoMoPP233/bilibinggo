@@ -7,6 +7,7 @@ import os
 import sys
 
 from src.app_paths import is_frozen
+from src.restart_control import restart_control
 
 DASHBOARD_HOST = "127.0.0.1"
 DEV_DASHBOARD_PORT = 8787
@@ -43,17 +44,31 @@ def _ensure_stdio() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
-def run_dashboard_server(*, log_level: str = "info") -> None:
+def run_dashboard_server(*, log_level: str = "info") -> bool:
+    """Run Uvicorn and report whether the supervisor should restart it.
+
+    ``restart_control.request_restart`` flips ``Server.should_exit`` only after
+    FastAPI has sent the successful switch response.  Uvicorn then performs its
+    normal graceful shutdown before this function returns ``True``.
+    """
+
     import uvicorn
 
     assert_loopback_host(DASHBOARD_HOST)
     _ensure_stdio()
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    uvicorn.run(
+    config = uvicorn.Config(
         "web.app:app",
         host=DASHBOARD_HOST,
         port=get_dashboard_port(),
         reload=False,
         log_level=log_level,
     )
+    server = uvicorn.Server(config)
+    restart_control.register_server(server)
+    try:
+        server.run()
+    finally:
+        restart_requested = restart_control.finish_server(server)
+    return restart_requested

@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import BackgroundTasks, FastAPI, Query
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,11 @@ from src.llm_settings import (
 from src.sources.common import is_valid_dynamic_id, load_previous_output
 from src.state_store import get_watch_last_synced_at
 from src.profile_manager import create_profile, delete_profile, list_profiles, set_active_profile
+from src.restart_control import (
+    RestartPendingError,
+    RestartUnavailableError,
+    restart_control,
+)
 from src.user_settings import (
     DEFAULT_PARTICIPATE_FALLBACK_TEXT,
     DEFAULT_PARTICIPATE_TEXT,
@@ -196,13 +201,24 @@ def api_account() -> dict[str, Any]:
     return get_account_profile()
 
 
-def _require_profile_operations_idle() -> None:
+def _require_profile_operations_idle(*, switching: bool = False) -> None:
     auto_running = auto_scheduler.get_status().get("state") == "running"
     if runner.is_running() or auto_running:
+        if switching:
+            message = "当前有任务正在运行，请等待任务结束后再切换账号。"
+        else:
+            message = "任务或自动调度正在运行，暂时不能切换或删除账号 Profile"
         raise AppError(
             ErrorCode.JOB_BUSY,
-            "任务或自动调度正在运行，暂时不能切换或删除账号 Profile",
+            message,
         )
+
+
+def _raise_restart_pending() -> None:
+    raise AppError(
+        ErrorCode.JOB_BUSY,
+        "Binggo 正在切换账号并重新启动，请稍候。",
+    )
 
 
 def _raise_profile_value_error(exc: ValueError) -> None:
@@ -227,7 +243,10 @@ def api_profiles() -> dict[str, Any]:
 @app.post("/api/profiles", tags=["stable"])
 def api_create_profile() -> dict[str, Any]:
     try:
-        profile = create_profile()
+        with restart_control.new_work_guard():
+            profile = create_profile()
+    except RestartPendingError:
+        _raise_restart_pending()
     except OSError as exc:
         raise AppError(ErrorCode.INTERNAL, f"创建账号 Profile 失败：{exc}") from exc
     return {"ok": True, "profile": profile}
@@ -235,9 +254,12 @@ def api_create_profile() -> dict[str, Any]:
 
 @app.post("/api/profiles/{profile_id}/activate", tags=["stable"])
 def api_activate_profile(profile_id: str) -> dict[str, Any]:
-    _require_profile_operations_idle()
     try:
-        profile = set_active_profile(profile_id)
+        with restart_control.new_work_guard():
+            _require_profile_operations_idle()
+            profile = set_active_profile(profile_id)
+    except RestartPendingError:
+        _raise_restart_pending()
     except ValueError as exc:
         _raise_profile_value_error(exc)
     except OSError as exc:
@@ -249,11 +271,68 @@ def api_activate_profile(profile_id: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/profiles/{profile_id}/switch", tags=["stable"])
+def api_switch_profile(profile_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """Persist the target Profile, then gracefully stop for supervisor respawn."""
+
+    runtime_profile_id = get_runtime_profile_id()
+
+    # Restoring the already-running Profile only clears an older pending manual
+    # selection.  There is no reason to bounce the process in that case.
+    if profile_id == runtime_profile_id:
+        try:
+            with restart_control.new_work_guard():
+                _require_profile_operations_idle(switching=True)
+                profile = set_active_profile(profile_id)
+        except RestartPendingError:
+            _raise_restart_pending()
+        except ValueError as exc:
+            _raise_profile_value_error(exc)
+        except OSError as exc:
+            raise AppError(ErrorCode.INTERNAL, f"切换账号 Profile 失败：{exc}") from exc
+        return {
+            "ok": True,
+            "profile": profile,
+            "runtime_profile_id": runtime_profile_id,
+            "active_profile_id": get_selected_profile_id(),
+            "restart_requested": False,
+        }
+
+    def transition() -> dict[str, str]:
+        _require_profile_operations_idle(switching=True)
+        return set_active_profile(profile_id)
+
+    try:
+        profile = restart_control.begin_restart(transition)
+    except RestartPendingError:
+        _raise_restart_pending()
+    except RestartUnavailableError as exc:
+        raise AppError(ErrorCode.INTERNAL, str(exc), status_code=503) from exc
+    except ValueError as exc:
+        _raise_profile_value_error(exc)
+    except OSError as exc:
+        raise AppError(ErrorCode.INTERNAL, f"切换账号 Profile 失败：{exc}") from exc
+
+    # Starlette executes response background tasks after sending the response
+    # body.  Only then tell Uvicorn to enter its normal graceful shutdown path.
+    background_tasks.add_task(restart_control.request_restart)
+    return {
+        "ok": True,
+        "profile": profile,
+        "runtime_profile_id": runtime_profile_id,
+        "active_profile_id": get_selected_profile_id(),
+        "restart_requested": True,
+    }
+
+
 @app.delete("/api/profiles/{profile_id}", tags=["stable"])
 def api_delete_profile(profile_id: str) -> dict[str, bool]:
-    _require_profile_operations_idle()
     try:
-        delete_profile(profile_id)
+        with restart_control.new_work_guard():
+            _require_profile_operations_idle()
+            delete_profile(profile_id)
+    except RestartPendingError:
+        _raise_restart_pending()
     except ValueError as exc:
         _raise_profile_value_error(exc)
     except OSError as exc:
@@ -353,6 +432,8 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
         if not is_valid_dynamic_id(dynamic_id):
             raise AppError(ErrorCode.VALIDATION_ERROR, "活动 ID 无效")
     if runner.try_start(request.action, params, source="ui") is None:
+        if restart_control.is_restart_pending():
+            _raise_restart_pending()
         raise AppError(ErrorCode.JOB_BUSY, "已有任务正在运行")
     return {"ok": True, "job": runner.get_status().to_dict()}
 
@@ -452,6 +533,8 @@ def api_auto_status() -> dict[str, Any]:
 def api_auto_start() -> dict[str, Any]:
     try:
         return auto_scheduler.start()
+    except RestartPendingError:
+        _raise_restart_pending()
     except RuntimeError as exc:
         text = str(exc)
         if "已在运行" in text:

@@ -5,11 +5,32 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from src.restart_control import RESTART_SUPERVISED_ENV, restart_control
 from web.api_contract import API_CONTRACT_HEADER, API_CONTRACT_VERSION
 from web.app import app
 
 
 client = TestClient(app)
+
+
+class _FakeServer:
+    def __init__(self) -> None:
+        self.should_exit = False
+
+
+@pytest.fixture(autouse=True)
+def _reset_restart_state(monkeypatch: pytest.MonkeyPatch):
+    restart_control.reset_for_tests()
+    monkeypatch.delenv(RESTART_SUPERVISED_ENV, raising=False)
+    yield
+    restart_control.reset_for_tests()
+
+
+def _enable_supervised_restart(monkeypatch: pytest.MonkeyPatch) -> _FakeServer:
+    server = _FakeServer()
+    monkeypatch.setenv(RESTART_SUPERVISED_ENV, "1")
+    restart_control.register_server(server)
+    return server
 
 
 def _assert_error(response, *, status: int, code: str) -> dict:
@@ -89,6 +110,98 @@ def test_profile_activate_current_runtime_clears_restart_requirement() -> None:
 
     assert response.status_code == 200
     assert response.json()["restart_required"] is False
+
+
+def test_profile_switch_updates_active_without_hot_switch_and_requests_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _enable_supervised_restart(monkeypatch)
+    target = {"profile_id": "account-2", "mid": "200", "nickname": "Bob"}
+    runner_idle, scheduler_idle = _idle_patches()
+    with runner_idle, scheduler_idle, patch(
+        "web.app.set_active_profile", return_value=target
+    ) as activate_mock, patch(
+        "web.app.get_runtime_profile_id", return_value="account-1"
+    ), patch(
+        "web.app.get_selected_profile_id", return_value="account-2"
+    ):
+        response = client.post("/api/profiles/account-2/switch")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "profile": target,
+        "runtime_profile_id": "account-1",
+        "active_profile_id": "account-2",
+        "restart_requested": True,
+    }
+    activate_mock.assert_called_once_with("account-2")
+    assert restart_control.is_restart_pending() is True
+    assert server.should_exit is True
+
+
+def test_profile_switch_rejected_while_job_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _enable_supervised_restart(monkeypatch)
+    with patch("web.app.runner.is_running", return_value=True), patch(
+        "web.app.auto_scheduler.get_status", return_value={"state": "idle"}
+    ), patch("web.app.get_runtime_profile_id", return_value="account-1"), patch(
+        "web.app.set_active_profile"
+    ) as activate_mock:
+        response = client.post("/api/profiles/account-2/switch")
+
+    payload = _assert_error(response, status=409, code="JOB_BUSY")
+    assert payload["error"]["message"] == "当前有任务正在运行，请等待任务结束后再切换账号。"
+    activate_mock.assert_not_called()
+    assert restart_control.is_restart_pending() is False
+    assert server.should_exit is False
+
+
+def test_profile_switch_rejected_while_auto_scheduler_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _enable_supervised_restart(monkeypatch)
+    with patch("web.app.runner.is_running", return_value=False), patch(
+        "web.app.auto_scheduler.get_status", return_value={"state": "running"}
+    ), patch("web.app.get_runtime_profile_id", return_value="account-1"), patch(
+        "web.app.set_active_profile"
+    ) as activate_mock:
+        response = client.post("/api/profiles/account-2/switch")
+
+    _assert_error(response, status=409, code="JOB_BUSY")
+    activate_mock.assert_not_called()
+    assert restart_control.is_restart_pending() is False
+    assert server.should_exit is False
+
+
+def test_profile_switch_refuses_unsupervised_entry_before_changing_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with patch("web.app.get_runtime_profile_id", return_value="account-1"), patch(
+        "web.app.set_active_profile"
+    ) as activate_mock:
+        response = client.post("/api/profiles/account-2/switch")
+
+    payload = _assert_error(response, status=503, code="INTERNAL")
+    assert "不支持自动重新启动" in payload["error"]["message"]
+    activate_mock.assert_not_called()
+
+
+def test_restart_gate_rejects_new_job_and_auto_scheduler_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_supervised_restart(monkeypatch)
+    restart_control.begin_restart(lambda: None)
+
+    with patch("web.app.get_account_profile", return_value={"logged_in": False}):
+        job_response = client.post("/api/jobs", json={"action": "login", "params": {}})
+    auto_response = client.post("/api/auto/start")
+
+    job_payload = _assert_error(job_response, status=409, code="JOB_BUSY")
+    auto_payload = _assert_error(auto_response, status=409, code="JOB_BUSY")
+    assert "重新启动" in job_payload["error"]["message"]
+    assert "重新启动" in auto_payload["error"]["message"]
 
 
 def test_profile_activate_rejected_while_job_is_running() -> None:

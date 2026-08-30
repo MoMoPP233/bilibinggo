@@ -12,6 +12,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 def main() -> int:
+    # 保持用户原有命令不变，但正常入口改由 launcher 父进程监督。
+    # ``--serve`` 只供 launcher 启动源码服务子进程使用。
+    if "--serve" not in sys.argv:
+        from binggo_launcher import main as launcher_main
+
+        return launcher_main()
+
     try:
         import uvicorn  # noqa: F401
     except ImportError:
@@ -51,7 +58,11 @@ def main() -> int:
             "生产请先: cd web/frontend && npm ci && npm run build",
             file=sys.stderr,
         )
-    run_dashboard_server()
+    restart_requested = run_dashboard_server()
+    if restart_requested:
+        from src.restart_control import RESTART_EXIT_CODE
+
+        return RESTART_EXIT_CODE
     return 0
 
 

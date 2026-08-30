@@ -34,15 +34,44 @@ def test_packaged_port_is_8181(monkeypatch):
 
 def test_run_dashboard_server_restores_none_stdio(monkeypatch):
     import src.dashboard_server as dashboard_server
+    from src.restart_control import restart_control
 
     monkeypatch.setattr(dashboard_server.sys, "stdout", None)
     monkeypatch.setattr(dashboard_server.sys, "stderr", None)
     captured: dict[str, bool] = {}
 
-    def fake_uvicorn_run(*_args, **_kwargs):
-        captured["stdout_ok"] = dashboard_server.sys.stdout is not None
-        captured["stderr_ok"] = dashboard_server.sys.stderr is not None
+    class FakeServer:
+        def __init__(self, _config):
+            self.should_exit = False
 
-    monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
-    dashboard_server.run_dashboard_server()
+        def run(self):
+            captured["stdout_ok"] = dashboard_server.sys.stdout is not None
+            captured["stderr_ok"] = dashboard_server.sys.stderr is not None
+
+    restart_control.reset_for_tests()
+    monkeypatch.setattr("uvicorn.Config", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    assert dashboard_server.run_dashboard_server() is False
     assert captured == {"stdout_ok": True, "stderr_ok": True}
+    restart_control.reset_for_tests()
+
+
+def test_run_dashboard_server_reports_supervised_restart(monkeypatch):
+    import src.dashboard_server as dashboard_server
+    from src.restart_control import RESTART_SUPERVISED_ENV, restart_control
+
+    class FakeServer:
+        def __init__(self, _config):
+            self.should_exit = False
+
+        def run(self):
+            restart_control.begin_restart(lambda: None)
+            assert restart_control.request_restart() is True
+            assert self.should_exit is True
+
+    restart_control.reset_for_tests()
+    monkeypatch.setenv(RESTART_SUPERVISED_ENV, "1")
+    monkeypatch.setattr("uvicorn.Config", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    assert dashboard_server.run_dashboard_server() is True
+    restart_control.reset_for_tests()
