@@ -134,6 +134,19 @@ def save_cookies(cookie_str: str) -> Path:
     return path
 
 
+def _sync_profile_mid(cookies: dict[str, str]) -> None:
+    """扫码响应已带 DedeUserID 时立即写 Profile；昵称由后续 nav 同步。"""
+    mid = str(cookies.get("DedeUserID") or "").strip()
+    if not mid:
+        return
+    try:
+        from src.profile_manager import update_profile_metadata
+
+        update_profile_metadata(mid=mid)
+    except (OSError, RuntimeError, ValueError):
+        logger.warning("登录成功，但写入 Profile MID 失败", exc_info=True)
+
+
 def _request_json(
     client: httpx.Client,
     url: str,
@@ -235,6 +248,7 @@ def login_with_qrcode(
     on_qrcode_ready: Callable[[], None] | None = None,
     on_status_change: Callable[[str, str], None] | None = None,
 ) -> str:
+    ensure_user_dirs()
     client = httpx.Client(headers=PASSPORT_HEADERS, follow_redirects=True, timeout=20.0)
 
     def _check_cancelled() -> None:
@@ -312,6 +326,7 @@ def login_with_qrcode(
                 essential = {k: v for k, v in cookies.items() if k in ESSENTIAL_KEYS}
                 cookie_str = cookies_to_header(essential or cookies)
                 save_cookies(cookie_str)
+                _sync_profile_mid(cookies)
                 _emit("success", "登录成功")
                 return cookie_str
 

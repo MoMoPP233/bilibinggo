@@ -4876,6 +4876,152 @@ body.modal-open {
   filter: brightness(1.05);
 }
 
+.profile-panel-head {
+  align-items: center;
+}
+
+.profile-restart-notice {
+  margin-bottom: 16px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border-soft));
+  border-radius: 12px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.profile-current {
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface-soft);
+}
+
+.profile-current-label {
+  margin: 0 0 10px;
+  color: var(--foreground-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.profile-current-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.profile-field {
+  min-width: 0;
+}
+
+.profile-field span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--foreground-muted);
+  font-size: 12px;
+}
+
+.profile-field strong {
+  display: block;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-data-root {
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+}
+
+.profile-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 13px;
+}
+
+.profile-row.is-runtime {
+  border-color: color-mix(in srgb, var(--success) 30%, var(--border-soft));
+  background: var(--success-soft);
+}
+
+.profile-row-copy {
+  min-width: 0;
+}
+
+.profile-row-title,
+.profile-badges,
+.profile-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-row-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-row-copy p {
+  margin: 4px 0 0;
+  color: var(--foreground-muted);
+  font-size: 12px;
+}
+
+.profile-badge {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-soft);
+  color: var(--foreground-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.profile-badge.is-runtime {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.profile-badge.is-next {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.profile-delete:not(:disabled) {
+  color: var(--danger);
+}
+
+@media (max-width: 720px) {
+  .profile-panel-head,
+  .profile-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .profile-current-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .profile-row-actions .btn {
+    flex: 1;
+  }
+}
+
 .onboarding-panel {
   border: 1px solid var(--border-soft);
   background: linear-gradient(180deg, var(--surface) 0%, var(--surface-soft) 100%);

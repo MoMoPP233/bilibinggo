@@ -13,7 +13,8 @@ from src.bilibili_rate_limit import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_limiter() -> None:
+def _reset_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BILI_RPS", raising=False)
     reset_bilibili_rate_limit()
     yield
     reset_bilibili_rate_limit()

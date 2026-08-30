@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from src import data_paths
 from src.secrets_inventory import (
     SECRET_FILENAMES,
     is_redact_secret_key,
@@ -16,11 +17,16 @@ def test_secret_filenames() -> None:
     assert "cookies.txt" in secret_filenames_csv()
 
 
-def test_secrets_inventory_paths_follow_home(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("src.app_paths.user_home", lambda: tmp_path)
-    paths = secret_file_paths()
-    assert paths[0] == tmp_path / "config" / "cookies.txt"
-    assert paths[1] == tmp_path / "config" / "llm.env"
+def test_secrets_inventory_paths_follow_profile_and_shared_root(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(data_paths.DATA_ROOT_ENV, str(tmp_path))
+    monkeypatch.delenv(data_paths.LEGACY_HOME_ENV, raising=False)
+    data_paths.reset_runtime_profile_for_tests()
+    try:
+        paths = secret_file_paths()
+        assert paths[0] == tmp_path / "profiles" / "account-1" / "cookies.txt"
+        assert paths[1] == tmp_path / "shared" / "llm.env"
+    finally:
+        data_paths.reset_runtime_profile_for_tests()
 
 
 def test_redact_vs_sanitize_matching() -> None:

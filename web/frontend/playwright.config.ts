@@ -31,8 +31,10 @@ export default defineConfig({
     env: {
       ...process.env,
       BINGGO_E2E: "1",
-      // 勿继承开发机 BINGGO_HOME，强制由 run_e2e_server 使用临时目录
+      // 勿继承开发机真实数据根，强制由 run_e2e_server 使用临时目录
+      BINGGO_DATA_ROOT: "",
       BINGGO_HOME: "",
+      BINGGO_LEGACY_DATA_ROOT: "",
     },
   },
 });

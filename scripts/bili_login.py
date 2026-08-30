@@ -1,4 +1,4 @@
-"""哔哩哔哩扫码登录 — 自动保存 Cookie 到 config/cookies.txt"""
+"""哔哩哔哩扫码登录 — 自动保存 Cookie 到当前 Profile。"""
 
 from __future__ import annotations
 

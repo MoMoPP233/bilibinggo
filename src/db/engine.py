@@ -10,10 +10,10 @@ _engine_db_path: Path | None = None
 
 
 def db_path() -> Path:
-    # 动态解析，便于测试通过 BINGGO_HOME / monkeypatch user_home 隔离库文件
-    from src.app_paths import user_home
+    # 无参路径绑定进程启动时的 Profile；active_profile 改写后不会热切库。
+    from src.data_paths import get_database_path
 
-    return user_home() / "data" / "binggo.db"
+    return get_database_path()
 
 
 def _sqlite_url(path: Path) -> str:

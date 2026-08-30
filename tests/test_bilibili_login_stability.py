@@ -8,6 +8,7 @@ from src.bilibili_login import (
     POLL_SUCCESS,
     POLL_WAITING,
     _poll_status,
+    _sync_profile_mid,
     save_cookies,
 )
 
@@ -46,3 +47,15 @@ def test_save_cookies_writes_atomically(tmp_path, monkeypatch) -> None:
     assert saved == cookie_path
     assert cookie_path.read_text(encoding="utf-8") == "SESSDATA=abc; bili_jct=xyz"
     assert not cookie_path.with_name("cookies.txt.tmp").exists()
+
+
+def test_login_cookie_mid_updates_current_profile(monkeypatch) -> None:
+    recorded: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        "src.profile_manager.update_profile_metadata",
+        lambda **values: recorded.append(values),
+    )
+
+    _sync_profile_mid({"DedeUserID": "123456"})
+
+    assert recorded == [{"mid": "123456"}]

@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from src.app_logging import get_logger
-from src.app_paths import __version__, platform_label, runtime_label, user_home
+from src.app_paths import __version__, config_dir, data_dir, platform_label, runtime_label, user_home
 from src.config_validate import cookie_has_dede_user_id, cookie_missing_hard_fields
 from src.dashboard_server import DASHBOARD_HOST, get_dashboard_port
 from src.secrets_inventory import secret_filenames_csv
@@ -66,7 +66,7 @@ def run_config_health_checks() -> HealthReport:
             HealthFinding(
                 code="env_cookie_override",
                 severity="warning",
-                message="检测到 BILI_COOKIE 环境变量，登录态可能来自环境变量而非 cookies.txt",
+                message="检测到 BILI_COOKIE 环境变量；多账号模式为防止串号已禁用该全局覆盖",
             )
         )
 
@@ -165,8 +165,8 @@ def run_config_health_checks() -> HealthReport:
     return HealthReport(
         runtime=runtime_label(),
         user_home=str(home),
-        data_dir=str(home / "data"),
-        config_dir=str(home / "config"),
+        data_dir=str(data_dir()),
+        config_dir=str(config_dir()),
         version=__version__,
         bind_host=DASHBOARD_HOST,
         bind_port=get_dashboard_port(),

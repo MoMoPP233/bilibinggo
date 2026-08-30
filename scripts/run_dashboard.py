@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -10,17 +11,25 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.app_logging import setup_logging
-from src.app_paths import ensure_user_dirs
-from src.dashboard_server import DASHBOARD_URL, run_dashboard_server
-
-
 def main() -> int:
     try:
         import uvicorn  # noqa: F401
     except ImportError:
         print("请先安装依赖: pip install -r requirements.txt", file=sys.stderr)
         return 1
+
+    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected
+
+    try:
+        os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(ROOT))
+        ensure_data_root_selected()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    from src.app_logging import setup_logging
+    from src.app_paths import ensure_user_dirs
+    from src.dashboard_server import DASHBOARD_URL, run_dashboard_server
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

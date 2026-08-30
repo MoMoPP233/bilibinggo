@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src.app_logging import get_logger, setup_logging
 from src.app_paths import __version__, ensure_user_dirs
 from src.bilibili_login import QR_IMAGE_PATH
+from src.data_paths import get_data_root, get_runtime_profile_id, get_selected_profile_id
 from src.llm_client import test_llm_connection
 from src.llm_settings import (
     build_llm_config_from_inputs,
@@ -24,6 +25,7 @@ from src.llm_settings import (
 )
 from src.sources.common import is_valid_dynamic_id, load_previous_output
 from src.state_store import get_watch_last_synced_at
+from src.profile_manager import create_profile, delete_profile, list_profiles, set_active_profile
 from src.user_settings import (
     DEFAULT_PARTICIPATE_FALLBACK_TEXT,
     DEFAULT_PARTICIPATE_TEXT,
@@ -192,6 +194,71 @@ def api_remove_watch_user(mid: int) -> OkResponse:
 @app.get("/api/account", tags=["stable"])
 def api_account() -> dict[str, Any]:
     return get_account_profile()
+
+
+def _require_profile_operations_idle() -> None:
+    auto_running = auto_scheduler.get_status().get("state") == "running"
+    if runner.is_running() or auto_running:
+        raise AppError(
+            ErrorCode.JOB_BUSY,
+            "任务或自动调度正在运行，暂时不能切换或删除账号 Profile",
+        )
+
+
+def _raise_profile_value_error(exc: ValueError) -> None:
+    message = str(exc)
+    code = ErrorCode.NOT_FOUND if "不存在" in message else ErrorCode.VALIDATION_ERROR
+    raise AppError(code, message) from exc
+
+
+@app.get("/api/profiles", tags=["stable"])
+def api_profiles() -> dict[str, Any]:
+    runtime_profile_id = get_runtime_profile_id()
+    active_profile_id = get_selected_profile_id()
+    return {
+        "runtime_profile_id": runtime_profile_id,
+        "active_profile_id": active_profile_id,
+        "restart_required": active_profile_id != runtime_profile_id,
+        "data_root": str(get_data_root()),
+        "profiles": list_profiles(),
+    }
+
+
+@app.post("/api/profiles", tags=["stable"])
+def api_create_profile() -> dict[str, Any]:
+    try:
+        profile = create_profile()
+    except OSError as exc:
+        raise AppError(ErrorCode.INTERNAL, f"创建账号 Profile 失败：{exc}") from exc
+    return {"ok": True, "profile": profile}
+
+
+@app.post("/api/profiles/{profile_id}/activate", tags=["stable"])
+def api_activate_profile(profile_id: str) -> dict[str, Any]:
+    _require_profile_operations_idle()
+    try:
+        profile = set_active_profile(profile_id)
+    except ValueError as exc:
+        _raise_profile_value_error(exc)
+    except OSError as exc:
+        raise AppError(ErrorCode.INTERNAL, f"切换账号 Profile 失败：{exc}") from exc
+    return {
+        "ok": True,
+        "profile": profile,
+        "restart_required": get_selected_profile_id() != get_runtime_profile_id(),
+    }
+
+
+@app.delete("/api/profiles/{profile_id}", tags=["stable"])
+def api_delete_profile(profile_id: str) -> dict[str, bool]:
+    _require_profile_operations_idle()
+    try:
+        delete_profile(profile_id)
+    except ValueError as exc:
+        _raise_profile_value_error(exc)
+    except OSError as exc:
+        raise AppError(ErrorCode.INTERNAL, f"删除账号 Profile 失败：{exc}") from exc
+    return {"ok": True}
 
 
 @app.get("/api/account/extras", tags=["stable"])

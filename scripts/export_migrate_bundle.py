@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""导出完整用户数据目录，便于 Windows → macOS 迁移。
+"""导出旧版单账号用户数据目录，便于 Windows → macOS 迁移。
 
 默认打包「当前仓库开发态」的 config/ + data/（含 binggo.db、Cookie、LLM 等），
 并可选合并 %APPDATA%\\Binggo 中仓库里没有的文件。
@@ -7,6 +7,8 @@
 产物默认：dist/private/Binggo-userdata-migrate.zip
 解压到 Mac 后整目录内容应放到：
   ~/Library/Application Support/Binggo/
+
+多 Profile 数据请直接完整备份 DATA_ROOT；本旧工具会明确拒绝，避免生成漏数据的“完整包”。
 """
 
 from __future__ import annotations
@@ -115,6 +117,11 @@ def build_bundle(
     appdata_home: Path | None,
     out_zip: Path,
 ) -> dict:
+    if (source_home / "active_profile.json").exists() or (source_home / "profiles").is_dir():
+        raise RuntimeError(
+            "此旧版迁移脚本不支持多 Profile 数据；请退出 Binggo 后完整复制 DATA_ROOT "
+            "（含 active_profile.json、profiles/、shared/）。"
+        )
     staging: dict[str, Path] = {}
 
     for sub in ("config", "data"):
@@ -203,7 +210,7 @@ def build_bundle(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="导出 Binggo 完整用户数据迁移包")
+    parser = argparse.ArgumentParser(description="导出 Binggo 旧版单账号数据迁移包")
     parser.add_argument(
         "--source",
         type=Path,

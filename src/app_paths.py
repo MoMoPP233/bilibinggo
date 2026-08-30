@@ -7,6 +7,14 @@ import shutil
 import sys
 from pathlib import Path
 
+from src.data_paths import (
+    get_cookie_path,
+    get_data_root,
+    get_llm_env_path,
+    get_profile_dir,
+    initialize_data_layout,
+)
+
 __version__ = "5.0.5"
 
 
@@ -48,50 +56,36 @@ def platform_label() -> str:
 
 
 def user_home() -> Path:
-    """用户数据根目录（config/、data/）。"""
-    override = os.environ.get("BINGGO_HOME", "").strip()
-    if override:
-        return Path(override)
-    if is_frozen():
-        portable = os.environ.get("BINGGO_PORTABLE", "").strip().lower() in {"1", "true", "yes"}
-        if portable:
-            if sys.platform == "darwin":
-                # 解压目录（Binggo.app 的父目录）
-                return app_bundle_root().parent
-            return bundle_root()
-        if sys.platform == "darwin":
-            return Path.home() / "Library" / "Application Support" / "Binggo"
-        appdata = os.environ.get("APPDATA", "").strip()
-        if appdata:
-            return Path(appdata) / "Binggo"
-        return Path.home() / "Binggo"
-    return Path(__file__).resolve().parents[1]
+    """统一数据根目录（兼容旧调用名）。"""
+    return get_data_root()
 
 
 def config_dir() -> Path:
-    return user_home() / "config"
+    """当前进程 Profile 的兼容配置目录。"""
+    return get_profile_dir()
 
 
 def data_dir() -> Path:
-    return user_home() / "data"
+    """当前进程 Profile 的完整数据目录。"""
+    return get_profile_dir()
 
 
 def cookie_file() -> Path:
-    """动态解析 cookies.txt（尊重当前 BINGGO_HOME）。"""
-    return config_dir() / "cookies.txt"
+    """当前进程 Profile 独立的 cookies.txt。"""
+    return get_cookie_path()
 
 
 def llm_env_file() -> Path:
-    """动态解析 llm.env（尊重当前 BINGGO_HOME）。"""
-    return config_dir() / "llm.env"
+    """所有 Profile 共享的 llm.env。"""
+    return get_llm_env_path()
 
 
 INSTALL_ROOT = install_root()
 USER_HOME = user_home()
-DATA_DIR = USER_HOME / "data"
-CONFIG_DIR = USER_HOME / "config"
-COOKIE_PATH = CONFIG_DIR / "cookies.txt"
-LLM_ENV_PATH = CONFIG_DIR / "llm.env"
+DATA_DIR = data_dir()
+CONFIG_DIR = config_dir()
+COOKIE_PATH = cookie_file()
+LLM_ENV_PATH = llm_env_file()
 WATCH_USERS_PATH = CONFIG_DIR / "watch_users.json"
 WATCH_CANDIDATES_PATH = CONFIG_DIR / "watch_users_candidates.json"
 GLOBAL_SETTINGS_PATH = CONFIG_DIR / "participate_settings.json"
@@ -123,14 +117,14 @@ def ensure_user_dirs() -> None:
     先置 `_SEEDED` 再 seed，避免 seed 内再次调用本函数时递归 bootstrap。
     """
     global _SEEDED
-    home = user_home()
-    data_dir = home / "data"
-    config_dir = home / "config"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "output").mkdir(parents=True, exist_ok=True)
-    (data_dir / "cache").mkdir(parents=True, exist_ok=True)
-    (data_dir / "logs").mkdir(parents=True, exist_ok=True)
+    initialize_data_layout()
+    profile_dir = data_dir()
+    shared_dir = llm_env_file().parent
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "output").mkdir(parents=True, exist_ok=True)
+    (profile_dir / "cache").mkdir(parents=True, exist_ok=True)
+    (profile_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     if not _SEEDED:
         bundled_config = install_root() / "config"
@@ -139,12 +133,13 @@ def ensure_user_dirs() -> None:
                 if not item.is_file():
                     continue
                 if item.name.endswith(".example"):
-                    dst = config_dir / item.name
+                    dst_dir = shared_dir if item.name == "llm.env.example" else profile_dir
+                    dst = dst_dir / item.name
                     if not dst.exists():
                         shutil.copy2(item, dst)
                     continue
                 if item.name == "sources.yaml":
-                    dst = config_dir / item.name
+                    dst = profile_dir / item.name
                     if not dst.exists():
                         shutil.copy2(item, dst)
         from src.db import init_db

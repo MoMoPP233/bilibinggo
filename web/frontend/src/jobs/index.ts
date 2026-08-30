@@ -8,6 +8,7 @@ import { isLlmConfigured, requireSetup, scrollToLlmSettings, syncProjectState } 
 import { buildActivityFilterJobParams, loadActivities, loadSummary, renderTripleParticipateBar } from "../activities/index";
 import { ACTION_LABELS, COMMENT_OPTIONAL_PATTERNS, FORWARD_REQUIRED_ACTIONS, INTERACT_REQUIRED_ACTIONS, JOB_RESULT_AUTO_DISMISS_MS, JOB_RESULT_EXIT_MS, PARTICIPATE_ACTIVE_KEYWORDS, PARTICIPATE_DONE_KEYWORDS, PARTICIPATE_FAIL_KEYWORDS, PARTICIPATE_PENDING_KEYWORDS, PARTICIPATE_STEP_LABELS, REFRESH_ALL_DS_COUNT, REFRESH_ALL_PIPELINE, REFRESH_ALL_PIPELINE_SUBSTEPS, REFRESH_WATCH_PIPELINE, RESERVE_REQUIRED_ACTIONS, RESERVE_STEP_LABELS, SYNC_TOAST_ACTIONS, jobLog, jobMessage, jobResultActions, jobResultBanner, jobResultBody, jobResultEyebrow, jobResultHint, jobResultIcon, jobResultProgress, jobResultSummary, jobResultTitle, logDock, logDockBadge, logDockPanel, logDockToggle, progressBanner, progressChip, progressDetail, progressFill, progressFillGlow, progressLabel, progressPercent, progressPercentSuffix, progressRing, progressSteps, progressTrack, qrcodeClose, qrcodeFrame, qrcodeImg, qrcodeModal, qrcodeOverlay, qrcodeOverlayIcon, qrcodeOverlayText, qrcodeStatus, qrcodeTitle, sidebarLoginBtn } from "../dom";
 import { startRealtime } from "../realtime/sse";
+import { syncProfilesAfterLoginJob } from "../profiles/index";
 import { confirmRefreshAll } from "../shell/confirm";
 import { switchSection } from "../shell/nav";
 import { dismissRunningToasts, showToast } from "../shell/toast";
@@ -1226,6 +1227,7 @@ export async function handleJobCompletion(job) {
   try {
     await loadSummary();
     await syncProjectState();
+    await syncProfilesAfterLoginJob(job).catch(() => false);
     await loadActivities();
     if (job.action === "refresh_watch") {
       await loadWatchUsers();

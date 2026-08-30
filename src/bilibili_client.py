@@ -52,7 +52,9 @@ def _load_cookie_string() -> str | None:
 
     env = os.environ.get("BILI_COOKIE", "").strip()
     if env:
-        return env
+        raise RuntimeError(
+            "多账号模式已禁用全局 BILI_COOKIE，请移除该环境变量并使用当前 Profile 扫码登录"
+        )
     path = app_paths.cookie_file()
     if path.exists():
         text = path.read_text(encoding="utf-8").strip()
@@ -379,8 +381,8 @@ class BilibiliClient:
             errors.append(str(exc))
             raise RuntimeError(
                 "获取最新视频失败（B 站风控 -352/-412）。\n"
-                "请将浏览器 Cookie 保存到 config/cookies.txt 后重试。\n"
-                "参考 config/cookies.txt.example\n"
+                "请在当前账号 Profile 中重新扫码登录后重试。\n"
+                "Cookie 会保存到当前 Profile 的 cookies.txt。\n"
                 + "\n".join(errors)
             ) from exc
 

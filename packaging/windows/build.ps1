@@ -8,7 +8,8 @@ if (-not (Test-Path (Join-Path $Root "binggo_launcher.py"))) {
 Set-Location $Root
 
 Write-Host "==> 读取版本 (src.app_paths.__version__)"
-$AppVersion = (python -c "from src.app_paths import __version__; print(__version__)").Trim()
+$VersionMatch = Select-String -Path (Join-Path $Root "src\app_paths.py") -Pattern '^__version__\s*=\s*"([^"]+)"'
+$AppVersion = if ($VersionMatch) { $VersionMatch.Matches[0].Groups[1].Value.Trim() } else { "" }
 if (-not $AppVersion) {
     throw "无法读取 src.app_paths.__version__"
 }
@@ -55,8 +56,14 @@ Binggo 便携版（Windows）
 3. 浏览器会自动打开 http://127.0.0.1:8181
 4. 按页面提示扫码登录、配置 LLM（转发抽奖需要）
 
-数据默认保存在：%APPDATA%\Binggo
-若希望数据放在本文件夹，可创建 BinggoPortable.cmd，内容：
+安装版首次启动会要求选择数据根目录（可选择 D 盘或其他磁盘），也可在启动前设置：
+  set BINGGO_DATA_ROOT=D:\BinggoData
+
+账号数据分别保存在：<数据根目录>\profiles\<profile_id>\
+所有账号共享的 LLM 配置保存在：<数据根目录>\shared\llm.env
+卸载 Binggo 不会删除上述外置数据目录，请自行妥善备份其中的数据库与 Cookie。
+
+若希望便携版数据放在本文件夹，可创建 BinggoPortable.cmd，内容：
   set BINGGO_PORTABLE=1
   start "" "%~dp0Binggo.exe"
 
@@ -75,7 +82,8 @@ function Invoke-BinggoInnoSetup {
     if (-not $IsccPath) {
         $candidates = @(
             "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+            "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe"
         )
         foreach ($c in $candidates) {
             if (Test-Path $c) { $IsccPath = $c; break }

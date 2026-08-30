@@ -7,19 +7,19 @@ from pathlib import Path
 
 
 def assert_safe_e2e_home(home: Path, root: Path) -> None:
-    """拒绝指向仓库根或 data/（及其子目录）的 HOME，防止污染开发库。"""
+    """拒绝指向仓库根或 data/（及其子目录）的 DATA_ROOT，防止污染开发库。"""
     home_r = home.resolve()
     root_r = root.resolve()
     data_r = (root_r / "data").resolve()
     if home_r == root_r:
-        raise ValueError("BINGGO_HOME 不能指向仓库根目录")
+        raise ValueError("BINGGO_DATA_ROOT 不能指向仓库根目录")
     if home_r == data_r:
-        raise ValueError("BINGGO_HOME 不能指向仓库 data/ 目录")
+        raise ValueError("BINGGO_DATA_ROOT 不能指向仓库 data/ 目录")
     try:
         home_r.relative_to(data_r)
     except ValueError:
         return
-    raise ValueError("BINGGO_HOME 不能位于仓库 data/ 之下")
+    raise ValueError("BINGGO_DATA_ROOT 不能位于仓库 data/ 之下")
 
 
 def seed_activities() -> int:
@@ -102,28 +102,29 @@ def write_llm_env(config_dir: Path, *, ready: bool = True) -> None:
 
 
 def seed_e2e_home(home: Path) -> None:
-    """在已设置 BINGGO_HOME 且可 import 项目模块后调用。"""
+    """在已设置 BINGGO_DATA_ROOT 且可 import 项目模块后调用。"""
     from src.app_paths import CONFIG_DIR, USER_HOME, ensure_user_dirs
+    from src.data_paths import get_llm_env_path, get_profile_dir
     from src.db.engine import db_path, reset_engine_for_tests
     from src.db.schema import init_db
     from web.e2e_hooks import set_e2e_state
 
     home = home.resolve()
     ensure_user_dirs()
-    # 首轮 import 的 USER_HOME/CONFIG_DIR 必须与本次 HOME 一致
+    # 首轮 import 的 USER_HOME/CONFIG_DIR 必须与本次 DATA_ROOT 一致
     if USER_HOME.resolve() != home:
         raise RuntimeError(
-            f"BINGGO_HOME 与 app_paths.USER_HOME 不一致：env={home} bound={USER_HOME.resolve()}。"
-            "请确保在首次 import src.app_paths 之前设置 BINGGO_HOME。"
+            f"BINGGO_DATA_ROOT 与 app_paths.USER_HOME 不一致：env={home} bound={USER_HOME.resolve()}。"
+            "请确保在首次 import src.app_paths 之前设置 BINGGO_DATA_ROOT。"
         )
-    if CONFIG_DIR.resolve() != (home / "config").resolve():
-        raise RuntimeError(f"CONFIG_DIR 未落在 HOME 下：{CONFIG_DIR}")
+    if CONFIG_DIR.resolve() != get_profile_dir().resolve():
+        raise RuntimeError(f"CONFIG_DIR 未落在当前 Profile 下：{CONFIG_DIR}")
 
     reset_engine_for_tests()
     init_db()
     resolved = db_path().resolve()
     assert resolved.is_relative_to(home), resolved
     count = seed_activities()
-    write_llm_env(CONFIG_DIR, ready=True)
+    write_llm_env(get_llm_env_path().parent, ready=True)
     set_e2e_state(account="logged_out", llm="not_ready")
     print(f"E2E seed: activities={count} db={resolved}", flush=True)

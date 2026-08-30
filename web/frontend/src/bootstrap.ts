@@ -18,6 +18,7 @@ import { sanitizeUserText } from "./utils/text";
 import { bindDiagnosticsExport } from "./diagnostics/index";
 import { bindCheckUpdates, loadRuntimeInfo } from "./runtime/index";
 import { bindWatchUsers, loadWatchUsers } from "./watch/index";
+import { bindProfiles, loadProfiles } from "./profiles/index";
 
 export async function init() {
   initSystemPreferences();
@@ -30,12 +31,14 @@ export async function init() {
   bindSettingsDirtyTracking();
   bindLlmApiKeyToggle();
   bindWatchUsers();
+  bindProfiles();
   bindOnboardingPanel();
   bindActionButtons();
   bindDiagnosticsExport();
   bindCheckUpdates();
   loadRuntimeInfo().catch(() => {});
   await syncProjectState();
+  await loadProfiles().catch(() => {});
   try {
     const job = await loadSummary();
     if (job) state.currentJob = job;

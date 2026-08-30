@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import pytest
+
+from src import data_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,49 +23,64 @@ from src.app_paths import (
 
 
 def test_user_home_override(monkeypatch, tmp_path):
+    monkeypatch.delenv("BINGGO_DATA_ROOT", raising=False)
     monkeypatch.setenv("BINGGO_HOME", str(tmp_path))
     assert user_home() == tmp_path
 
 
-def test_dev_mode_user_home_is_project_root(monkeypatch):
-    monkeypatch.delenv("BINGGO_HOME", raising=False)
-    monkeypatch.setattr("src.app_paths.is_frozen", lambda: False)
-    assert user_home() == ROOT
-
-
-def test_frozen_installed_user_home(monkeypatch):
+def test_dev_mode_user_home_chooses_and_persists_data_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("BINGGO_DATA_ROOT", raising=False)
     monkeypatch.delenv("BINGGO_HOME", raising=False)
     monkeypatch.delenv("BINGGO_PORTABLE", raising=False)
-    appdata = r"C:\Users\Demo\AppData\Roaming"
-    monkeypatch.setenv("APPDATA", appdata)
-    monkeypatch.setattr("src.app_paths.is_frozen", lambda: True)
-    monkeypatch.setattr(sys, "platform", "win32")
-    # 两侧用同一构造，避免 Linux CI 上反斜杠 Path 字面量比较踩坑
-    assert user_home() == Path(appdata) / "Binggo"
+    selected = tmp_path / "chosen-data"
+    locator = tmp_path / "locator.json"
+    monkeypatch.setenv("BINGGO_DATA_ROOT_LOCATOR", str(locator))
+    monkeypatch.setattr("src.data_paths._is_frozen", lambda: False)
+    monkeypatch.setattr("src.data_paths._choose_data_root", lambda: selected)
+
+    assert user_home() == selected.resolve()
+    assert locator.is_file()
+    assert json.loads(locator.read_text(encoding="utf-8")) == {
+        "data_root": str(selected.resolve())
+    }
+    assert data_paths.get_data_root() == selected.resolve()
+
+
+def test_frozen_installed_user_home_uses_persisted_data_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("BINGGO_DATA_ROOT", raising=False)
+    monkeypatch.delenv("BINGGO_HOME", raising=False)
+    monkeypatch.delenv("BINGGO_PORTABLE", raising=False)
+    selected = tmp_path / "selected-data"
+    locator = tmp_path / "appdata" / "Binggo" / "data_root.json"
+    locator.parent.mkdir(parents=True)
+    locator.write_text(json.dumps({"data_root": str(selected)}), encoding="utf-8")
+    monkeypatch.setenv("BINGGO_DATA_ROOT_LOCATOR", str(locator))
+    monkeypatch.setattr("src.data_paths._is_frozen", lambda: True)
+    assert user_home() == selected.resolve()
 
 
 def test_frozen_portable_user_home(monkeypatch, tmp_path):
+    monkeypatch.delenv("BINGGO_DATA_ROOT", raising=False)
     monkeypatch.delenv("BINGGO_HOME", raising=False)
     monkeypatch.setenv("BINGGO_PORTABLE", "1")
-    monkeypatch.setattr("src.app_paths.is_frozen", lambda: True)
-    monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr("src.app_paths.bundle_root", lambda: tmp_path)
+    monkeypatch.setattr("src.data_paths._portable_root", lambda: tmp_path)
     assert user_home() == tmp_path
 
 
-def test_frozen_darwin_application_support(monkeypatch, tmp_path):
+def test_frozen_installed_user_home_requires_data_root_selection(monkeypatch, tmp_path):
+    monkeypatch.delenv("BINGGO_DATA_ROOT", raising=False)
     monkeypatch.delenv("BINGGO_HOME", raising=False)
     monkeypatch.delenv("BINGGO_PORTABLE", raising=False)
-    monkeypatch.setattr("src.app_paths.is_frozen", lambda: True)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    assert user_home() == tmp_path / "Library" / "Application Support" / "Binggo"
+    monkeypatch.setenv("BINGGO_DATA_ROOT_LOCATOR", str(tmp_path / "missing-locator.json"))
+    monkeypatch.setattr("src.data_paths._is_frozen", lambda: True)
+    with pytest.raises(data_paths.DataRootNotConfiguredError, match="尚未选择"):
+        user_home()
 
 
 def test_frozen_darwin_portable_uses_app_parent(monkeypatch, tmp_path):
+    monkeypatch.delenv("BINGGO_DATA_ROOT", raising=False)
     monkeypatch.delenv("BINGGO_HOME", raising=False)
     monkeypatch.setenv("BINGGO_PORTABLE", "1")
-    monkeypatch.setattr("src.app_paths.is_frozen", lambda: True)
     monkeypatch.setattr(sys, "platform", "darwin")
     fake_exe = tmp_path / "Binggo.app" / "Contents" / "MacOS" / "Binggo"
     fake_exe.parent.mkdir(parents=True)
@@ -80,7 +98,9 @@ def test_platform_label(monkeypatch):
 
 
 def test_ensure_user_dirs_seeds_examples(monkeypatch, tmp_path):
-    monkeypatch.setattr("src.app_paths.user_home", lambda: tmp_path)
+    monkeypatch.setenv("BINGGO_DATA_ROOT", str(tmp_path))
+    monkeypatch.delenv("BINGGO_HOME", raising=False)
+    data_paths.reset_runtime_profile_for_tests()
     monkeypatch.setattr("src.app_paths.install_root", lambda: ROOT)
     monkeypatch.setattr("src.app_paths._SEEDED", False)
     monkeypatch.setattr("src.app_paths._BOOTSTRAPPED", False)
@@ -88,10 +108,13 @@ def test_ensure_user_dirs_seeds_examples(monkeypatch, tmp_path):
 
     reset_engine_for_tests()
     ensure_user_dirs()
-    assert (tmp_path / "config" / "cookies.txt.example").exists()
-    assert (tmp_path / "config" / "sources.yaml").exists()
-    assert (tmp_path / "data" / "logs").is_dir()
+    profile_dir = tmp_path / "profiles" / "account-1"
+    assert (profile_dir / "cookies.txt.example").exists()
+    assert (profile_dir / "sources.yaml").exists()
+    assert (profile_dir / "logs").is_dir()
+    assert (tmp_path / "shared" / "llm.env.example").exists()
     reset_engine_for_tests()
+    data_paths.reset_runtime_profile_for_tests()
 
 
 def test_is_frozen_false_in_pytest():

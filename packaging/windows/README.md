@@ -52,17 +52,35 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 
 | 变量 | 说明 |
 |------|------|
-| `BINGGO_HOME` | 自定义数据目录（覆盖默认 `%APPDATA%\Binggo`） |
+| `BINGGO_DATA_ROOT` | 统一数据根目录；设置后跳过首次目录选择，可指向 D 盘或其他磁盘 |
 | `BINGGO_PORTABLE=1` | 便携模式：数据放在 `Binggo.exe` 同目录 |
 | `BINGGO_SKIP_INNO=1` | 本地构建时跳过 Inno |
 
 ## 数据目录与安全
 
+安装版首次启动时会要求选择数据根目录（可选择 D 盘或其他磁盘），选择结果会被记住；也可在启动前设置 `BINGGO_DATA_ROOT`。程序安装目录与用户数据目录彼此独立。
+
+```text
+<BINGGO_DATA_ROOT>\
+├─ active_profile.json
+├─ shared\
+│  └─ llm.env
+└─ profiles\
+   ├─ account-1\
+   │  ├─ binggo.db
+   │  ├─ cookies.txt
+   │  └─ profile.json
+   └─ account-2\
+      └─ ...
+```
+
 | 模式 | 数据根 | 说明 |
 |------|--------|------|
-| 安装包默认 | `%APPDATA%\Binggo` | 卸载**不删除**此目录 |
-| 便携 | exe 同目录 | 含 `config/cookies.txt`、`config/llm.env`；**勿整夹同步到公开盘** |
-| 自定义 | `BINGGO_HOME` | 覆盖以上默认 |
+| 安装包首次启动 | 用户选择的目录 | 每个 Profile 独立数据库与 Cookie；LLM 配置位于 `shared` |
+| 自定义 | `BINGGO_DATA_ROOT` | 优先使用指定目录，并跳过首次选择 |
+| 便携 | exe 同目录 | 由 `BINGGO_PORTABLE=1` 启用；**勿整夹同步到公开盘** |
+
+卸载程序默认**不会删除**用户选择的外置数据根目录；其中包含数据库、Cookie 和 LLM 密钥，请自行备份或清理。
 
 密钥仅存本机明文文件；控制台只监听 `127.0.0.1:8181`，请勿改成局域网开放。
 

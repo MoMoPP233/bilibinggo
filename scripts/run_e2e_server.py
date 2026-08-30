@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""隔离 HOME 的 E2E 后端（127.0.0.1:8791）。须在 import web.app 前设置 BINGGO_HOME。"""
+"""隔离 DATA_ROOT 的 E2E 后端（127.0.0.1:8791）。"""
 
 from __future__ import annotations
 
@@ -29,16 +29,18 @@ def main() -> int:
         sys.path.insert(0, str(ROOT))
 
     os.environ["BINGGO_E2E"] = "1"
-    home_env = os.environ.get("BINGGO_HOME", "").strip()
+    home_env = os.environ.get("BINGGO_DATA_ROOT", "").strip()
     if home_env:
         home = Path(home_env)
         home.mkdir(parents=True, exist_ok=True)
     else:
         home = Path(tempfile.mkdtemp(prefix="binggo-e2e-"))
-        os.environ["BINGGO_HOME"] = str(home)
+        os.environ["BINGGO_DATA_ROOT"] = str(home)
 
     home = home.resolve()
-    # 延迟 import：保证先写入 BINGGO_HOME 再加载 app_paths
+    # E2E 数据根是完全隔离的新布局，禁止回退读取仓库或开发机旧账号数据。
+    os.environ["BINGGO_LEGACY_DATA_ROOT"] = str(home)
+    # 延迟 import：保证先写入 BINGGO_DATA_ROOT 再加载 app_paths
     from web.e2e_seed import assert_safe_e2e_home, seed_e2e_home
 
     try:

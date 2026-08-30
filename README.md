@@ -67,7 +67,9 @@ Binggo 从 UP 合集与监控用户动态发现进行中的抽奖活动，在本
 
 ## Privacy
 
-凭证保存在本机；数据目录随安装方式不同（安装包、`BINGGO_PORTABLE`、`BINGGO_HOME` 等），可在控制台「概览 → 项目信息」查看当前路径。勿轻信私信「中奖」并要求转账或验证码 — 说明见官网 **[谨防诈骗](https://luovicter-collab.github.io/bilibinggo/#notice)**。
+凭证保存在本机。安装版首次启动会要求选择统一数据根目录（可选择 D 盘或其他磁盘），也可预先设置 `BINGGO_DATA_ROOT`；每个账号的数据库与 Cookie 位于 `<DATA_ROOT>/profiles/<profile_id>/`，所有账号共享的 LLM 配置位于 `<DATA_ROOT>/shared/llm.env`。便携模式可使用 `BINGGO_PORTABLE=1`，当前路径可在控制台「概览 → 项目信息」查看。
+
+卸载 Binggo 默认不会删除用户选择的外置数据根目录。该目录包含数据库、Cookie 与 LLM 密钥，请自行妥善备份或清理，勿整目录同步到公开网盘。勿轻信私信「中奖」并要求转账或验证码 — 说明见官网 **[谨防诈骗](https://luovicter-collab.github.io/bilibinggo/#notice)**。
 
 ## Development
 

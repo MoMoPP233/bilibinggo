@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules
@@ -6,6 +7,12 @@ from PyInstaller.utils.hooks import collect_submodules
 block_cipher = None
 root = Path(SPECPATH).resolve().parents[1]
 icon_path = Path(SPECPATH).resolve().parent / "binggo.ico"
+
+# PyInstaller imports packages while discovering hidden submodules.  Give those
+# build-time imports an isolated data root so they never open the first-run
+# chooser or inspect a developer's real Binggo data.  This value only exists in
+# the PyInstaller process and is not embedded in the packaged application.
+os.environ["BINGGO_DATA_ROOT"] = str(root / "build" / "pyinstaller-data-root")
 
 datas = [
     # 生产前端：仅 dist + favicon（勿打包 frontend/node_modules 或 backup）

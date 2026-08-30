@@ -67,7 +67,9 @@ def test_get_account_profile_logged_in_shape(monkeypatch) -> None:
             }
 
     monkeypatch.setattr("web.account_service.has_login_cookie", lambda: True)
-    with patch("web.account_service.BilibiliClient", FakeClient):
+    with patch("web.account_service.BilibiliClient", FakeClient), patch(
+        "src.profile_manager.update_profile_metadata"
+    ) as update_profile_metadata:
         profile = get_account_profile()
 
     assert profile["logged_in"] is True
@@ -75,3 +77,4 @@ def test_get_account_profile_logged_in_shape(monkeypatch) -> None:
     assert profile["following"] == 10
     assert profile["extras_loading"] is True
     assert profile["unread_at"] is None
+    update_profile_metadata.assert_called_once_with(mid=123, nickname="tester")

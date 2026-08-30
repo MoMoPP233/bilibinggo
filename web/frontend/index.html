@@ -301,6 +301,24 @@
               <p class="caption">加载账号信息中…</p>
             </article>
 
+            <article class="panel profile-panel" id="profile-panel">
+              <div class="panel-head-row profile-panel-head">
+                <div>
+                  <p class="eyebrow">账号 Profile</p>
+                  <h2 class="section-title">多账号数据隔离</h2>
+                  <p class="section-desc">每个 Profile 独立保存账号 Cookie、活动与参与状态。</p>
+                </div>
+                <button type="button" class="btn btn-secondary btn-compact btn-pill" id="profile-create">新建账号</button>
+              </div>
+              <div class="profile-restart-notice" id="profile-restart-notice" role="status" hidden>
+                账号配置已切换，请重新启动 Binggo 后生效。
+              </div>
+              <div class="profile-current" id="profile-current">
+                <p class="caption">加载 Profile 信息中…</p>
+              </div>
+              <div class="profile-list" id="profile-list" aria-label="账号 Profile 列表"></div>
+            </article>
+
             <div class="stats-grid" id="stats-grid"></div>
 
             <article class="panel quick-actions">

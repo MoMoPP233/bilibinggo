@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,8 +26,11 @@ def main() -> int:
     if arch != "arm64":
         print(f"WARNING: arch={arch}; official target is Apple Silicon arm64.", file=sys.stderr)
 
-    sys.path.insert(0, str(ROOT))
-    from src.app_paths import __version__ as app_version
+    app_paths_text = (ROOT / "src" / "app_paths.py").read_text(encoding="utf-8")
+    version_match = re.search(r'^__version__\s*=\s*"([^"]+)"', app_paths_text, re.MULTILINE)
+    if version_match is None:
+        raise RuntimeError("cannot read src.app_paths.__version__")
+    app_version = version_match.group(1)
 
     print(f"==> version={app_version}")
 

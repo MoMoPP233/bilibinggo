@@ -59,7 +59,10 @@ def test_seed_state_if_missing_writes_payload(
     assert seed_state_if_missing() is False
 
 
-def test_no_bundled_state_seed_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_bundled_state_seed_by_default(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ = isolated_home
     root = Path(__file__).resolve().parents[1]
     missing = root / "config" / "_missing_state_seed.json"
     monkeypatch.setattr("src.state_seed.USER_STATE_SEED_PATH", missing)

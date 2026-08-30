@@ -125,6 +125,19 @@ def _save_account_cache(profile: dict[str, Any]) -> None:
         pass
 
 
+def _sync_profile_metadata(profile: dict[str, Any]) -> None:
+    """同步已验证账号的展示信息；写入失败不应影响现有登录流程。"""
+    try:
+        from src.profile_manager import update_profile_metadata
+
+        update_profile_metadata(
+            mid=profile.get("mid"),
+            nickname=str(profile.get("uname") or ""),
+        )
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
 def _profile_from_network_error(exc: RuntimeError) -> dict[str, Any]:
     profile = _empty_profile(friendly_network_error(str(exc)))
     profile["cookie_saved"] = True
@@ -220,6 +233,7 @@ def get_account_profile() -> dict[str, Any]:
                 pass
 
             _save_account_cache(profile)
+            _sync_profile_metadata(profile)
             return profile
     except RuntimeError as exc:
         if has_login_cookie():

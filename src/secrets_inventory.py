@@ -62,7 +62,7 @@ SANITIZE_SECRET_KEY_SUBSTR: frozenset[str] = frozenset(
 
 
 def secret_file_paths() -> list[Path]:
-    """运行态密钥文件绝对路径（动态解析，尊重 BINGGO_HOME）。"""
+    """运行态密钥文件绝对路径（统一 DATA_ROOT，Cookie 按 Profile 隔离）。"""
     return [app_paths.cookie_file(), app_paths.llm_env_file()]
 
 

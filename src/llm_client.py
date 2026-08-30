@@ -106,7 +106,7 @@ def test_llm_connection(config: LlmConfig) -> str:
 def chat_json(*, system: str, user: str, config: LlmConfig | None = None) -> dict[str, Any]:
     cfg = config or load_llm_config()
     if not cfg:
-        raise RuntimeError("未配置 LLM，请检查 config/llm.env")
+        raise RuntimeError("未配置 LLM，请检查数据根目录下的 shared/llm.env")
 
     payload = _build_chat_payload(
         cfg,

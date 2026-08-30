@@ -1,7 +1,7 @@
 """只读解析旧 JSON 并写入 SQLite（供 scripts/import_json_to_db.py 使用）。
 
-归档相对路径统一相对 USER_HOME：
-  data/backup/json_pre_sqlite/<相对 USER_HOME 的路径>
+归档相对路径统一相对当前 Profile：
+  backup/json_pre_sqlite/<相对 Profile 的路径>
 """
 
 from __future__ import annotations
@@ -46,17 +46,18 @@ EXIT_DB = 4
 
 
 def _user_home() -> Path:
-    from src.app_paths import user_home
+    """兼容旧内部名称：现在表示当前 Profile 目录。"""
+    from src.app_paths import data_dir
 
-    return user_home()
+    return data_dir()
 
 
 def _data_dir() -> Path:
-    return _user_home() / "data"
+    return _user_home()
 
 
 def _config_dir() -> Path:
-    return _user_home() / "config"
+    return _user_home()
 
 
 def _archive_root() -> Path:

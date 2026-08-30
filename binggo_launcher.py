@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -12,19 +13,22 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.dashboard_server import DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_URL
-
 MUTEX_NAME = "Global\\BilibiliBinggoDashboard"
 SERVE_FLAG = "--serve"
 STARTUP_TIMEOUT_SEC = 45.0
 CREATE_NO_WINDOW = 0x08000000
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_PORT = 8181 if bool(getattr(sys, "frozen", False)) else 8787
+DASHBOARD_URL = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
 
 # 非 Windows 文件锁句柄，进程存活期间保持打开
 _LOCK_FH = None
 
 
 def _show_error(message: str) -> None:
-    print(message, file=sys.stderr)
+    # PyInstaller windowed 模式下 stdout/stderr 可能为 None；错误框仍须可用。
+    if sys.stderr is not None:
+        print(message, file=sys.stderr)
     if sys.platform == "win32":
         try:
             import ctypes
@@ -188,18 +192,32 @@ def _startup_failure_message(*, log_path: Path, data_root: Path, exit_code: int 
 
 
 def run_server_mode() -> int:
-    from src.app_logging import get_logger, setup_logging
-    from src.app_paths import ensure_user_dirs
-    from src.dashboard_server import run_dashboard_server
+    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected
 
     try:
+        if bool(getattr(sys, "frozen", False)):
+            appdata = os.environ.get("APPDATA", "").strip()
+            if appdata:
+                os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(Path(appdata) / "Binggo"))
+        else:
+            os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(ROOT))
+        ensure_data_root_selected()
+    except (OSError, RuntimeError) as exc:
+        _show_error(str(exc))
+        return 1
+
+    try:
+        from src.app_logging import get_logger, setup_logging
+        from src.app_paths import ensure_user_dirs
+        from src.dashboard_server import run_dashboard_server
+
         ensure_user_dirs()
         setup_logging(console=False)
         logger = get_logger("launcher")
         logger.info("Binggo 服务进程启动，监听 %s", DASHBOARD_URL)
         run_dashboard_server()
         return 0
-    except RuntimeError as exc:
+    except (OSError, RuntimeError) as exc:
         _show_error(str(exc))
         return 1
     except Exception:
@@ -211,11 +229,24 @@ def run_server_mode() -> int:
 
 
 def main() -> int:
-    from src.app_logging import setup_logging
-    from src.app_paths import ensure_user_dirs, runtime_label, user_home
-
+    # Windows mutex 必须早于首次目录选择与任何 Profile 初始化，避免双开
+    # 分别选择 A/B 后互相覆盖 locator。非 Windows 文件锁也沿用同一入口。
     if not _acquire_single_instance():
         return 0
+
+    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected
+
+    try:
+        if bool(getattr(sys, "frozen", False)):
+            appdata = os.environ.get("APPDATA", "").strip()
+            if appdata:
+                os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(Path(appdata) / "Binggo"))
+        else:
+            os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(ROOT))
+        ensure_data_root_selected()
+    except (OSError, RuntimeError) as exc:
+        _show_error(str(exc))
+        return 1
 
     if not _port_available(DASHBOARD_HOST, DASHBOARD_PORT):
         webbrowser.open(DASHBOARD_URL)
@@ -225,8 +256,11 @@ def main() -> int:
         return 0
 
     try:
+        from src.app_logging import setup_logging
+        from src.app_paths import ensure_user_dirs, runtime_label, user_home
+
         ensure_user_dirs()
-    except RuntimeError as exc:
+    except (OSError, RuntimeError) as exc:
         _show_error(str(exc))
         return 1
 

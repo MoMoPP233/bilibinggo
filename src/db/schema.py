@@ -89,7 +89,7 @@ def _schema_newer_than_code_error(recorded: int) -> RuntimeError:
         f"数据库 schema_version={recorded} 高于本程序支持的 {SCHEMA_VERSION}，无法安全启动。\n\n"
         f"数据库文件：{db}\n\n"
         "请先安装最新版 Release，并完全退出 Binggo（任务管理器结束所有 Binggo.exe）后重试。\n"
-        "若仍失败：备份上述 data 文件夹后删除 binggo.db，再启动（会丢失本地活动库，Cookie 仍在 config）。"
+        "若仍失败：备份上述 Profile 文件夹后删除 binggo.db，再启动（会丢失该 Profile 的本地活动库，Cookie 会保留）。"
     )
 
 
