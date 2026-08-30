@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 MUTEX_NAME = "Global\\BilibiliBinggoDashboard"
+SOURCE_MUTEX_NAME = "Global\\BilibiliBinggoDashboard.Source.8787"
 SERVE_FLAG = "--serve"
 STARTUP_TIMEOUT_SEC = 45.0
 SHUTDOWN_TIMEOUT_SEC = 15.0
@@ -26,6 +27,9 @@ DASHBOARD_URL = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
 
 # 非 Windows 文件锁句柄，进程存活期间保持打开
 _LOCK_FH = None
+# Windows mutex 也必须由 supervisor 父进程持有到退出；仅保存返回值，
+# 不把它交给服务子进程或 Profile 运行时。
+_WINDOWS_MUTEX_HANDLE = None
 
 
 def _show_error(message: str) -> None:
@@ -88,18 +92,45 @@ def _port_available(host: str, port: int) -> bool:
     return True
 
 
+def _windows_mutex_name() -> str:
+    """安装版保留原 mutex；源码版使用独立的 8787 supervisor mutex。"""
+
+    return MUTEX_NAME if bool(getattr(sys, "frozen", False)) else SOURCE_MUTEX_NAME
+
+
 def _acquire_windows_mutex() -> bool:
+    global _WINDOWS_MUTEX_HANDLE
     if sys.platform != "win32":
+        return True
+    if _WINDOWS_MUTEX_HANDLE is not None:
         return True
     try:
         import ctypes
+        from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.CreateMutexW(None, False, MUTEX_NAME)
-        already_exists = kernel32.GetLastError() == 183
-        if already_exists:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+        create_mutex.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        ctypes.set_last_error(0)
+        handle = create_mutex(None, False, _windows_mutex_name())
+        error_code = ctypes.get_last_error()
+        if not handle:
+            # ERROR_ACCESS_DENIED 通常表示同名 Global mutex 已由更高权限
+            # 进程持有；与 ERROR_ALREADY_EXISTS 一样按已有实例处理。
+            if error_code in {5, 183}:
+                webbrowser.open(DASHBOARD_URL)
+                return False
+            return True
+        if error_code == 183:
+            close_handle(handle)
             webbrowser.open(DASHBOARD_URL)
             return False
+        _WINDOWS_MUTEX_HANDLE = handle
         return True
     except Exception:
         return True
@@ -201,6 +232,21 @@ def _stop_process(proc: subprocess.Popen[bytes]) -> int | None:
             return proc.poll()
 
 
+def _finish_process_after_interrupt(proc: subprocess.Popen[bytes]) -> int | None:
+    """Ctrl+C 后先等待同控制台子进程自行优雅退出，超时才强制兜底。"""
+
+    exit_code = proc.poll()
+    if exit_code is not None:
+        return exit_code
+    try:
+        return proc.wait(timeout=SHUTDOWN_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        return _stop_process(proc)
+    except KeyboardInterrupt:
+        # 用户再次按 Ctrl+C 时不再继续等待。
+        return _stop_process(proc)
+
+
 def _startup_failure_message(*, log_path: Path, data_root: Path, exit_code: int | None) -> str:
     code_text = str(exit_code) if exit_code is not None else "仍在运行"
     return (
@@ -218,7 +264,12 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
     browser_opened = False
     while True:
         proc = _spawn_server_process()
-        if not _wait_for_server():
+        try:
+            server_ready = _wait_for_server()
+        except KeyboardInterrupt:
+            _finish_process_after_interrupt(proc)
+            return 0
+        if not server_ready:
             exit_code = _stop_process(proc)
             _show_error(
                 _startup_failure_message(
@@ -234,13 +285,13 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
             browser_opened = True
 
         try:
-            while proc.poll() is None:
-                time.sleep(0.5)
+            # 父 supervisor 必须明确等待当前 --serve 子进程结束；只有
+            # Ctrl+C 会中断这次等待，不能在浏览器打开后自行返回。
+            exit_code = proc.wait()
         except KeyboardInterrupt:
-            _stop_process(proc)
+            _finish_process_after_interrupt(proc)
             return 0
 
-        exit_code = proc.poll()
         if exit_code != RESTART_EXIT_CODE:
             # 普通退出或异常崩溃都不自动拉起，避免形成崩溃循环。
             return int(exit_code) if exit_code is not None else 1
