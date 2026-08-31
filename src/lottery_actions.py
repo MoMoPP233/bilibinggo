@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
+
+import httpx
 
 from src.bilibili_auth import get_login_uid, require_login
 from src.bilibili_client import BilibiliClient, api_code
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
 from src.sources.common import opus_link
+from src.participation_guard import (
+    ParticipationGuardBlocked,
+    confirm_repost,
+    get_guard,
+    mark_repost_unknown,
+    record_pending,
+)
 
 ActionName = Literal["like", "follow", "favorite", "repost", "comment", "reserve"]
 
@@ -26,9 +36,6 @@ REPLY_MAIN_URL = "https://api.bilibili.com/x/v2/reply/main"
 
 FAV_CONTENT_TYPE = 24
 FOLLOWING_ATTRIBUTES = {2, 6}
-SPACE_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
-SPACE_FEED_PAGE_SIZE = 20
-SPACE_FEED_MAX_PAGES = 3
 ACTION_INTERVAL_SEC = 1.5
 ACTION_LABELS: dict[ActionName, str] = {
     "like": "点赞",
@@ -39,6 +46,96 @@ ACTION_LABELS: dict[ActionName, str] = {
     "reserve": "预约",
 }
 PARTICIPATION_STEPS: tuple[ActionName, ...] = ("like", "follow", "favorite", "repost", "comment")
+_UNSET = object()
+
+
+class ParticipationReadError(RuntimeError):
+    """无法可靠确认当前目标的交互状态；本次参与不得继续写操作。"""
+
+
+class ParticipationReadClient:
+    """一次参与的只读快照：相同 GET 只发一次，失败不重试、不降级继续探测。"""
+
+    def __init__(self, client: BilibiliClient) -> None:
+        self.raw_client = client
+        self._responses: dict[tuple, Any] = {}
+        self._failure: Exception | None = None
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def _read(self, kind: str, url: str, params: dict | None, referer: str | None) -> Any:
+        self.raise_if_failed()
+        key = (kind, url, json.dumps(params or {}, sort_keys=True), referer)
+        if key in self._responses:
+            return self._responses[key]
+        try:
+            if kind == "text":
+                payload = self.raw_client.get_text(url, referer=referer, retries=0)
+            else:
+                payload = self.raw_client.request_json(url, params, referer=referer, retries=0)
+                if not isinstance(payload, dict) or type(payload.get("code")) is not int:
+                    raise ParticipationReadError("交互状态响应缺少有效 code，已停止本次参与")
+                if payload["code"] != 0:
+                    raise ParticipationReadError(
+                        f"交互状态读取失败 code={payload['code']}，已停止本次参与且不重试"
+                    )
+        except (httpx.HTTPError, RuntimeError, json.JSONDecodeError) as exc:
+            if isinstance(exc, RuntimeError) and not isinstance(exc, ParticipationReadError):
+                if not isinstance(exc.__cause__, (httpx.HTTPError, json.JSONDecodeError)):
+                    self._failure = exc
+                    raise
+            self._failure = (
+                exc if isinstance(exc, ParticipationReadError)
+                else ParticipationReadError(f"交互状态读取失败，已停止本次参与：{exc}")
+            )
+            if self._failure is exc:
+                raise
+            raise self._failure from exc
+        except Exception as exc:
+            # 上层旧 API 会捕获异常后尝试降级；保留并重新抛出，不能被其吞掉。
+            self._failure = exc
+            raise
+        self._responses[key] = payload
+        return payload
+
+    def request_json(
+        self, url: str, params: dict | None = None, *, referer: str | None = None, retries: int = 0
+    ) -> dict:
+        return self._read("json", url, params, referer)
+
+    def get_json(
+        self, url: str, params: dict | None = None, *, referer: str | None = None,
+        retries: int = 0, wbi: bool = False,
+    ) -> dict:
+        if wbi:
+            raise ValueError("参与状态快照不支持 WBI 请求")
+        return self.request_json(url, params, referer=referer)
+
+    def get_text(self, url: str, *, referer: str | None = None, retries: int = 0) -> str:
+        return self._read("text", url, None, referer)
+
+    def post_form(self, *args: Any, **kwargs: Any) -> dict:
+        self.raise_if_failed()
+        return self.raw_client.post_form(*args, **kwargs)
+
+    def post_json(self, *args: Any, **kwargs: Any) -> dict:
+        self.raise_if_failed()
+        return self.raw_client.post_json(*args, **kwargs)
+
+
+def _interaction_flag(value: Any) -> bool | None:
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return value == 1
+    return None
+
+
+def _stat_flag(stat: dict, name: str) -> bool | None:
+    entry = stat.get(name)
+    return _interaction_flag(entry.get("status")) if isinstance(entry, dict) else None
 
 
 @dataclass
@@ -55,11 +152,11 @@ class DynamicContext:
     referer: str
     comment_rid: str
     comment_type: int
-    liked: bool
-    favorited: bool
+    liked: bool | None
+    favorited: bool | None
     favorite_available: bool
     followed: bool
-    reposted: bool
+    reposted: bool | None
     commented: bool
 
 
@@ -152,10 +249,17 @@ def build_dynamic_context(
     dynamic_id: str,
     action_text: str,
     sender_uid: int | None = None,
+    detail_item: dict | None = None,
+    notice: dict | None | object = _UNSET,
+    repost_confirmed: bool = False,
+    check_comment: bool = True,
+    check_follow: bool = True,
 ) -> DynamicContext:
-    item = fetch_dynamic_detail(client, dynamic_id)
+    client = client if isinstance(client, ParticipationReadClient) else ParticipationReadClient(client)
+    item = detail_item if detail_item is not None else fetch_dynamic_detail(client, dynamic_id)
+    client.raise_if_failed()
     if not item:
-        raise RuntimeError("无法获取动态详情")
+        raise ParticipationReadError("无法获取动态详情")
 
     referer = opus_link(dynamic_id)
     basic = item.get("basic") or {}
@@ -163,26 +267,34 @@ def build_dynamic_context(
     comment_type = int(basic.get("comment_type") or 17)
     uid = sender_uid or resolve_sender_uid(item)
 
-    modules = item.get("modules") or {}
-    stat = modules.get("module_stat") or {}
-    like_obj = stat.get("like") or {}
-    liked = bool(like_obj.get("status"))
+    stat = _extract_module_stat(item)
+    liked = _stat_flag(stat, "like")
+    if liked is None:
+        raise ParticipationReadError("当前目标的点赞状态未知，已停止本次参与")
 
-    followed = is_following(client, uid=uid, referer=referer)
+    followed = is_following(client, uid=uid, referer=referer) if check_follow else False
     favorite_available = favorite_supported(item, client=client, dynamic_id=dynamic_id)
-    favorited = (
-        is_favorited(client, dynamic_id=dynamic_id, referer=referer)
-        if favorite_available
-        else False
+    client.raise_if_failed()
+    favorited = _stat_flag(stat, "favorite")
+    if favorite_available and favorited is None:
+        favorited = is_favorited(client, dynamic_id=dynamic_id, referer=referer)
+    client.raise_if_failed()
+    if favorite_available and favorited is None:
+        raise ParticipationReadError("当前目标的收藏状态未知，已停止本次参与")
+    reposted = True if repost_confirmed else is_reposted(
+        client, dynamic_id=dynamic_id, referer=referer, notice=notice
     )
-    reposted = is_reposted(client, dynamic_id=dynamic_id, referer=referer)
-    commented = has_comment(
-        client,
-        rid=comment_rid,
-        comment_type=comment_type,
-        action_text=action_text,
-        referer=referer,
-    )
+    client.raise_if_failed()
+    commented = False
+    if check_comment:
+        commented = has_comment(
+            client,
+            rid=comment_rid,
+            comment_type=comment_type,
+            action_text=action_text,
+            referer=referer,
+        )
+        client.raise_if_failed()
 
     return DynamicContext(
         dynamic_id=dynamic_id,
@@ -219,62 +331,32 @@ def _opus_favorite_status(client: BilibiliClient, *, dynamic_id: str, referer: s
                 "features": "htmlNewStyle,ugcDelete,editable,opusPrivateVisible",
             },
             referer=referer,
+            retries=0,
         )
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError, json.JSONDecodeError):
         return None
     if _api_code(payload) != 0:
         return None
     item = (payload.get("data") or {}).get("item") or {}
-    for module in item.get("modules") or []:
-        if module.get("module_type") != "MODULE_TYPE_STAT":
-            continue
-        favorite = (module.get("module_stat") or {}).get("favorite") or {}
-        return bool(favorite.get("status"))
+    return _stat_flag(_extract_module_stat(item), "favorite")
+
+
+def is_favorited(client: BilibiliClient, *, dynamic_id: str, referer: str) -> bool | None:
+    return _opus_favorite_status(client, dynamic_id=dynamic_id, referer=referer)
+
+
+def is_reposted(
+    client: BilibiliClient, *, dynamic_id: str, referer: str, notice: dict | None | object = _UNSET
+) -> bool | None:
+    """只接受当前目标的官方抽奖字段；普通动态不扫描账号历史来补偿。"""
+    client = client if isinstance(client, ParticipationReadClient) else ParticipationReadClient(client)
+    if notice is _UNSET:
+        resolved = fetch_notice_for_interact(client, dynamic_id)
+        client.raise_if_failed()
+        notice = resolved[0] if resolved else None
+    if isinstance(notice, dict):
+        return _interaction_flag(notice.get("reposted"))
     return None
-
-
-def is_favorited(client: BilibiliClient, *, dynamic_id: str, referer: str) -> bool:
-    status = _opus_favorite_status(client, dynamic_id=dynamic_id, referer=referer)
-    return bool(status)
-
-
-def is_reposted(client: BilibiliClient, *, dynamic_id: str, referer: str) -> bool:
-    notice = fetch_notice_for_interact(client, dynamic_id)
-    if notice:
-        return bool(notice[0].get("reposted"))
-    return has_reposted_in_space_feed(client, dynamic_id=dynamic_id)
-
-
-def has_reposted_in_space_feed(client: BilibiliClient, *, dynamic_id: str) -> bool:
-    uid = get_login_uid()
-    if not uid:
-        return False
-    referer = f"https://space.bilibili.com/{uid}/dynamic"
-    offset = ""
-    target = str(dynamic_id)
-    for _ in range(SPACE_FEED_MAX_PAGES):
-        try:
-            payload = client.request_json(
-                SPACE_FEED_URL,
-                params={"host_mid": uid, "offset": offset, "type": "all"},
-                referer=referer,
-            )
-        except RuntimeError:
-            return False
-        if api_code(payload) != 0:
-            return False
-        data = payload.get("data") or {}
-        items = data.get("items") or []
-        for item in items:
-            if item.get("type") != "DYNAMIC_TYPE_FORWARD":
-                continue
-            orig = item.get("orig") or {}
-            if str(orig.get("id_str") or "") == target:
-                return True
-        offset = str(data.get("offset") or "")
-        if not offset or len(items) < SPACE_FEED_PAGE_SIZE:
-            break
-    return False
 
 
 def has_comment(
@@ -353,9 +435,17 @@ def favorite_dynamic(
     dynamic_id: str,
     csrf: str,
     referer: str,
+    known_status: bool | None | object = _UNSET,
 ) -> ActionResult:
-    if is_favorited(client, dynamic_id=dynamic_id, referer=referer):
+    client = client.raw_client if isinstance(client, ParticipationReadClient) else client
+    status = (
+        is_favorited(client, dynamic_id=dynamic_id, referer=referer)
+        if known_status is _UNSET else known_status
+    )
+    if status is True:
         return ActionResult("favorite", True, "已收藏，跳过")
+    if status is not False:
+        raise ParticipationReadError("当前目标的收藏状态未知，未执行收藏")
 
     payload = client.post_json(
         COSMO_SIMPLE_ACTION_URL,
@@ -374,16 +464,14 @@ def favorite_dynamic(
         params={"csrf": csrf},
         referer=referer,
         raise_on_code=False,
+        retries=0,
     )
     code = _api_code(payload)
     message = _api_message(payload)
     if code == 0:
-        for attempt in range(4):
-            if is_favorited(client, dynamic_id=dynamic_id, referer=referer):
-                return ActionResult("favorite", True, "")
-            if attempt < 3:
-                time.sleep(0.6 + attempt * 0.4)
-        return ActionResult("favorite", False, message or "收藏状态未更新")
+        if is_favorited(client, dynamic_id=dynamic_id, referer=referer) is True:
+            return ActionResult("favorite", True, "")
+        return ActionResult("favorite", False, message or "收藏状态未确认，未继续查询")
     if code in (65006, 75008):
         return ActionResult("favorite", True, message or "已收藏")
     return ActionResult("favorite", False, f"code={code} {message}".strip())
@@ -398,25 +486,47 @@ def repost_dynamic(
     referer: str,
     content: str,
 ) -> ActionResult:
-    payload = client.post_form(
-        REPOST_URL,
-        {
-            "uid": str(my_uid),
-            "dynamic_id": dynamic_id,
-            "content": content[:233],
-            "ctrl": "[]",
-            "csrf": csrf,
-        },
-        referer=referer,
-        raise_on_code=False,
-    )
-    code = _api_code(payload)
-    if code == 0:
+    guard = get_guard(my_uid, dynamic_id)
+    if guard is not None:
+        if guard.repost_status == "confirmed":
+            return ActionResult("repost", True, "本地已确认转发，跳过")
+        return ActionResult("repost", False, "已有转发保护记录，未再次发送")
+    try:
+        record_pending(my_uid, dynamic_id)
+    except ParticipationGuardBlocked:
+        return ActionResult("repost", False, "已有转发保护记录，未再次发送")
+
+    client = client.raw_client if isinstance(client, ParticipationReadClient) else client
+    try:
+        payload = client.post_form(
+            REPOST_URL,
+            {
+                "uid": str(my_uid),
+                "dynamic_id": dynamic_id,
+                "content": content[:233],
+                "ctrl": "[]",
+                "csrf": csrf,
+            },
+            referer=referer,
+            raise_on_code=False,
+            retries=0,
+        )
+    except Exception as exc:
+        # 调用已开始，异常不能证明服务端没有转发。先持久化不确定结果，
+        # 再区分可报告的传输失败与必须继续抛出的未知程序异常。
+        mark_repost_unknown(my_uid, dynamic_id)
+        if isinstance(exc, (httpx.HTTPError, json.JSONDecodeError)) or (
+            isinstance(exc, RuntimeError)
+            and isinstance(exc.__cause__, (httpx.HTTPError, json.JSONDecodeError))
+        ):
+            return ActionResult("repost", False, f"转发结果未知，已阻止自动重试：{exc}")
+        raise
+    if isinstance(payload, dict) and type(payload.get("code")) is int and payload["code"] == 0:
+        confirm_repost(my_uid, dynamic_id)
         return ActionResult("repost", True, content[:80])
-    message = _api_message(payload)
-    if "已" in message or "重复" in message:
-        return ActionResult("repost", True, "已转发")
-    return ActionResult("repost", False, f"code={code} {message}".strip())
+    mark_repost_unknown(my_uid, dynamic_id)
+    detail = f"code={_api_code(payload)} {_api_message(payload)}" if isinstance(payload, dict) else "无效响应"
+    return ActionResult("repost", False, f"转发结果未确认，已阻止自动重试：{detail}".strip())
 
 
 def comment_dynamic(
@@ -450,14 +560,22 @@ def execute_full_participation(
     action_text: str = DEFAULT_PARTICIPATE_TEXT,
     dry_run: bool = False,
     on_step: Callable[[int, int, str, ActionName], None] | None = None,
+    context: DynamicContext | None = None,
+    on_action: Callable[[ActionResult], None] | None = None,
 ) -> tuple[list[ActionResult], DynamicContext]:
     text = (action_text or DEFAULT_PARTICIPATE_TEXT).strip() or DEFAULT_PARTICIPATE_TEXT
-    context = build_dynamic_context(
-        client,
-        dynamic_id=dynamic_id,
-        action_text=text,
-        sender_uid=sender_uid,
-    )
+    if context is None:
+        context = build_dynamic_context(
+            client,
+            dynamic_id=dynamic_id,
+            action_text=text,
+            sender_uid=sender_uid,
+        )
+    if context.dynamic_id != dynamic_id:
+        raise ValueError("参与状态快照与目标动态不一致")
+    if context.liked is None or (context.favorite_available and context.favorited is None):
+        raise ParticipationReadError("当前目标的交互状态未知，未执行参与操作")
+    client = client.raw_client if isinstance(client, ParticipationReadClient) else client
 
     total_steps = len(PARTICIPATION_STEPS)
 
@@ -492,36 +610,44 @@ def execute_full_participation(
     csrf, my_uid = require_login()
     actions: list[ActionResult] = []
 
+    def append_action(action: ActionResult) -> None:
+        actions.append(action)
+        if on_action is not None:
+            on_action(action)
+
     report_step(1, "like")
     if context.liked:
-        actions.append(ActionResult("like", True, "已点赞，跳过"))
+        append_action(ActionResult("like", True, "已点赞，跳过"))
     else:
-        actions.append(like_dynamic(client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer))
+        append_action(like_dynamic(client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
 
     report_step(2, "follow")
     if context.followed:
-        actions.append(ActionResult("follow", True, f"uid={context.sender_uid} 已关注，跳过"))
+        append_action(ActionResult("follow", True, f"uid={context.sender_uid} 已关注，跳过"))
     else:
-        actions.append(follow_user(client, uid=context.sender_uid, csrf=csrf, referer=context.referer))
+        append_action(follow_user(client, uid=context.sender_uid, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
 
     report_step(3, "favorite")
     if not context.favorite_available:
-        actions.append(ActionResult("favorite", True, "无收藏入口，跳过"))
+        append_action(ActionResult("favorite", True, "无收藏入口，跳过"))
     elif context.favorited:
-        actions.append(ActionResult("favorite", True, "已收藏，跳过"))
+        append_action(ActionResult("favorite", True, "已收藏，跳过"))
     else:
-        actions.append(
-            favorite_dynamic(client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer)
+        append_action(
+            favorite_dynamic(
+                client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer,
+                known_status=context.favorited,
+            )
         )
     time.sleep(ACTION_INTERVAL_SEC)
 
     report_step(4, "repost")
     if context.reposted:
-        actions.append(ActionResult("repost", True, "已转发，跳过"))
+        append_action(ActionResult("repost", True, "已转发，跳过"))
     else:
-        actions.append(
+        append_action(
             repost_dynamic(
                 client,
                 dynamic_id=dynamic_id,
@@ -535,9 +661,9 @@ def execute_full_participation(
 
     report_step(5, "comment")
     if context.commented:
-        actions.append(ActionResult("comment", True, "已评论，跳过"))
+        append_action(ActionResult("comment", True, "已评论，跳过"))
     else:
-        actions.append(
+        append_action(
             comment_dynamic(
                 client,
                 rid=context.comment_rid,

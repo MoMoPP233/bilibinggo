@@ -633,15 +633,28 @@ export function payloadJoinedSuccess(payload) {
   return participationSucceeded(actions, payload?.lottery_type || "");
 }
 
+const PARTICIPATION_DEDUP_SKIP_REASONS = new Set([
+  "already_joined", "participation_busy", "repost_pending", "repost_unknown",
+  "repost_suspected", "platform_joined",
+]);
+
+export function payloadDedupSkipped(payload) {
+  return payload?.status === "skipped"
+    && PARTICIPATION_DEDUP_SKIP_REASONS.has(payload?.skip_reason)
+    && !(payload?.actions || []).length;
+}
+
 export function summarizeTripleResult(result) {
   const items = result?.items || [];
   let joined = 0;
   let failed = 0;
+  let skipped = 0;
   for (const item of items) {
     if (payloadJoinedSuccess(item)) joined += 1;
+    else if (payloadDedupSkipped(item)) skipped += 1;
     else failed += 1;
   }
-  return { joined, failed, total: items.length };
+  return { joined, skipped, failed, total: items.length };
 }
 
 export function renderActionChips(actions) {
@@ -757,6 +770,9 @@ export function renderTripleParticipationResults(result) {
     if (succeeded) {
       statusLabel = "成功";
       statusClass = "success";
+    } else if (payloadDedupSkipped(payload)) {
+      statusLabel = ["repost_pending", "repost_unknown", "repost_suspected"].includes(payload.skip_reason)
+        ? "需确认（已跳过）" : "已跳过";
     } else if (status === "failed" || (status === "joined" && !payloadJoinedSuccess(payload))) {
       statusLabel = "失败";
       statusClass = "failed";
@@ -785,11 +801,13 @@ export function showParticipationResult(job) {
   const isTriple = job.action === "participate_triple";
   let joined = 0;
   let failed = 0;
+  let skipped = 0;
   let total = 1;
   if (isTriple) {
     const summary = summarizeTripleResult(result);
     joined = summary.joined;
     failed = summary.failed;
+    skipped = summary.skipped;
     total = summary.total;
   } else {
     joined = payloadJoinedSuccess(result) ? 1 : 0;
@@ -806,6 +824,10 @@ export function showParticipationResult(job) {
     tone = "is-success";
     icon = "✓";
     title = isTriple ? "三连参与完成" : "参与成功";
+  } else if (job.state === "success" && skipped > 0 && failed === 0) {
+    tone = "is-partial";
+    icon = "○";
+    title = "三连参与完成（含跳过）";
   } else if (joined > 0) {
     tone = "is-partial";
     icon = "◐";

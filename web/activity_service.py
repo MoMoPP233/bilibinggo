@@ -5,11 +5,13 @@ from typing import Any
 from src.activity_status import resolve_activity_status
 from src.activity_store import load_payload
 from src.db.snapshots import load_ds_check_dict, load_watch_sync_dict
+from src.db.uids import participation_uid
 from src.draw_reminder import matches_draw_window_filter
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
 from src.lottery_time import format_timestamp, is_activity_past_end, lottery_time_text
 from src.participation_log import load_action_entries_for_uid
 from src.participation_store import ParticipationRecord, load_participations
+from src.participation_guard import load_blocked_guard_ids
 from src.sources.common import is_valid_dynamic_id
 from src.state_store import DATA_DIR, get_last_pipeline_persisted
 
@@ -297,6 +299,7 @@ def _filtered_activity_rows(
     action_map = _load_participation_actions()
     participations = load_participations()
     items = [item for item in (enriched.get("activities") or []) if isinstance(item, dict)]
+    blocked_ids = load_blocked_guard_ids(participation_uid())
 
     normalized: list[dict[str, Any]] = []
     draw_window_value = (draw_window or "").strip().lower()
@@ -314,6 +317,12 @@ def _filtered_activity_rows(
         if not _should_list_activity(item, activity_status, can_participate):
             continue
         row = _normalize_activity(item, action_map, participation)
+        if dynamic_id in blocked_ids:
+            # Keep the activity and its real history visible; only suppress new
+            # participation until its uncertain repost state is reviewed.
+            row["can_participate"] = False
+            row["participation_blocked"] = True
+            row["skip_reason"] = "转发状态待确认，已暂停参与以避免重复操作"
         normalized.append(row)
 
     if draw_window_value:

@@ -12,11 +12,9 @@ from typing import Any, Callable
 from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
 from src.bilibili_login import login_with_qrcode
-from src.fetch_activity_info import mark_enriched_joined
 from src.log_span import PhaseSpanTracker, log_span
 from src.lottery_actions import ActionResult
 from src.lottery_classifier import PARTICIPATABLE_TYPES
-from src.participate_preflight import ensure_activity_participatable
 from src.participation import participate_activity
 from src.participation_log import participation_succeeded
 from src.pipeline.refresh_all_pipeline import PipelineResult, run_new_links_pipeline, run_refresh_all_pipeline
@@ -51,6 +49,10 @@ PARTICIPATE_TRIPLE_WORKERS = PARTICIPATE_TRIPLE_LIMIT
 REFRESH_ALL_PIPELINE_SUBSTEPS = 3
 REFRESH_WATCH_PIPELINE_SUBSTEPS = 3
 REFRESH_WATCH_TOTAL = 1 + REFRESH_WATCH_PIPELINE_SUBSTEPS
+PARTICIPATION_DEDUP_SKIP_REASONS = frozenset({
+    "already_joined", "participation_busy", "repost_pending", "repost_unknown",
+    "repost_suspected", "platform_joined",
+})
 
 
 def _deserialize_payload_actions(payload: dict[str, Any]) -> list[ActionResult]:
@@ -91,7 +93,17 @@ def _require_participate_success(payload: dict[str, Any]) -> None:
         raise RuntimeError(str(payload.get("message") or "参与失败"))
 
 
+def _is_participation_dedup_skip(payload: dict[str, Any]) -> bool:
+    return (
+        payload.get("status") == "skipped"
+        and payload.get("skip_reason") in PARTICIPATION_DEDUP_SKIP_REASONS
+        and not payload.get("actions")
+    )
+
+
 def _normalize_participate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if _is_participation_dedup_skip(payload):
+        return {**payload, "skipped": True}
     _require_participate_success(payload)
     return dict(payload)
 
@@ -104,20 +116,14 @@ def _participate_dynamic_payload(
     client: BilibiliClient | None = None,
 ) -> dict[str, Any]:
     resolved_type = resolve_participate_lottery_type(dynamic_id, hint=lottery_type_hint)
-    if client is not None:
-        payload = _execute_participate(
-            dynamic_id,
-            on_step,
-            lottery_type=resolved_type,
-            client=client,
-        )
-    else:
-        payload, _detail = _capture_output(
-            _execute_participate,
-            dynamic_id,
-            on_step,
-            lottery_type=resolved_type,
-        )
+    # Client creation and live preflight belong behind the shared local guard.
+    # Do not redirect process-global stdout from parallel participation workers.
+    payload = _execute_participate(
+        dynamic_id,
+        on_step,
+        lottery_type=resolved_type,
+        client=client,
+    )
     return _normalize_participate_payload(payload)
 
 
@@ -147,23 +153,18 @@ def _execute_participate(
     if resolved_type not in PARTICIPATABLE_TYPES:
         resolved_type = resolve_participate_lottery_type(dynamic_id)
 
-    def _run(active_client: BilibiliClient) -> dict[str, Any]:
-        result = participate_activity(
-            active_client,
-            dynamic_id=dynamic_id,
-            lottery_type=resolved_type,
-            dry_run=False,
-            persist=True,
-            on_step=on_step,
-        )
-        payload = result.to_dict()
-        payload["lottery_type"] = resolved_type
-        return payload
-
-    if client is not None:
-        return _run(client)
-    with BilibiliClient() as owned_client:
-        return _run(owned_client)
+    result = participate_activity(
+        client,
+        dynamic_id=dynamic_id,
+        lottery_type=resolved_type,
+        dry_run=False,
+        persist=True,
+        preflight=True,
+        on_step=on_step,
+    )
+    payload = result.to_dict()
+    payload["lottery_type"] = resolved_type
+    return payload
 
 
 def _append_log_detail(log_lines: list[str], detail: str) -> None:
@@ -843,19 +844,19 @@ def run_action(
             _raise_if_cancelled(cancel_event)
             progress(step=step, total=total, message=message, log_append=message)
 
-        with BilibiliClient() as client:
-            _raise_if_cancelled(cancel_event)
-            ensure_activity_participatable(client, dynamic_id, lottery_type_hint=lottery_type)
-            _raise_if_cancelled(cancel_event)
-            progress(step=0, total=total_steps, message="检查通过，开始参与…", log_append="活动可参与，开始执行参与步骤")
-            payload = _participate_dynamic_payload(
-                dynamic_id,
-                on_step,
-                lottery_type_hint=lottery_type,
-                client=client,
-            )
+        _raise_if_cancelled(cancel_event)
+        payload = _participate_dynamic_payload(
+            dynamic_id,
+            on_step,
+            lottery_type_hint=lottery_type,
+        )
 
-        mark_enriched_joined(dynamic_id)
+        if _is_participation_dedup_skip(payload):
+            message = str(payload.get("message") or "参与已跳过")
+            progress(step=total_steps, total=total_steps, message=message, log_append=message)
+            invalidate_activity_cache()
+            return {"ok": True, "message": message, "result": payload, "log": format_participation_log(payload)}
+
         refresh_local_activity_statuses()
         logger.info("参与活动成功 %s", dynamic_id)
         action_log = format_participation_log(payload)
@@ -922,6 +923,7 @@ def run_action(
         task_step_progress: dict[str, int] = {
             str(item.get("dynamic_id") or ""): 0 for item in targets
         }
+        completed_target_ids: set[str] = set()
         target_ids = [str(item.get("dynamic_id") or "") for item in targets]
 
         def _overall_progress_step() -> int:
@@ -972,7 +974,7 @@ def run_action(
             skip_markers = ("失败", "参与成功", "完成", "成功", "已停止", "已取消")
             with progress_lock:
                 for other_id in target_ids:
-                    if failed_id and other_id == failed_id:
+                    if other_id in completed_target_ids or (failed_id and other_id == failed_id):
                         continue
                     state = task_states.get(other_id, "")
                     if any(marker in state for marker in skip_markers):
@@ -991,33 +993,24 @@ def run_action(
                 task_states[dynamic_id] = "正在检查活动状态…"
             _emit_triple_progress(log_append=f"{title}：正在检查活动状态…")
 
-            with BilibiliClient() as client:
-                ensure_activity_participatable(
-                    client,
-                    dynamic_id,
-                    lottery_type_hint=target_lottery_type,
-                )
-                if cancel_event and cancel_event.is_set():
-                    raise ValueError("任务已取消")
+            def on_step(step: int, total: int, message: str, _action_name: str) -> None:
+                _report_task_progress(dynamic_id, step, total, message)
 
-                def on_step(step: int, total: int, message: str, _action_name: str) -> None:
-                    _report_task_progress(dynamic_id, step, total, message)
+            payload = _participate_dynamic_payload(
+                dynamic_id,
+                on_step,
+                lottery_type_hint=target_lottery_type,
+            )
 
-                payload = _participate_dynamic_payload(
-                    dynamic_id,
-                    on_step,
-                    lottery_type_hint=target_lottery_type,
-                    client=client,
-                )
-
-            mark_enriched_joined(dynamic_id)
+            skipped = _is_participation_dedup_skip(payload)
             with progress_lock:
-                task_states[dynamic_id] = str(payload.get("message") or "参与成功")
+                task_states[dynamic_id] = str(payload.get("message") or ("已跳过" if skipped else "参与成功"))
+                completed_target_ids.add(dynamic_id)
             plan_entry = progress_plan.get(dynamic_id)
             if plan_entry:
                 _, budget = plan_entry
                 task_step_progress[dynamic_id] = budget
-            _emit_triple_progress(log_append=f"{title}：参与成功")
+            _emit_triple_progress(log_append=f"{title}：{task_states[dynamic_id]}")
             return {
                 "dynamic_id": dynamic_id,
                 "activity_title": title,
@@ -1062,9 +1055,14 @@ def run_action(
         refresh_local_activity_statuses()
         results.sort(key=lambda item: target_ids.index(item["dynamic_id"]))
         log_blocks = [format_participation_log(item["payload"]) for item in results]
-        message = f"三连参与完成：{len(results)} 个活动全部成功"
+        skipped_count = sum(_is_participation_dedup_skip(item["payload"]) for item in results)
+        joined_count = len(results) - skipped_count
+        message = (
+            f"三连参与完成：成功 {joined_count} 个，已跳过 {skipped_count} 个"
+            if skipped_count else f"三连参与完成：{joined_count} 个活动全部成功"
+        )
         progress(step=total_steps, total=total_steps, message=message, log_append=message)
-        logger.info("三连参与成功 count=%s", len(results))
+        logger.info("三连参与完成 joined=%s skipped=%s", joined_count, skipped_count)
         invalidate_activity_cache()
         return {
             "ok": True,
@@ -1079,7 +1077,11 @@ def run_action(
                     for item in results
                 ],
                 "items": [item["payload"] for item in results],
-                "joined": len(results),
+                "joined": joined_count,
+                "skipped_count": skipped_count,
+                "failed": 0,
+                "skipped": bool(results) and skipped_count == len(results),
+                "from_auto": from_auto,
             },
             "log": "\n\n".join(log_blocks).strip(),
         }

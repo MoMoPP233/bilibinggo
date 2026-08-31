@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.bilibili_client import BilibiliClient
+from src.app_paths import ensure_user_dirs
 from src.fetch_activity_info import ENRICHED_OUTPUT_PATH
 from src.participation import participate_activity
 from src.sources.common import load_previous_output
@@ -48,22 +48,32 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        # CLI 可能是升级后的首个入口，先完成当前 Profile 的 schema 检查。
+        ensure_user_dirs()
         lottery_type = _lookup_lottery_type(args.dynamic_id)
     except RuntimeError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
 
-    with BilibiliClient() as client:
-        result = participate_activity(
-            client,
-            dynamic_id=args.dynamic_id,
-            lottery_type=lottery_type,
-            dry_run=False,
-            persist=True,
-        )
+    result = participate_activity(
+        dynamic_id=args.dynamic_id,
+        lottery_type=lottery_type,
+        dry_run=False,
+        persist=True,
+        preflight=True,
+    )
 
-    print(json.dumps(result.to_dict(), ensure_ascii=False))
-    return 0 if result.status == "joined" else 1
+    payload = result.to_dict()
+    print(json.dumps(payload, ensure_ascii=False))
+    dedup_skip = (
+        payload.get("status") == "skipped"
+        and payload.get("skip_reason") in {
+            "already_joined", "participation_busy", "repost_pending", "repost_unknown",
+            "repost_suspected", "platform_joined",
+        }
+        and not payload.get("actions")
+    )
+    return 0 if result.status == "joined" or dedup_skip else 1
 
 
 if __name__ == "__main__":

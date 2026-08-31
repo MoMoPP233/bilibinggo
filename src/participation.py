@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 import time
+from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
+
+import httpx
 
 from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient
@@ -10,8 +15,11 @@ from src.lottery_actions import (
     ACTION_INTERVAL_SEC,
     DEFAULT_PARTICIPATE_TEXT,
     ActionResult,
+    ParticipationReadClient,
+    build_dynamic_context,
     execute_full_participation,
     follow_user,
+    has_comment,
     is_following,
     resolve_sender_uid,
     _api_code,
@@ -29,7 +37,15 @@ from src.participation_log import (
     append_action_record_unlocked,
     serialize_actions,
 )
-from src.participation_store import set_participation_unlocked
+from src.participation_store import get_participation, set_participation_unlocked
+from src.participation_guard import (
+    ParticipationBusyError,
+    confirm_repost,
+    get_guard,
+    mark_repost_suspected,
+    participation_gate,
+)
+from src.participate_preflight import ActivityAlreadyJoined, ensure_activity_participatable
 from src.user_data_lock import user_data_lock
 from src.participate_text import resolve_participate_text_for_activity
 from src.fetch_activity_info import mark_enriched_joined
@@ -39,6 +55,7 @@ from src.sources.common import is_valid_dynamic_id, opus_link
 RESERVE_CLICK_URL = "https://api.bilibili.com/x/dynamic/feed/reserve/click"
 RESERVE_RESERVED_STATUS = 2
 RESERVE_PARTICIPATE_STEPS = 2
+_execution_uid: ContextVar[str | None] = ContextVar("participation_uid", default=None)
 
 @dataclass
 class ParticipateResult:
@@ -51,7 +68,7 @@ class ParticipateResult:
     context_snapshot: dict[str, Any]
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "dynamic_id": self.dynamic_id,
             "lottery_type": self.lottery_type,
             "status": self.status,
@@ -60,6 +77,28 @@ class ParticipateResult:
             "actions": serialize_actions(self.actions),
             "context_snapshot": self.context_snapshot,
         }
+        if self.status == "skipped" and self.context_snapshot.get("dedup_reason"):
+            payload["skipped"] = True
+            payload["skip_reason"] = self.context_snapshot["dedup_reason"]
+        return payload
+
+
+def _confirmed(value: Any) -> bool:
+    return value is True or (type(value) is int and value == 1)
+
+
+def _dedup_skip(dynamic_id: str, lottery_type: str, reason: str, message: str) -> ParticipateResult:
+    return ParticipateResult(
+        dynamic_id=dynamic_id, lottery_type=lottery_type, status="skipped",
+        message=message, action_text="", actions=[], context_snapshot={"dedup_reason": reason},
+    )
+
+
+def _save_platform_joined(dynamic_id: str, *, persist: bool, dry_run: bool) -> None:
+    if persist and not dry_run:
+        with user_data_lock():
+            set_participation_unlocked(dynamic_id, "已参加", uid=_execution_uid.get())
+        mark_enriched_joined(dynamic_id)
 
 
 def _notice_snapshot(notice: dict | None) -> dict[str, Any]:
@@ -118,9 +157,9 @@ def _persist_result(
         context_snapshot=result.context_snapshot,
     )
     with user_data_lock():
-        append_action_record_unlocked(record)
+        append_action_record_unlocked(record, uid=_execution_uid.get())
         if joined:
-            set_participation_unlocked(result.dynamic_id, "已参加")
+            set_participation_unlocked(result.dynamic_id, "已参加", uid=_execution_uid.get())
     if joined:
         mark_enriched_joined(result.dynamic_id)
 
@@ -172,29 +211,27 @@ def participate_five_action_lottery(
     persist: bool = True,
     on_step: Callable[[int, int, str, str], None] | None = None,
 ) -> ParticipateResult:
-    text, text_meta = _resolve_action_text(client, dynamic_id=dynamic_id, action_text=action_text)
+    reader = client if isinstance(client, ParticipationReadClient) else ParticipationReadClient(client)
+    text = action_text or DEFAULT_PARTICIPATE_TEXT
+    text_meta: dict[str, Any] = {}
     notice: dict | None = None
     sender_uid: int | None = None
 
-    try:
-        detail_item = fetch_dynamic_detail(client, dynamic_id)
-        if is_upower_dynamic(detail_item):
-            result = ParticipateResult(
-                dynamic_id=dynamic_id,
-                lottery_type=lottery_type,
-                status="skipped",
-                message="充电专属抽奖，不参与",
-                action_text=text,
-                actions=[],
-                context_snapshot={},
-            )
-            _persist_result(result=result, persist=persist, dry_run=dry_run)
-            return result
-    except RuntimeError:
-        pass
+    detail_item = fetch_dynamic_detail(reader, dynamic_id)
+    reader.raise_if_failed()
+    if not detail_item:
+        raise RuntimeError("无法获取动态详情，请稍后重试")
+    if is_upower_dynamic(detail_item):
+        result = ParticipateResult(
+            dynamic_id=dynamic_id, lottery_type=lottery_type, status="skipped",
+            message="充电专属抽奖，不参与", action_text=text, actions=[], context_snapshot={},
+        )
+        _persist_result(result=result, persist=persist, dry_run=dry_run)
+        return result
 
     if lottery_type == "互动抽奖":
-        resolved = fetch_notice_for_interact(client, dynamic_id)
+        resolved = fetch_notice_for_interact(reader, dynamic_id)
+        reader.raise_if_failed()
         if not resolved:
             result = ParticipateResult(
                 dynamic_id=dynamic_id,
@@ -223,16 +260,61 @@ def participate_five_action_lottery(
             return result
         sender_uid = int(notice.get("sender_uid") or 0) or None
 
+    uid = _execution_uid.get() or str(require_login()[1])
+    guard = get_guard(uid, dynamic_id)
+    if notice and _confirmed(notice.get("reposted")) and not dry_run:
+        confirm_repost(uid, dynamic_id)
+    if notice and _confirmed(notice.get("participated")):
+        _save_platform_joined(dynamic_id, persist=persist, dry_run=dry_run)
+        result = _dedup_skip(dynamic_id, lottery_type, "platform_joined", "平台已确认参与，已跳过")
+        _persist_result(result=result, persist=persist, dry_run=dry_run)
+        return result
+
+    context = build_dynamic_context(
+        reader, dynamic_id=dynamic_id, sender_uid=sender_uid, action_text="",
+        detail_item=detail_item, notice=notice,
+        repost_confirmed=bool(guard and guard.repost_status == "confirmed"),
+        check_comment=False, check_follow=False,
+    )
+    reader.raise_if_failed()
+    if context.reposted is True:
+        if not dry_run:
+            confirm_repost(uid, dynamic_id)
+    elif context.liked is True and context.favorited is True:
+        if not dry_run:
+            mark_repost_suspected(uid, dynamic_id)
+        result = _dedup_skip(
+            dynamic_id, lottery_type, "repost_suspected",
+            "已点赞并收藏，但无法确认是否转发；疑似已参与，已暂停自动转发，需人工确认",
+        )
+        _persist_result(result=result, persist=persist, dry_run=dry_run)
+        return result
+
+    # 疑似参与直接退出，不为这个分支额外查询关注、评论或生成文案。
+    context.followed = is_following(reader, uid=context.sender_uid, referer=context.referer)
+    reader.raise_if_failed()
+    # 只有确定要继续参与时才生成文案/检查评论，复用当前目标的读取快照。
+    text, text_meta = _resolve_action_text(reader, dynamic_id=dynamic_id, action_text=action_text)
+    context.commented = has_comment(
+        reader, rid=context.comment_rid, comment_type=context.comment_type,
+        action_text=text, referer=context.referer,
+    )
+    reader.raise_if_failed()
+    completed_actions: list[ActionResult] = []
     try:
         actions, context = execute_full_participation(
-            client,
+            reader,
             dynamic_id=dynamic_id,
             sender_uid=sender_uid,
             action_text=text,
             dry_run=dry_run,
             on_step=on_step,
+            context=context,
+            on_action=completed_actions.append,
         )
-    except RuntimeError as exc:
+    except Exception as exc:
+        # Keep completed actions even when a later request fails. Unexpected
+        # exceptions still propagate after preserving the diagnostic record.
         message = str(exc).strip() or "参与失败"
         if "无法获取动态详情" in message:
             message = "无法获取动态详情，请稍后重试"
@@ -242,10 +324,12 @@ def participate_five_action_lottery(
             status="failed",
             message=message,
             action_text=text,
-            actions=[],
-            context_snapshot=_notice_snapshot(notice),
+            actions=completed_actions,
+            context_snapshot=_context_snapshot(context, extra={**text_meta, "notice": _notice_snapshot(notice)}),
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
+        if not isinstance(exc, (RuntimeError, httpx.HTTPError, json.JSONDecodeError)):
+            raise
         return result
 
     if dry_run:
@@ -265,7 +349,7 @@ def participate_five_action_lottery(
 
     snapshot = _context_snapshot(
         context,
-        extra={**_notice_snapshot(notice), **text_meta},
+        extra={"notice": _notice_snapshot(notice), **text_meta},
     )
     result = ParticipateResult(
         dynamic_id=dynamic_id,
@@ -429,8 +513,10 @@ def participate_reserve_lottery(
     if on_step:
         on_step(1, total_steps, f"正在关注（1/{total_steps}）", "follow")
     try:
+        followed = is_following(client, uid=sender_uid, referer=referer)
+        if isinstance(client, ParticipationReadClient):
+            client.raise_if_failed()
         if dry_run:
-            followed = is_following(client, uid=sender_uid, referer=referer)
             follow_action = ActionResult(
                 "follow",
                 True,
@@ -438,7 +524,7 @@ def participate_reserve_lottery(
             )
         else:
             csrf, _ = require_login()
-            if is_following(client, uid=sender_uid, referer=referer):
+            if followed:
                 follow_action = ActionResult("follow", True, f"uid={sender_uid} 已关注，跳过")
             else:
                 follow_action = follow_user(client, uid=sender_uid, csrf=csrf, referer=referer)
@@ -509,7 +595,7 @@ def participate_reserve_lottery(
     return result
 
 
-def participate_activity(
+def _participate_activity_unlocked(
     client: BilibiliClient,
     *,
     dynamic_id: str,
@@ -564,3 +650,97 @@ def participate_activity(
             on_step=on_step,
         )
     raise RuntimeError(f"不支持的抽奖类型: {lottery_type}")
+
+
+def participate_activity(
+    client: BilibiliClient | None = None,
+    *,
+    dynamic_id: str,
+    lottery_type: str,
+    action_text: str | None = None,
+    dry_run: bool = False,
+    persist: bool = True,
+    on_step: Callable[[int, int, str, str], None] | None = None,
+    preflight: bool = False,
+) -> ParticipateResult:
+    """Web、自动与 CLI 共用入口：跨进程锁内先查本地，再访问当前目标。
+
+    persist 控制参与日志/整体成功记录；非预演转发的防重记录始终持久化。
+    """
+    dynamic_id = str(dynamic_id or "").strip()
+    if not is_valid_dynamic_id(dynamic_id):
+        raise ValueError("dynamic_id 无效")
+    if lottery_type not in PARTICIPATABLE_TYPES and lottery_type != "充电抽奖":
+        raise RuntimeError(f"不支持的抽奖类型: {lottery_type}")
+    _, account_uid = require_login()  # 只读本地 Cookie，不发登录/目标状态请求。
+    uid = str(account_uid)
+
+    def checked_step(step: int, total: int, message: str, action: str) -> None:
+        if str(require_login()[1]) != uid:
+            raise RuntimeError("参与期间登录账号发生变化，已停止操作")
+        if on_step:
+            on_step(step, total, message, action)
+
+    try:
+        with participation_gate(uid, dynamic_id):
+            token = _execution_uid.set(uid)
+            try:
+                local = get_participation(dynamic_id, uid=uid)
+                if local is not None and local.user_status == "已参加":
+                    return _dedup_skip(dynamic_id, lottery_type, "already_joined", "本地已记录参加，已跳过")
+                guard = get_guard(uid, dynamic_id)
+                if guard and guard.repost_status in {"pending", "unknown", "suspected"}:
+                    labels = {
+                        "pending": "曾发起转发，结果尚未确认",
+                        "unknown": "上次转发结果未知",
+                        "suspected": "存在疑似参与痕迹",
+                    }
+                    return _dedup_skip(
+                        dynamic_id, lottery_type, f"repost_{guard.repost_status}",
+                        f"{labels[guard.repost_status]}，禁止自动重发，需人工确认",
+                    )
+                checked_step(0, RESERVE_PARTICIPATE_STEPS if lottery_type == "预约抽奖" else 5,
+                             "本地防重检查通过，正在检查当前目标…", "check")
+                # 本地明确成功/待确认时不会构造客户端，亦不会发生暖机请求。
+                manager = nullcontext(client) if client is not None else BilibiliClient(warmup=False)
+                with manager as active_client:
+                    reader = (
+                        active_client if isinstance(active_client, ParticipationReadClient)
+                        else ParticipationReadClient(active_client)
+                    )
+                    if preflight:
+                        try:
+                            ensure_activity_participatable(
+                                reader, dynamic_id, lottery_type_hint=lottery_type, uid=uid,
+                            )
+                            reader.raise_if_failed()
+                        except ActivityAlreadyJoined as exc:
+                            reader.raise_if_failed()
+                            fresh_local = get_participation(dynamic_id, uid=uid)
+                            if fresh_local and fresh_local.user_status == "已参加":
+                                return _dedup_skip(dynamic_id, lottery_type, "already_joined", "本地已记录参加，已跳过")
+                            if lottery_type == "互动抽奖":
+                                resolved = fetch_notice_for_interact(reader, dynamic_id)
+                                reader.raise_if_failed()
+                                if resolved and _confirmed(resolved[0].get("reposted")) and not dry_run:
+                                    confirm_repost(uid, dynamic_id)
+                            if exc.item.get("platform_participated") is True:
+                                _save_platform_joined(dynamic_id, persist=persist, dry_run=dry_run)
+                            result = _dedup_skip(
+                                dynamic_id, lottery_type, "platform_joined", "平台已确认参与，已跳过",
+                            )
+                            _persist_result(result=result, persist=persist, dry_run=dry_run)
+                            return result
+                    checked_step(0, RESERVE_PARTICIPATE_STEPS if lottery_type == "预约抽奖" else 5,
+                                 "检查当前目标参与状态…", "check")
+                    return _participate_activity_unlocked(
+                        reader, dynamic_id=dynamic_id, lottery_type=lottery_type,
+                        action_text=action_text, dry_run=dry_run, persist=persist,
+                        on_step=checked_step,
+                    )
+            finally:
+                _execution_uid.reset(token)
+    except ParticipationBusyError:
+        return _dedup_skip(
+            dynamic_id, lottery_type, "participation_busy", "当前账号正在处理这个动态，已跳过重复请求",
+        )

@@ -66,8 +66,10 @@ def load_action_entries_for_uid(uid: str | None = None) -> list[dict]:
         return entries
 
 
-def append_action_record_unlocked(record: ParticipationActionRecord) -> None:
-    uid = participation_uid()
+def append_action_record_unlocked(
+    record: ParticipationActionRecord, *, uid: str | None = None,
+) -> None:
+    uid = uid if uid is not None else participation_uid()
     with session_scope() as session:
         session.add(
             ParticipationActionRow(

@@ -42,8 +42,24 @@ def load_participations() -> dict[str, ParticipationRecord]:
         return result
 
 
-def set_participation_unlocked(dynamic_id: str, user_status: ParticipationStatus) -> ParticipationRecord:
-    uid = participation_uid()
+def get_participation(dynamic_id: str, *, uid: str | None = None) -> ParticipationRecord | None:
+    """仅查询当前目标；显式 UID 用于冻结整次参与的账号身份。"""
+    key = uid if uid is not None else participation_uid()
+    with session_scope() as session:
+        row = session.get(ParticipationRow, (key, dynamic_id))
+        if row is None or row.user_status not in ("已参加", "未参加"):
+            return None
+        return ParticipationRecord(
+            dynamic_id=str(row.dynamic_id),
+            user_status=row.user_status,
+            updated_at=int(row.updated_at or 0),
+        )
+
+
+def set_participation_unlocked(
+    dynamic_id: str, user_status: ParticipationStatus, *, uid: str | None = None,
+) -> ParticipationRecord:
+    uid = uid if uid is not None else participation_uid()
     record = ParticipationRecord(
         dynamic_id=dynamic_id,
         user_status=user_status,

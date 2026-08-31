@@ -27,19 +27,20 @@ def test_init_db_idempotent(isolated_home: Path) -> None:
     assert db_path().parent == isolated_home / "data"
 
 
-def test_init_db_repairs_inflated_schema_meta(isolated_home: Path) -> None:
-    """开发版误标 schema_meta 高于代码时，表结构已齐则自动回写。"""
+def test_init_db_rejects_future_schema_meta_without_downgrade(isolated_home: Path) -> None:
+    """不能把真实未来版本误当成开发版误标并静默降级。"""
     init_db()
     with session_scope() as session:
         meta = session.get(SchemaMeta, 1)
         assert meta is not None
         meta.version = SCHEMA_VERSION + 1
         session.commit()
-    init_db()
+    with pytest.raises(RuntimeError, match="schema_version"):
+        init_db()
     with session_scope() as session:
         meta = session.get(SchemaMeta, 1)
         assert meta is not None
-        assert int(meta.version) == SCHEMA_VERSION
+        assert int(meta.version) == SCHEMA_VERSION + 1
 
 
 def test_activity_codec_preserves_business_type_int(isolated_home: Path) -> None:

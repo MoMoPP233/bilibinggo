@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Column, Index, Text
+from sqlalchemy import CheckConstraint, Column, Index, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -70,6 +70,21 @@ class ParticipationActionRow(SQLModel, table=True):
     action_text: str = ""
     actions_json: str = Field(default="[]", sa_column=Column(Text, nullable=False))
     context_snapshot_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+
+
+class ParticipationGuardRow(SQLModel, table=True):
+    __tablename__ = "participation_guard"
+    __table_args__ = (
+        CheckConstraint(
+            "repost_status IN ('pending','confirmed','unknown','suspected')",
+            name="ck_participation_guard_repost_status",
+        ),
+    )
+
+    uid: str = Field(primary_key=True, max_length=64)
+    dynamic_id: str = Field(primary_key=True, max_length=32)
+    repost_status: str = Field(max_length=16)
+    updated_at: int = 0
 
 
 class SourceCheckpointRow(SQLModel, table=True):

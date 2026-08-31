@@ -43,6 +43,9 @@ export function renderStats(summary) {
 }
 
 export function buildActivityParticipateBtn(item) {
+  if (item.participation_blocked) {
+    return `<span class="caption" title="${escapeHtml(item.skip_reason || "转发状态待确认，已暂停参与")}">需确认</span>`;
+  }
   if (item.can_participate) {
     return `<button class="btn btn-primary btn-compact btn-pill" data-action="participate" data-dynamic-id="${escapeHtml(item.dynamic_id)}">参与</button>`;
   }

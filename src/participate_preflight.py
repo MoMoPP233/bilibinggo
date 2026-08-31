@@ -16,9 +16,15 @@ from src.lottery_api import (
 )
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
 from src.lottery_time import lottery_time_unix
-from src.participation_store import ParticipationRecord, load_participations
+from src.participation_store import ParticipationRecord, get_participation, load_participations
 from src.sources.common import is_valid_dynamic_id, load_previous_output
 from src.status_refresh import persist_activity_record
+
+
+class ActivityAlreadyJoined(RuntimeError):
+    def __init__(self, item: dict[str, Any]) -> None:
+        super().__init__("活动当前为「已参加」，已跳过")
+        self.item = item
 
 
 def _load_activity_item(dynamic_id: str) -> dict | None:
@@ -30,8 +36,11 @@ def _load_activity_item(dynamic_id: str) -> dict | None:
 
 
 def _apply_notice_fields(item: dict, notice: dict) -> None:
-    if "participated" in notice:
-        item["platform_participated"] = bool(notice.get("participated"))
+    value = notice.get("participated")
+    # 缺字段/异常类型不是未参加，也不能沿用缓存中的账号状态作为新证据。
+    item["platform_participated"] = (
+        bool(value) if type(value) in (bool, int) and value in (0, 1) else None
+    )
     lottery_time = int(notice.get("lottery_time") or 0)
     if lottery_time:
         item["lottery_time"] = lottery_time
@@ -51,6 +60,8 @@ def _sync_live_fields(
     lottery_type: str,
 ) -> None:
     dynamic_id = str(item.get("dynamic_id") or "")
+    # Cached account state must not become positive evidence for this request.
+    item["platform_participated"] = None
     detail = fetch_dynamic_detail(client, dynamic_id)
     if not detail:
         raise RuntimeError("无法打开活动链接，请稍后重试")
@@ -66,9 +77,9 @@ def _sync_live_fields(
         return
 
     if lottery_type == "预约抽奖":
-        item["reserve_reserved"] = fetch_reserve_button_status(client, dynamic_id)
+        item["reserve_reserved"] = fetch_reserve_button_status(client, dynamic_id, detail_item=detail)
         try:
-            resolved = fetch_notice_for_reserve(client, dynamic_id)
+            resolved = fetch_notice_for_reserve(client, dynamic_id, detail_item=detail)
         except RuntimeError:
             resolved = None
         if resolved:
@@ -92,6 +103,7 @@ def refresh_activity_status_from_live(
     dynamic_id: str,
     *,
     lottery_type_hint: str | None = None,
+    uid: str | None = None,
 ) -> dict[str, Any]:
     """打开活动链接同步最新状态，写回本地并返回更新后的记录。"""
     dynamic_id = str(dynamic_id or "").strip()
@@ -111,7 +123,10 @@ def refresh_activity_status_from_live(
 
     item["lottery_type"] = lottery_type
     _sync_live_fields(client, item, lottery_type=lottery_type)
-    participation = load_participations().get(dynamic_id)
+    participation = (
+        get_participation(dynamic_id, uid=uid)
+        if uid is not None else load_participations().get(dynamic_id)
+    )
     return persist_activity_record(item, participation=participation)
 
 
@@ -120,14 +135,21 @@ def ensure_activity_participatable(
     dynamic_id: str,
     *,
     lottery_type_hint: str | None = None,
+    uid: str | None = None,
 ) -> dict[str, Any]:
     """参与前检查：同步状态后必须为未参加且未结束。"""
+    local = get_participation(dynamic_id, uid=uid)
+    if local is not None and local.user_status == "已参加":
+        raise ActivityAlreadyJoined({"dynamic_id": dynamic_id, "activity_status": "已参加"})
     item = refresh_activity_status_from_live(
         client,
         dynamic_id,
         lottery_type_hint=lottery_type_hint,
+        uid=uid,
     )
     status = str(item.get("activity_status") or "")
+    if status == "已参加":
+        raise ActivityAlreadyJoined(item)
     if status != "未参加":
         raise RuntimeError(f"活动当前为「{status}」，无法参与")
     if str(item.get("draw_status") or "") == "ended":

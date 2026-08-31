@@ -208,10 +208,8 @@ def test_run_action_participate_triple_concurrent(monkeypatch: pytest.MonkeyPatc
     with (
         patch("web.actions.pick_triple_participate_targets", return_value=targets),
         patch("web.actions.resolve_participate_lottery_type", return_value="互动抽奖"),
-        patch("web.actions.ensure_activity_participatable"),
         patch("web.actions._execute_participate", side_effect=fake_execute),
         patch("web.actions.invalidate_activity_cache"),
-        patch("web.actions.mark_enriched_joined"),
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient", FakeClient),
     ):
@@ -219,7 +217,9 @@ def test_run_action_participate_triple_concurrent(monkeypatch: pytest.MonkeyPatc
 
     assert set(calls) == {_id(101), _id(102)}
     assert len(calls) == 2
-    assert len(client_instances) == 2
+    # The shared guarded service owns deferred client creation; Web must not
+    # create a client before its local idempotency check.
+    assert len(client_instances) == 0
     assert payload["ok"] is True
     assert payload["result"]["joined"] == 2
     assert len(payload["result"]["items"]) == 2
@@ -253,10 +253,8 @@ def test_run_action_participate_triple_fail_fast_stops_other_targets() -> None:
     with (
         patch("web.actions.pick_triple_participate_targets", return_value=targets),
         patch("web.actions.resolve_participate_lottery_type", return_value="互动抽奖"),
-        patch("web.actions.ensure_activity_participatable"),
         patch("web.actions._execute_participate", side_effect=fake_execute),
         patch("web.actions.invalidate_activity_cache"),
-        patch("web.actions.mark_enriched_joined"),
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
@@ -280,11 +278,9 @@ def test_run_action_participate_triple_rejects_joined_with_failed_core_action() 
 
     with (
         patch("web.actions.pick_triple_participate_targets", return_value=targets),
-        patch("web.actions.ensure_activity_participatable"),
         patch("web.actions._execute_participate", return_value=fake_payload),
         patch("web.actions.resolve_participate_lottery_type", return_value="互动抽奖"),
         patch("web.actions.invalidate_activity_cache"),
-        patch("web.actions.mark_enriched_joined"),
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
@@ -327,10 +323,8 @@ def test_run_action_participate_triple_uses_mixed_progress_budget() -> None:
     with (
         patch("web.actions.pick_triple_participate_targets", return_value=targets),
         patch("web.actions.resolve_participate_lottery_type", side_effect=lambda dynamic_id, **_: "预约抽奖" if dynamic_id == _id(1) else "互动抽奖"),
-        patch("web.actions.ensure_activity_participatable"),
         patch("web.actions._execute_participate", side_effect=fake_execute),
         patch("web.actions.invalidate_activity_cache"),
-        patch("web.actions.mark_enriched_joined"),
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
@@ -365,10 +359,8 @@ def test_run_action_participate_triple_emits_targets_in_initial_progress() -> No
     with (
         patch("web.actions.pick_triple_participate_targets", return_value=targets),
         patch("web.actions.resolve_participate_lottery_type", side_effect=lambda dynamic_id, **_: "预约抽奖" if dynamic_id == _id(1) else "互动抽奖"),
-        patch("web.actions.ensure_activity_participatable"),
         patch("web.actions._execute_participate", side_effect=fake_execute),
         patch("web.actions.invalidate_activity_cache"),
-        patch("web.actions.mark_enriched_joined"),
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
@@ -414,10 +406,8 @@ def test_run_action_participate_triple_uses_lookup_type_for_execution() -> None:
     with (
         patch("web.actions.pick_triple_participate_targets", return_value=targets),
         patch("web.actions.resolve_participate_lottery_type", return_value="预约抽奖"),
-        patch("web.actions.ensure_activity_participatable"),
         patch("web.actions._execute_participate", side_effect=fake_execute),
         patch("web.actions.invalidate_activity_cache"),
-        patch("web.actions.mark_enriched_joined"),
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
