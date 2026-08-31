@@ -5,6 +5,8 @@ import re
 import threading
 import time
 
+import httpx
+
 from src.bilibili_client import BilibiliClient
 from src.lottery_classifier import UPOWER_BUSINESS_TYPE
 from src.sources.common import opus_link
@@ -23,6 +25,8 @@ LOTTERY_NOTICE_URL = "https://api.vc.bilibili.com/lottery_svr/v1/lottery_svr/lot
 DYNAMIC_DETAIL_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail"
 OPUS_DETAIL_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail"
 OPUS_DETAIL_FEATURES = "htmlNewStyle,ugcDelete,editable,opusPrivateVisible"
+
+_OPUS_UNREADABLE_CODES = frozenset({-404, 404, -403, -509, -799})
 
 RESERVE_RESERVED_STATUS = 2
 
@@ -177,6 +181,77 @@ def _fetch_opus_detail_item(client: BilibiliClient, dynamic_id: str) -> dict | N
         return None
     item = (data.get("data") or {}).get("item") or {}
     return item or None
+
+
+class OpusReadError(RuntimeError):
+    """已知的 Opus 读取失败；调用方可记录原因并跳过当前链接。"""
+
+
+class OpusRiskControlError(OpusReadError):
+    """Opus 接口明确触发 -352 风控，应停止本次后续 Opus 探测。"""
+
+
+def fetch_opus_detail_item_strict(
+    client: BilibiliClient,
+    dynamic_id: str,
+) -> dict | None:
+    """读取原始 Opus 结构，不吞未知异常，也不丢弃正文模块。
+
+    只有接口明确回退到同一 ID 的普通动态时返回 None。缺少 item 不代表
+    普通动态，否则不可读的合集会被误送入后续转发抽奖分类。
+    """
+    try:
+        payload = client.request_json(
+            OPUS_DETAIL_URL,
+            {"id": dynamic_id, "features": OPUS_DETAIL_FEATURES},
+            referer=opus_link(dynamic_id),
+            retries=0,
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        raise OpusReadError(f"opus/detail 请求失败: {exc}") from exc
+    except RuntimeError as exc:
+        # request_json 只会将网络请求错误包装成此带 cause 的 RuntimeError。
+        # JSON 解析失败或程序错误不能作为可忽略的容器读取错误处理。
+        if isinstance(exc.__cause__, httpx.RequestError):
+            raise OpusReadError(f"opus/detail 请求失败: {exc}") from exc
+        raise
+
+    if not isinstance(payload, dict):
+        raise TypeError("opus/detail 响应必须是对象")
+    code = payload.get("code")
+    if type(code) is not int:
+        raise ValueError("opus/detail 响应缺少有效的整数 code")
+    if code == -352:
+        raise OpusRiskControlError(f"opus/detail API error {code}: {payload.get('message') or ''}")
+    if code in _OPUS_UNREADABLE_CODES:
+        raise OpusReadError(f"opus/detail API error {code}: {payload.get('message') or ''}")
+    if code != 0:
+        raise RuntimeError(f"opus/detail API error {code}: {payload.get('message') or ''}")
+
+    data = payload.get("data")
+    if data is None:
+        raise OpusReadError("opus/detail 未返回正文数据")
+    if not isinstance(data, dict):
+        raise TypeError("opus/detail data 必须是对象")
+    item = data.get("item")
+    if item is not None and not isinstance(item, dict):
+        raise TypeError("opus/detail item 必须是对象或 null")
+    if item:
+        return item
+
+    fallback = data.get("fallback")
+    if fallback is not None and not isinstance(fallback, dict):
+        raise TypeError("opus/detail fallback 必须是对象或 null")
+    if (
+        "item" in data
+        and item is None
+        and isinstance(fallback, dict)
+        and type(fallback.get("type")) is int
+        and fallback["type"] == 1
+        and str(fallback.get("id") or "") == dynamic_id
+    ):
+        return None
+    raise OpusReadError("opus/detail 缺少正文，且未明确回退到同一普通动态")
 
 
 def is_upower_dynamic(item: dict | None) -> bool:

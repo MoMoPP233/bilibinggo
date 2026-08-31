@@ -293,7 +293,19 @@ def _run_ds_check(
     source_id: str,
     check_update: Callable[..., Any],
     save_result: Callable[[Any], Any],
+    *,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[int, dict[str, Any], str, CheckResult]:
+    source_log_lines: list[str] = []
+
+    def on_source_progress(done: int, total: int, message: str) -> None:
+        cleaned = sanitize_log(str(message or "").strip())
+        if not cleaned:
+            return
+        source_log_lines.append(f"【{source_id}】{cleaned}")
+        if on_progress is not None:
+            on_progress(done, total, cleaned)
+
     with log_span(
         f"ds_check:{source_id}",
         logger=logger,
@@ -301,7 +313,10 @@ def _run_ds_check(
         source_id=source_id,
         phase="ds_check",
     ):
-        result, detail = _capture_output(check_update, force=False)
+        check_kwargs: dict[str, Any] = {"force": False}
+        if source_id == "DS-3":
+            check_kwargs["on_progress"] = on_source_progress
+        result, detail = _capture_output(check_update, **check_kwargs)
         out_path = save_result(result)
     status_text = "发现新专栏，已爬取" if result.updated else "同一专栏，已跳过"
     log_line = f"【{source_id}】{status_text}，共 {len(result.activity_links)} 条链接"
@@ -313,6 +328,7 @@ def _run_ds_check(
         "log_line": log_line,
         "detail": detail.strip(),
         "status_text": status_text,
+        "source_log_lines": source_log_lines,
     }
     return index, payload, log_line, result
 
@@ -320,6 +336,26 @@ def _run_ds_check(
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise ValueError("任务已取消")
+
+
+def _make_ds_source_progress(
+    progress: ProgressCallback,
+    *,
+    source_id: str,
+    step: int,
+    total: int,
+    cancel_event: threading.Event | None,
+) -> Callable[[int, int, str], None]:
+    def on_source_progress(_done: int, _total: int, message: str) -> None:
+        _raise_if_cancelled(cancel_event)
+        progress(
+            step=step,
+            total=total,
+            message=f"{source_id}：{message}",
+            log_append=f"【{source_id}】{message}",
+        )
+
+    return on_source_progress
 
 
 def run_action(
@@ -412,6 +448,15 @@ def run_action(
                     source_id,
                     check_update,
                     save_result,
+                    **({
+                        "on_progress": _make_ds_source_progress(
+                            progress,
+                            source_id=source_id,
+                            step=0,
+                            total=REFRESH_ALL_TOTAL,
+                            cancel_event=cancel_event,
+                        )
+                    } if source_id == "DS-3" and on_progress is not None else {}),
                 ): source_id
                 for index, (source_id, check_update, save_result) in enumerate(DS_HANDLERS, start=1)
             }
@@ -438,6 +483,9 @@ def run_action(
                     "saved": payload["saved"],
                 }
             )
+            # JobRunner 完成后以 payload.log 覆盖实时日志；保留来源阶段的
+            # 细节和部分失败警告，避免成功状态将它们清空。
+            log_lines.extend(payload.get("source_log_lines") or [])
             log_lines.append(log_line)
             progress(
                 step=index,
@@ -545,8 +593,20 @@ def run_action(
             message=f"正在检查 {source_id}…",
         )
         _raise_if_cancelled(cancel_event)
-        _, payload, log_line, check_result = _run_ds_check(1, source_id, check_update, save_result)
+        source_progress_kwargs: dict[str, Any] = {}
+        if source_id == "DS-3" and on_progress is not None:
+            source_progress_kwargs["on_progress"] = _make_ds_source_progress(
+                progress,
+                source_id=source_id,
+                step=1,
+                total=REFRESH_SOURCE_TOTAL,
+                cancel_event=cancel_event,
+            )
+        _, payload, log_line, check_result = _run_ds_check(
+            1, source_id, check_update, save_result, **source_progress_kwargs
+        )
         _raise_if_cancelled(cancel_event)
+        log_lines.extend(payload.get("source_log_lines") or [])
         log_lines.append(log_line)
         progress(
             step=1,
