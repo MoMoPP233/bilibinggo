@@ -51,9 +51,10 @@ def _outcome_with_api_cache(
     return outcome
 
 
-def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcome:
-    """API 优先分类；其余由 LLM 判断是否为转发抽奖。skipped 不落库。"""
-    ctx = ClassifyFetchContext(client, dynamic_id)
+def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
+    """纯分类能力：复用同一上下文内的 detail/notice 缓存，不触碰任何存储。"""
+    client = ctx.client
+    dynamic_id = ctx.dynamic_id
     referer = opus_link(dynamic_id)
     if ctx.is_deleted_link():
         return ClassifyOutcome(dynamic_id, None, True, "链接失效")
@@ -67,7 +68,9 @@ def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcom
         business_id=dynamic_id,
         business_type=1,
         referer=referer,
-        retries=1,
+        retries=ctx._notice_fetch_retries,
+        request_retries=ctx._notice_fetch_retries,
+        on_risk=ctx._record_risk,
     )
     if interact_notice and interact_notice.get("lottery_id"):
         return _outcome_with_api_cache(
@@ -83,7 +86,9 @@ def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcom
         business_id=dynamic_id,
         business_type=UPOWER_BUSINESS_TYPE,
         referer=referer,
-        retries=1,
+        retries=ctx._notice_fetch_retries,
+        request_retries=ctx._notice_fetch_retries,
+        on_risk=ctx._record_risk,
     )
     if upower_notice and upower_notice.get("lottery_id"):
         return ClassifyOutcome(dynamic_id, "充电抽奖", True, "充电抽奖")
@@ -131,3 +136,18 @@ def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcom
         ),
         ctx,
     )
+
+
+def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcome:
+    """API 优先分类；其余由 LLM 判断是否为转发抽奖。skipped 不落库。"""
+    return classify_with_context(ClassifyFetchContext(client, dynamic_id))
+
+
+def classify_for_cleanup(
+    client: BilibiliClient,
+    dynamic_id: str,
+) -> tuple[ClassifyOutcome, int | None]:
+    """清理评估专用：retries=0 串行复用同一套公共分类能力，返回 (outcome, risk_code)。"""
+    ctx = ClassifyFetchContext(client, dynamic_id, retries=0)
+    outcome = classify_with_context(ctx)
+    return outcome, ctx.risk_control_code()

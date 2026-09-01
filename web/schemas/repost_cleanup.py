@@ -8,5 +8,6 @@ class RepostCleanupDeleteRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    repost_dynamic_ids: list[str] = Field(min_length=1, max_length=100)
+    repost_dynamic_ids: list[str] = Field(min_length=1, max_length=20)
     confirmed: bool = False
+    manual_review_confirmed: bool = False

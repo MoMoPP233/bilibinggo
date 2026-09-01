@@ -11,7 +11,7 @@ from src.db.models import SchemaMeta
 # 确保全部表注册到 metadata
 from src.db import models as _models  # noqa: F401
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _JOB_V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("label", "TEXT NOT NULL DEFAULT ''"),
@@ -97,7 +97,8 @@ def _validate_columns(
     label: str,
 ) -> None:
     columns = _table_columns(session, table)
-    if {str(row[1]) for row in columns} != set(expected_types):
+    actual_names = {str(row[1]) for row in columns}
+    if not set(expected_types) <= actual_names:
         raise RuntimeError(f"{label} 表结构不完整，无法安全启用转发清理")
     actual_primary_key = [
         str(row[1]) for row in sorted(columns, key=lambda row: row[5]) if row[5]
@@ -108,7 +109,7 @@ def _validate_columns(
     if nullable_required:
         raise RuntimeError(f"{label} 非空约束不匹配，无法安全启用转发清理")
     actual_types = {str(row[1]): str(row[2]).upper() for row in columns}
-    if actual_types != expected_types:
+    if any(actual_types.get(name) != typ for name, typ in expected_types.items()):
         raise RuntimeError(f"{label} 字段类型不匹配，无法安全启用转发清理")
 
 
@@ -225,6 +226,99 @@ def _validate_repost_assessment_table(session: Session) -> None:
     )
 
 
+def _validate_repost_v6_columns(session: Session) -> None:
+    _validate_columns(
+        session,
+        table="repost_history",
+        expected_types={
+            "identity_source": "VARCHAR(16)",
+            "identity_checked_at": "INTEGER",
+            "identity_ok": "BOOLEAN",
+            "identity_error": "TEXT",
+        },
+        primary_key=["uid", "repost_dynamic_id"],
+        required=set(),
+        label="repost_history v6",
+    )
+    _validate_columns(
+        session,
+        table="repost_assessment",
+        expected_types={
+            "assessment_level": "VARCHAR(16)",
+            "reason_code": "VARCHAR(32)",
+            "classification_source": "VARCHAR(16)",
+            "summary": "TEXT",
+            "evaluated_at": "INTEGER",
+            "remote_checked_at": "INTEGER",
+        },
+        primary_key=["uid", "original_dynamic_id"],
+        required={"assessment_level", "classification_source"},
+        label="repost_assessment v6",
+    )
+
+
+def _table_has_columns(conn, table: str, names: set[str]) -> bool:
+    existing = {str(row[1]) for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+    return names <= existing
+
+
+def migrate_v5_to_v6(session: Session) -> None:
+    """纯增量升级：身份证据列 + 三级评估列；既有 history_import 保留严格身份证据。"""
+    conn = session.connection()
+    if not _table_has_columns(
+        conn, "repost_history", {"identity_source", "identity_checked_at", "identity_ok", "identity_error"}
+    ):
+        conn.execute(text("ALTER TABLE repost_history ADD COLUMN identity_source VARCHAR(16)"))
+        conn.execute(text("ALTER TABLE repost_history ADD COLUMN identity_checked_at INTEGER"))
+        conn.execute(text("ALTER TABLE repost_history ADD COLUMN identity_ok BOOLEAN"))
+        conn.execute(text("ALTER TABLE repost_history ADD COLUMN identity_error TEXT"))
+    conn.execute(
+        text(
+            "UPDATE repost_history SET "
+            "identity_source='legacy_space_feed', identity_ok=1, "
+            "identity_checked_at=COALESCE(last_seen_at, updated_at, 0) "
+            "WHERE source='history_import' AND identity_source IS NULL"
+        )
+    )
+    if not _table_has_columns(
+        conn,
+        "repost_assessment",
+        {
+            "assessment_level",
+            "reason_code",
+            "classification_source",
+            "summary",
+            "evaluated_at",
+            "remote_checked_at",
+        },
+    ):
+        conn.execute(
+            text(
+                "ALTER TABLE repost_assessment "
+                "ADD COLUMN assessment_level VARCHAR(16) NOT NULL DEFAULT 'safe'"
+            )
+        )
+        conn.execute(text("ALTER TABLE repost_assessment ADD COLUMN reason_code VARCHAR(32)"))
+        conn.execute(
+            text(
+                "ALTER TABLE repost_assessment "
+                "ADD COLUMN classification_source VARCHAR(16) NOT NULL DEFAULT 'activities'"
+            )
+        )
+        conn.execute(text("ALTER TABLE repost_assessment ADD COLUMN summary TEXT"))
+        conn.execute(text("ALTER TABLE repost_assessment ADD COLUMN evaluated_at INTEGER"))
+        conn.execute(text("ALTER TABLE repost_assessment ADD COLUMN remote_checked_at INTEGER"))
+    conn.execute(
+        text(
+            "UPDATE repost_assessment SET "
+            "assessment_level='safe', classification_source='legacy', reason_code='v1_safe', "
+            "evaluated_at=COALESCE(assessed_at, updated_at, 0), "
+            "remote_checked_at=COALESCE(assessed_at, 0)"
+        )
+    )
+    _validate_repost_v6_columns(session)
+
+
 def migrate_v3_to_v4(session: Session) -> None:
     """纯增表建立个人转发历史与增量扫描锚点，不触碰参与保护或旧业务表。"""
     conn = session.connection()
@@ -314,6 +408,7 @@ _MIGRATIONS: dict[int, Callable[[Session], None]] = {
     2: migrate_v2_to_v3,
     3: migrate_v3_to_v4,
     4: migrate_v4_to_v5,
+    5: migrate_v5_to_v6,
 }
 
 
@@ -366,6 +461,8 @@ def init_db() -> None:
                     _validate_repost_history_tables(session)
                 if recorded is not None and int(recorded) >= 5:
                     _validate_repost_assessment_table(session)
+                if recorded is not None and int(recorded) >= 6:
+                    _validate_repost_v6_columns(session)
                 SQLModel.metadata.create_all(conn)
                 meta = session.get(SchemaMeta, 1)
                 current = int(meta.version) if meta is not None else 1
@@ -384,6 +481,7 @@ def init_db() -> None:
                 _validate_participation_guard_table(session)
                 _validate_repost_history_tables(session)
                 _validate_repost_assessment_table(session)
+                _validate_repost_v6_columns(session)
                 session.flush()
             conn.commit()
         except Exception:

@@ -91,7 +91,13 @@ export const pagination = document.getElementById("pagination");
 
 export const repostHistoryTotal = document.getElementById("repost-history-total");
 
-export const repostCandidateTotal = document.getElementById("repost-candidate-total");
+export const repostSafeTotal = document.getElementById("repost-safe-total");
+
+export const repostManualTotal = document.getElementById("repost-manual-total");
+
+export const repostBlockedTotal = document.getElementById("repost-blocked-total");
+
+export const repostPendingTotal = document.getElementById("repost-pending-total");
 
 export const repostCheckpointStatus = document.getElementById("repost-checkpoint-status");
 

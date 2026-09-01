@@ -867,16 +867,16 @@ def run_action(
     if action == "scan_expired_reposts":
         from src.repost_cleanup import scan_expired_reposts
 
-        if params:
-            raise ValueError("扫描过期抽奖不接受额外参数")
-        progress(step=0, total=1, message="正在筛选可安全删除的官方抽奖转发…")
+        force_original_ids = params.get("force_original_ids") if params else None
+        progress(step=0, total=1, message="正在串行评估历史抽奖…")
         result = scan_expired_reposts(
             on_progress=_cleanup_progress_adapter(progress, cancel_event),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+            force_original_ids=force_original_ids,
         )
         _raise_if_cancelled(cancel_event)
         candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
-        message = f"过期抽奖扫描完成：找到 {len(candidates)} 条可删除候选"
+        message = str(result.get("message") or "历史抽奖评估完成")
         progress(step=1, total=1, message=message, log_append=message)
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 
@@ -895,13 +895,14 @@ def run_action(
             if repost_id not in seen_ids:
                 seen_ids.add(repost_id)
                 repost_ids.append(repost_id)
-        if len(repost_ids) > 100:
-            raise ValueError("单次最多删除 100 条转发动态")
+        if len(repost_ids) > 20:
+            raise ValueError("单次最多删除 20 条转发动态")
         progress(step=0, total=len(repost_ids), message=f"准备逐条验证并删除 {len(repost_ids)} 条转发动态…")
         result = delete_reposts(
             repost_ids,
             on_progress=_cleanup_progress_adapter(progress, cancel_event),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+            manual_review_confirmed=bool(params.get("manual_review_confirmed")),
         )
         _raise_if_cancelled(cancel_event)
         deleted = int(result.get("deleted_count") or result.get("deleted") or 0)

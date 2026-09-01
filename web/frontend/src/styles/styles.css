@@ -5177,6 +5177,70 @@ body.modal-open {
   background: var(--danger-soft);
 }
 
+.repost-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 10px;
+}
+
+.repost-filter-btn {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  padding: 6px 14px;
+  background: var(--surface-soft);
+  color: var(--foreground-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.repost-filter-btn.is-active {
+  color: var(--foreground);
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  font-weight: 600;
+}
+
+.repost-level {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.repost-level--safe {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.repost-level--manual_review {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.repost-level--blocked,
+.repost-level--pending,
+.repost-level--excluded {
+  color: var(--danger-alt);
+  background: var(--danger-soft);
+}
+
+.repost-blocked-mark {
+  font-size: 15px;
+  opacity: 0.75;
+}
+
+.repost-summary {
+  margin: 5px 0 0;
+  color: var(--foreground-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 900px) {
   .repost-cleanup-head,
   .repost-list-head {

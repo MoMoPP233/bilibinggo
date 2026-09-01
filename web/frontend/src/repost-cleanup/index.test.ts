@@ -37,6 +37,7 @@ const candidate = {
   original_author_name: "抽奖作者",
   lottery_type: "互动抽奖",
   lottery_time: 1_750_100_000,
+  level: "safe",
   delete_status: "active",
 };
 
@@ -44,13 +45,22 @@ function setupDom(): void {
   document.body.innerHTML = `
     <button id="repost-scan-btn" data-action="scan_expired_reposts">扫描</button>
     <span id="repost-history-total">—</span>
-    <span id="repost-candidate-total">0</span>
+    <span id="repost-safe-total">0</span>
+    <span id="repost-manual-total">0</span>
+    <span id="repost-blocked-total">0</span>
+    <span id="repost-pending-total">0</span>
     <span id="repost-checkpoint-status">尚未读取</span>
     <p id="repost-candidate-summary"></p>
     <span id="repost-selected-count"></span>
     <button id="repost-select-page">全选当前页</button>
     <button id="repost-clear-selection">取消选择</button>
     <button id="repost-delete-selected" data-job-control disabled>删除</button>
+    <div class="repost-filter-bar">
+      <button type="button" class="repost-filter-btn is-active" data-repost-filter="all">全部</button>
+      <button type="button" class="repost-filter-btn" data-repost-filter="safe">安全可删</button>
+      <button type="button" class="repost-filter-btn" data-repost-filter="manual_review">人工确认</button>
+      <button type="button" class="repost-filter-btn" data-repost-filter="blocked">不可判断</button>
+    </div>
     <table><tbody id="repost-candidates-body"></tbody></table>
     <div id="repost-candidate-pagination"></div>
     <p id="repost-history-summary"></p>
@@ -122,6 +132,7 @@ describe("repost cleanup UI", () => {
     expect(JSON.parse(options.body)).toEqual({
       repost_dynamic_ids: ["90001"],
       confirmed: true,
+      manual_review_confirmed: false,
     });
     expect(options.body).not.toContain("80001");
     expect(trackCurrentJobMock).toHaveBeenCalledOnce();
@@ -154,7 +165,7 @@ describe("repost cleanup UI", () => {
       result: { candidates: [candidate, { ...candidate, original_author_name: "重复项" }] },
     });
 
-    expect(document.getElementById("repost-candidate-total")?.textContent).toBe("1");
+    expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
     expect((document.getElementById("repost-delete-selected") as HTMLButtonElement).disabled).toBe(true);
     expect(document.querySelectorAll("[data-repost-select]")).toHaveLength(1);
   });
@@ -192,7 +203,7 @@ describe("repost cleanup UI", () => {
     await module.loadPersistedCandidates();
 
     expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates");
-    expect(document.getElementById("repost-candidate-total")?.textContent).toBe("1");
+    expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
     expect(document.querySelector<HTMLInputElement>("[data-repost-select='90001']")).not.toBeNull();
   });
 
@@ -213,6 +224,84 @@ describe("repost cleanup UI", () => {
     await vi.waitFor(() => {
       expect(document.querySelector("[data-repost-select='90001']")).not.toBeNull();
     });
-    expect(document.getElementById("repost-candidate-total")?.textContent).toBe("1");
+    expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
+  });
+
+  it("renders three levels and blocks have no delete checkbox", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([
+      { ...candidate, repost_dynamic_id: "90001", level: "safe" },
+      {
+        repost_dynamic_id: "90002",
+        original_dynamic_id: "80002",
+        reposted_at: 1_750_000_001,
+        level: "manual_review",
+        delete_status: "active",
+      },
+      {
+        repost_dynamic_id: "90003",
+        original_dynamic_id: "80003",
+        reposted_at: 1_750_000_002,
+        level: "blocked",
+        reason: "身份关系未验证",
+        delete_status: "active",
+      },
+    ]);
+
+    expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
+    expect(document.getElementById("repost-manual-total")?.textContent).toBe("1");
+    expect(document.getElementById("repost-blocked-total")?.textContent).toBe("1");
+    expect(document.querySelectorAll("[data-repost-select]")).toHaveLength(2);
+    expect(document.querySelector(".repost-blocked-mark")).not.toBeNull();
+  });
+
+  it("filters candidates by level", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([
+      { ...candidate, repost_dynamic_id: "90001", level: "safe" },
+      {
+        repost_dynamic_id: "90002",
+        original_dynamic_id: "80002",
+        reposted_at: 1_750_000_001,
+        level: "manual_review",
+        delete_status: "active",
+      },
+    ]);
+
+    document.querySelector<HTMLButtonElement>("[data-repost-filter='manual_review']")!.click();
+
+    expect(document.querySelectorAll("[data-repost-select]")).toHaveLength(1);
+    expect(document.querySelector<HTMLInputElement>("[data-repost-select='90002']")).not.toBeNull();
+    expect(document.querySelector<HTMLInputElement>("[data-repost-select='90001']")).toBeNull();
+  });
+
+  it("manual_review delete requires an extra confirmation", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([
+      {
+        repost_dynamic_id: "90002",
+        original_dynamic_id: "80002",
+        reposted_at: 1_750_000_001,
+        level: "manual_review",
+        delete_status: "active",
+      },
+    ]);
+    const checkbox = document.querySelector<HTMLInputElement>("[data-repost-select='90002']");
+    expect(checkbox).not.toBeNull();
+    checkbox!.checked = true;
+    checkbox!.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await module.deleteSelectedReposts();
+
+    expect(openAppConfirmMock).toHaveBeenCalledTimes(2);
+    const [, options] = fetchJSONMock.mock.calls[0];
+    expect(JSON.parse(options.body)).toEqual({
+      repost_dynamic_ids: ["90002"],
+      confirmed: true,
+      manual_review_confirmed: true,
+    });
   });
 });

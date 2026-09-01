@@ -120,7 +120,7 @@ def test_delete_endpoint_only_passes_deduplicated_repost_ids() -> None:
     assert response.status_code == 200
     start_mock.assert_called_once_with(
         "delete_expired_reposts",
-        {"repost_dynamic_ids": [REPOST_ID]},
+        {"repost_dynamic_ids": [REPOST_ID], "manual_review_confirmed": False},
         source="ui",
     )
 
@@ -156,12 +156,48 @@ def test_candidates_endpoint_reads_persisted_local_assessment() -> None:
     with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
         "web.app._require_runtime_bilibili_uid", return_value="123"
     ), patch(
-        "src.repost_cleanup.load_persisted_candidates", return_value=[candidate]
-    ) as load_mock:
+        "src.repost_cleanup.repost_cleanup_summary",
+        return_value={
+            "uid": "123",
+            "history_total": 1,
+            "safe": 1,
+            "manual_review": 0,
+            "blocked": 0,
+            "excluded": 0,
+            "pending_evaluation": 0,
+            "candidates": [candidate],
+        },
+    ) as summary_mock:
         response = client.get("/api/repost-cleanup/candidates")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["uid"] == "123"
     assert payload["candidates"] == [candidate]
-    load_mock.assert_called_once_with("123")
+    assert payload["safe"] == 1
+    summary_mock.assert_called_once_with("123")
+
+
+def test_scan_job_accepts_force_original_ids_only() -> None:
+    with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
+        "web.app.runner.try_start", return_value=74
+    ) as start_mock, patch(
+        "web.app.runner.get_status"
+    ) as status_mock:
+        status_mock.return_value.to_dict.return_value = _running_job("scan_expired_reposts", 74)
+        response = client.post(
+            "/api/jobs",
+            json={"action": "scan_expired_reposts", "params": {"force_original_ids": [ORIGINAL_ID]}},
+        )
+        rejected = client.post(
+            "/api/jobs",
+            json={"action": "scan_expired_reposts", "params": {"uid": "other"}},
+        )
+
+    assert response.status_code == 200
+    start_mock.assert_called_once_with(
+        "scan_expired_reposts",
+        {"force_original_ids": [ORIGINAL_ID]},
+        source="ui",
+    )
+    assert rejected.status_code == 400

@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from collections.abc import Callable
 
 import httpx
 
@@ -59,14 +60,20 @@ def fetch_lottery_notice(
     business_type: int,
     referer: str,
     retries: int = 3,
+    request_retries: int = 1,
+    on_risk: Callable[[int], None] | None = None,
 ) -> dict | None:
     for attempt in range(max(1, retries)):
         data = client.request_json(
             LOTTERY_NOTICE_URL,
             {"business_id": business_id, "business_type": business_type},
             referer=referer,
-            retries=1,
+            retries=request_retries,
         )
+        if on_risk is not None:
+            code = data.get("code")
+            if isinstance(code, int) and code in (-352, -509, -799):
+                on_risk(code)
         if data.get("code") == 0:
             notice = data.get("data") or {}
             return notice if notice.get("lottery_id") else None
@@ -156,7 +163,12 @@ def _normalize_dynamic_item(item: dict) -> dict:
     return normalized
 
 
-def _fetch_opus_detail_item(client: BilibiliClient, dynamic_id: str) -> dict | None:
+def _fetch_opus_detail_item(
+    client: BilibiliClient,
+    dynamic_id: str,
+    *,
+    retries: int = 2,
+) -> dict | None:
     referer = opus_link(dynamic_id)
     try:
         data = client.get_json(
@@ -166,7 +178,7 @@ def _fetch_opus_detail_item(client: BilibiliClient, dynamic_id: str) -> dict | N
                 "features": OPUS_DETAIL_FEATURES,
             },
             referer=referer,
-            retries=2,
+            retries=retries,
         )
     except Exception as exc:
         logger.debug("opus/detail 请求失败 %s: %s", dynamic_id, exc)

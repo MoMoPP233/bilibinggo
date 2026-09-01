@@ -95,6 +95,11 @@ class RepostHistoryRow(SQLModel, table=True):
             name="ck_repost_history_source",
         ),
         CheckConstraint(
+            "identity_source IS NULL OR identity_source IN "
+            "('space_feed','legacy_space_feed','remote_detail')",
+            name="ck_repost_history_identity_source",
+        ),
+        CheckConstraint(
             "delete_status IN ('active','delete_pending','deleted','delete_failed','unknown')",
             name="ck_repost_history_delete_status",
         ),
@@ -122,6 +127,10 @@ class RepostHistoryRow(SQLModel, table=True):
     deleted_at: Optional[int] = None
     last_seen_at: Optional[int] = None
     last_error: Optional[str] = Field(default=None, sa_column=Column(Text))
+    identity_source: Optional[str] = Field(default=None, max_length=16)
+    identity_checked_at: Optional[int] = None
+    identity_ok: Optional[bool] = None
+    identity_error: Optional[str] = Field(default=None, sa_column=Column(Text))
     updated_at: int = 0
 
 
@@ -143,16 +152,32 @@ class RepostSyncCheckpointRow(SQLModel, table=True):
 
 
 class RepostAssessmentRow(SQLModel, table=True):
-    """每个官方抽奖原动态最近一次可安全清理评估结果（仅存 eligible）。"""
+    """每个原动态最近一次清理评估结果（safe/manual_review/blocked/excluded）。"""
 
     __tablename__ = "repost_assessment"
+    __table_args__ = (
+        CheckConstraint(
+            "assessment_level IN ('safe','manual_review','blocked','excluded')",
+            name="ck_repost_assessment_level",
+        ),
+        CheckConstraint(
+            "classification_source IN ('activities','public_classifier','legacy')",
+            name="ck_repost_assessment_classification_source",
+        ),
+    )
 
     uid: str = Field(primary_key=True, max_length=64)
     original_dynamic_id: str = Field(primary_key=True, max_length=32)
+    assessment_level: str = Field(default="safe", max_length=16)
+    reason_code: Optional[str] = Field(default=None, max_length=32)
     lottery_type: Optional[str] = Field(default=None, max_length=16)
     lottery_time: Optional[int] = None
     eligible_after: Optional[int] = None
     reason: Optional[str] = Field(default=None, sa_column=Column(Text))
+    classification_source: str = Field(default="activities", max_length=16)
+    summary: Optional[str] = Field(default=None, sa_column=Column(Text))
+    evaluated_at: Optional[int] = None
+    remote_checked_at: Optional[int] = None
     assessed_at: int
     updated_at: int = 0
 

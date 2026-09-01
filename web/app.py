@@ -463,18 +463,18 @@ def api_repost_cleanup_history(
 
 @app.get("/api/repost-cleanup/candidates", tags=["stable"])
 def api_repost_cleanup_candidates() -> dict[str, Any]:
-    """从本地评估结果恢复候选；不触发远程接口或历史重新同步。"""
+    """从本地评估结果恢复三级候选与计数；不触发远程接口或历史重新同步。"""
 
-    from src.repost_cleanup import load_persisted_candidates
+    from src.repost_cleanup import repost_cleanup_summary
 
     account = get_account_profile()
     require_login(account, message="请先扫码登录后再查看删除候选")
     uid = _require_runtime_bilibili_uid()
     try:
-        candidates = load_persisted_candidates(uid)
+        summary = repost_cleanup_summary(uid)
     except ValueError as exc:
         raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
-    return {"ok": True, "uid": uid, "candidates": candidates}
+    return {"ok": True, "uid": uid, **summary}
 
 
 @app.post(
@@ -503,7 +503,10 @@ def api_delete_expired_reposts(request: RepostCleanupDeleteRequest) -> dict[str,
     if not repost_ids:
         raise AppError(ErrorCode.VALIDATION_ERROR, "没有选择要删除的转发动态")
 
-    params = {"repost_dynamic_ids": repost_ids}
+    params = {
+        "repost_dynamic_ids": repost_ids,
+        "manual_review_confirmed": request.manual_review_confirmed,
+    }
     if runner.try_start("delete_expired_reposts", params, source="ui") is None:
         if restart_control.is_restart_pending():
             _raise_restart_pending()
@@ -521,8 +524,10 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
     if request.action in _JOB_REQUIRES_LLM:
         require_llm_ready()
     params = request.params or {}
-    if request.action in {"sync_repost_history", "scan_expired_reposts"} and params:
+    if request.action == "sync_repost_history" and params:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
+    if request.action == "scan_expired_reposts" and not set(params) <= {"force_original_ids"}:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "该操作只接受 force_original_ids 参数")
     if request.action == "refresh_source":
         from web.actions import DS_HANDLER_BY_ID
 

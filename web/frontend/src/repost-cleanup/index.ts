@@ -3,8 +3,11 @@ import { fetchJSON } from "../api/client";
 import {
   repostCandidatePagination,
   repostCandidateSummary,
-  repostCandidateTotal,
   repostCandidatesBody,
+  repostSafeTotal,
+  repostManualTotal,
+  repostBlockedTotal,
+  repostPendingTotal,
   repostCheckpointStatus,
   repostClearSelectionBtn,
   repostDeleteSelectedBtn,
@@ -48,6 +51,11 @@ export interface CleanupCandidate {
   lottery_time?: string | number | null;
   eligible_after?: string | number | null;
   days_since_lottery?: number | null;
+  level?: "safe" | "manual_review" | "blocked" | "excluded" | string | null;
+  reason_code?: string | null;
+  summary?: string | null;
+  classification_source?: string | null;
+  evaluated_at?: string | number | null;
   reason?: string | null;
   delete_status?: string | null;
   delete_message?: string | null;
@@ -75,6 +83,12 @@ interface RepostCandidatesResponse {
   ok?: boolean;
   uid?: string | number;
   candidates?: unknown;
+  history_total?: number;
+  safe?: number;
+  manual_review?: number;
+  blocked?: number;
+  excluded?: number;
+  pending_evaluation?: number;
 }
 
 interface DeleteResultItem {
@@ -107,6 +121,8 @@ let historyPages = 1;
 let deleteSubmitting = false;
 let deletePromptOpen = false;
 let bound = false;
+let filter: "all" | "safe" | "manual_review" | "blocked" = "all";
+let pendingEvaluation = 0;
 
 function validDynamicId(value: unknown): string {
   const text = String(value ?? "").trim();
@@ -149,16 +165,38 @@ function historyStatus(status: unknown): { label: string; tone: string } {
 
 function candidateSelectable(candidate: CleanupCandidate): boolean {
   const status = String(candidate.delete_status || "active");
-  return status === "active" || status === "delete_failed";
+  const level = String(candidate.level || "safe");
+  const deletableLevel = level === "safe" || level === "manual_review";
+  return deletableLevel && (status === "active" || status === "delete_failed");
 }
 
 function candidatePageCount(): number {
-  return Math.max(1, Math.ceil(candidates.length / CANDIDATE_PAGE_SIZE));
+  return Math.max(1, Math.ceil(visibleCandidates().length / CANDIDATE_PAGE_SIZE));
+}
+
+function visibleCandidates(): CleanupCandidate[] {
+  if (filter === "all") return candidates;
+  return candidates.filter((candidate) => String(candidate.level || "safe") === filter);
 }
 
 function currentCandidatePageItems(): CleanupCandidate[] {
   const start = (candidatePage - 1) * CANDIDATE_PAGE_SIZE;
-  return candidates.slice(start, start + CANDIDATE_PAGE_SIZE);
+  return visibleCandidates().slice(start, start + CANDIDATE_PAGE_SIZE);
+}
+
+function levelLabel(level: unknown): { label: string; tone: string } {
+  switch (String(level || "safe")) {
+    case "safe":
+      return { label: "🟢 安全可删", tone: "safe" };
+    case "manual_review":
+      return { label: "🟡 人工确认", tone: "manual_review" };
+    case "blocked":
+      return { label: "🔴 不可判断", tone: "blocked" };
+    case "excluded":
+      return { label: "非抽奖", tone: "excluded" };
+    default:
+      return { label: "待评估", tone: "pending" };
+  }
 }
 
 function renderPager(
@@ -232,30 +270,41 @@ export function renderCandidates(): void {
   const validIds = new Set(candidates.filter(candidateSelectable).map((item) => item.repost_dynamic_id));
   selectedRepostIds = new Set([...selectedRepostIds].filter((id) => validIds.has(id)));
 
-  if (repostCandidateTotal) repostCandidateTotal.textContent = String(candidates.length);
+  const safeCount = candidates.filter((c) => String(c.level) === "safe").length;
+  const manualCount = candidates.filter((c) => String(c.level) === "manual_review").length;
+  const blockedCount = candidates.filter((c) => String(c.level) === "blocked").length;
+  if (repostSafeTotal) repostSafeTotal.textContent = String(safeCount);
+  if (repostManualTotal) repostManualTotal.textContent = String(manualCount);
+  if (repostBlockedTotal) repostBlockedTotal.textContent = String(blockedCount);
   if (repostCandidateSummary) {
-    repostCandidateSummary.textContent = candidates.length
-      ? `严格校验得到 ${candidates.length} 条候选；候选默认不勾选，删除前服务端还会再次校验。`
-      : "当前没有能够通过官方信息严格确认安全的删除候选。";
+    repostCandidateSummary.textContent = pendingEvaluation > 0
+      ? `还有 ${pendingEvaluation} 条原动态待评估，可继续点击“评估历史抽奖”。`
+      : candidates.length
+        ? `当前三级候选 ${candidates.length} 条；候选默认不勾选，删除前服务端还会再次校验。`
+        : "当前没有可展示的清理候选；请先同步并评估历史抽奖。";
   }
   if (repostCandidatesBody) {
     if (!pageItems.length) {
-      repostCandidatesBody.innerHTML = '<tr class="empty-row"><td colspan="5">暂无可安全删除候选</td></tr>';
+      repostCandidatesBody.innerHTML = '<tr class="empty-row"><td colspan="5">当前筛选下没有候选</td></tr>';
     } else {
       repostCandidatesBody.innerHTML = pageItems.map((candidate) => {
         const repostId = candidate.repost_dynamic_id;
         const originalId = candidate.original_dynamic_id;
         const selectable = candidateSelectable(candidate);
         const status = historyStatus(candidate.delete_status);
+        const level = levelLabel(candidate.level);
         const author = sanitizeUserText(candidate.original_author_name || "") || "原作者未知";
-        const reason = sanitizeUserText(candidate.reason || "") || "官方抽奖已结束，且当前账号不在完整中奖名单中";
+        const reason = sanitizeUserText(candidate.reason || "") || "暂无判断依据";
+        const summary = sanitizeUserText(candidate.summary || "");
         const lotteryType = sanitizeUserText(candidate.lottery_type || "") || "官方抽奖";
         const lotteryTime = formatTimestamp(candidate.lottery_time);
         const message = sanitizeUserText(candidate.delete_message || "");
         return `
           <tr class="repost-candidate-row" data-repost-row="${escapeHtml(repostId)}">
             <td class="repost-check-cell">
-              <input type="checkbox" class="repost-checkbox" data-repost-select="${escapeHtml(repostId)}" aria-label="选择本人转发 ${escapeHtml(repostId)}" ${selectedRepostIds.has(repostId) ? "checked" : ""} ${selectable ? "" : "disabled"} />
+              ${String(candidate.level) === "blocked"
+                ? `<span class="repost-blocked-mark" title="该候选禁止勾选删除">🔒</span>`
+                : `<input type="checkbox" class="repost-checkbox" data-repost-select="${escapeHtml(repostId)}" aria-label="选择本人转发 ${escapeHtml(repostId)}" ${selectedRepostIds.has(repostId) ? "checked" : ""} ${selectable ? "" : "disabled"} />`}
             </td>
             <td>
               <a class="activity-link" href="${opusUrl(repostId)}" target="_blank" rel="noopener">查看本人转发</a>
@@ -267,18 +316,21 @@ export function renderCandidates(): void {
               <p class="repost-author">${escapeHtml(author)}</p>
             </td>
             <td>
+              <span class="repost-level repost-level--${level.tone}">${level.label}</span>
               <span class="type-chip type-chip--interact">${escapeHtml(lotteryType)}</span>
               <p class="caption repost-lottery-time">开奖：${escapeHtml(lotteryTime)}</p>
             </td>
             <td>
-              ${selectable ? `<p class="repost-reason">${escapeHtml(reason)}</p>` : `<span class="repost-status repost-status--${status.tone}">${status.label}</span>`}
+              <p class="repost-reason">${escapeHtml(reason)}</p>
+              ${summary ? `<p class="caption repost-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}</p>` : ""}
+              ${!selectable && candidate.level !== "blocked" ? `<span class="repost-status repost-status--${status.tone}">${status.label}</span>` : ""}
               ${message ? `<p class="caption repost-error">${escapeHtml(message)}</p>` : ""}
             </td>
           </tr>`;
       }).join("");
     }
   }
-  renderPager(repostCandidatePagination, candidatePage, pages, candidates.length, "candidate");
+  renderPager(repostCandidatePagination, candidatePage, pages, visibleCandidates().length, "candidate");
   renderSelectionState();
 }
 
@@ -363,6 +415,11 @@ export async function loadRepostHistory(page = historyPage): Promise<RepostHisto
 export async function loadPersistedCandidates(): Promise<void> {
   try {
     const data = await fetchJSON<RepostCandidatesResponse>("/api/repost-cleanup/candidates");
+    pendingEvaluation = Math.max(0, Number(data?.pending_evaluation) || 0);
+    if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
+    if (repostHistoryTotal && Number(data?.history_total) >= 0) {
+      repostHistoryTotal.textContent = String(Number(data?.history_total) || 0);
+    }
     setCandidates(normalizeCandidates(data?.candidates));
   } catch {
     // 登录/网络异常时保留当前已渲染候选，避免误清空。
@@ -424,10 +481,19 @@ export async function deleteSelectedReposts(): Promise<void> {
     return Boolean(candidate && candidateSelectable(candidate));
   });
   if (!ids.length) return;
+  if (ids.length > 20) {
+    showToast("单次最多删除 20 条", "error");
+    return;
+  }
   if (!requireSetup("delete_expired_reposts")) return;
+  const hasManualReview = ids.some((id) => {
+    const candidate = known.get(id);
+    return String(candidate?.level) === "manual_review";
+  });
 
   deletePromptOpen = true;
   let confirmed = false;
+  let manualConfirmed = false;
   try {
     confirmed = await openAppConfirm({
       eyebrow: "危险操作",
@@ -435,13 +501,25 @@ export async function deleteSelectedReposts(): Promise<void> {
       desc: "将从当前登录的 Bilibili 账号中删除这些转发动态。此操作无法撤销。",
       bullets: [
         `本次只提交 ${ids.length} 个“本人转发动态 ID”，绝不会提交原抽奖动态 ID`,
-        "服务端会在每条删除前重新确认运行 Profile、UID、动态归属与官方开奖状态",
+        "服务端会在每条删除前重新确认运行 Profile、UID、动态归属与转发关系",
         "网络超时或响应不确定时会标记为 unknown，不会自动再次发送删除请求",
       ],
       confirmLabel: `确认删除 ${ids.length} 条`,
       cancelLabel: "取消",
       danger: true,
     });
+    if (confirmed && hasManualReview) {
+      manualConfirmed = await openAppConfirm({
+        eyebrow: "人工确认项",
+        title: "包含人工确认候选，请再次确认",
+        desc: "程序只能确认这是你的历史抽奖转发，无法确认你是否中奖或是否仍需领奖。请确认你已经人工检查原动态，并确定不再需要保留这条转发。",
+        bullets: ["人工确认项删除前仍会重新验证 Profile、UID、动态归属与 orig 关系"],
+        confirmLabel: "我已人工检查并确认删除",
+        cancelLabel: "取消",
+        danger: true,
+      });
+      if (!manualConfirmed) confirmed = false;
+    }
   } finally {
     deletePromptOpen = false;
   }
@@ -454,7 +532,11 @@ export async function deleteSelectedReposts(): Promise<void> {
     await fetchJSON("/api/repost-cleanup/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repost_dynamic_ids: ids, confirmed: true }),
+      body: JSON.stringify({
+        repost_dynamic_ids: ids,
+        confirmed: true,
+        manual_review_confirmed: Boolean(manualConfirmed),
+      }),
     });
     selectedRepostIds.clear();
     candidates = candidates.map((candidate) => pendingDeleteIds.has(candidate.repost_dynamic_id)
@@ -493,8 +575,16 @@ export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<
   if (job.action === "scan_expired_reposts") {
     if (job.state === "success") {
       const found = extractJobCandidates(job);
+      const result = (job.result || {}) as Record<string, unknown>;
+      pendingEvaluation = Math.max(0, Number(result.pending_originals ?? result.pending_evaluation) || 0);
+      if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
       setCandidates(found);
-      showToast("安全候选扫描完成", "success", `严格校验得到 ${found.length} 条候选，当前均未勾选`);
+      const message = String(result.message || "历史抽奖评估完成");
+      showToast(
+        result.rate_limited ? "本轮评估提前停止" : "历史抽奖评估完成",
+        result.rate_limited ? "info" : "success",
+        message,
+      );
     }
     return;
   }
@@ -553,10 +643,23 @@ export function bindRepostCleanup(): void {
   });
   repostCandidatePagination?.addEventListener("click", handlePaginationClick);
   repostHistoryPagination?.addEventListener("click", handlePaginationClick);
+  document.querySelectorAll<HTMLButtonElement>("[data-repost-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const value = button.dataset.repostFilter;
+      if (value === "all" || value === "safe" || value === "manual_review" || value === "blocked") {
+        filter = value;
+        candidatePage = 1;
+      }
+      document.querySelectorAll<HTMLButtonElement>("[data-repost-filter]").forEach((item) => {
+        item.classList.toggle("is-active", item === button);
+      });
+      renderCandidates();
+    });
+  });
   document.getElementById("repost-scan-btn")?.addEventListener("click", () => {
     // 旧候选可能已过期；每次开始重新扫描即清空，只有本轮成功结果可重新出现。
     setCandidates([]);
-    if (repostCandidateSummary) repostCandidateSummary.textContent = "正在重新校验安全候选…";
+    if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行评估历史抽奖…";
   });
   window.addEventListener("binggo:section-activated", ((event: CustomEvent<{ sectionId?: string }>) => {
     if (event.detail?.sectionId !== "repost-cleanup") return;

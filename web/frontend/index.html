@@ -639,32 +639,44 @@
           </div>
         </section>
 
-        <section class="view-section" id="section-repost-cleanup" data-title="转发清理" data-subtitle="人工同步本人转发，只删除经过官方开奖信息严格确认安全的记录。">
+        <section class="view-section" id="section-repost-cleanup" data-title="转发清理" data-subtitle="人工同步本人转发，只删除经过严格评估确认安全的记录。">
           <div class="repost-cleanup-stack">
             <article class="panel repost-cleanup-hero">
               <div class="panel-head-row repost-cleanup-head">
                 <div>
                   <p class="eyebrow">Manual Cleanup</p>
                   <h2 class="section-title">过期抽奖转发清理</h2>
-                  <p class="section-desc">先同步当前运行账号的转发历史，再扫描安全候选。普通 LLM 转发抽奖会保留在历史中，但不会自动成为删除候选。</p>
+                  <p class="section-desc">先同步转发历史，再点击“评估历史抽奖”。safe 可勾选删除；manual_review 需人工核对后强确认删除；blocked 不可删除。</p>
                 </div>
                 <div class="action-row repost-cleanup-actions">
                   <button type="button" class="btn btn-secondary btn-pill" id="repost-sync-btn" data-action="sync_repost_history">同步我的转发历史</button>
-                  <button type="button" class="btn btn-primary btn-pill" id="repost-scan-btn" data-action="scan_expired_reposts">扫描可安全删除项</button>
+                  <button type="button" class="btn btn-primary btn-pill" id="repost-scan-btn" data-action="scan_expired_reposts">评估历史抽奖</button>
                 </div>
               </div>
               <div class="repost-cleanup-safety" role="note">
-                <strong>严格 V1 安全边界</strong>
-                <span>不按发布时间或正文关键词猜测；无法确认开奖结果、中奖状态、动态归属或接口状态时，一律不删除。</span>
+                <strong>严格安全边界</strong>
+                <span>程序只在你主动点击“评估历史抽奖”时串行请求远程；页面打开/切换/刷新均为 0 远程请求。评估按轮预算进行，命中平台限流立即停止并保存已完成的进度。</span>
               </div>
               <div class="repost-cleanup-metrics" aria-live="polite">
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">已索引转发</span>
+                  <span class="repost-cleanup-metric-label">历史转发</span>
                   <strong class="repost-cleanup-metric-value" id="repost-history-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">本次安全候选</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-candidate-total">0</strong>
+                  <span class="repost-cleanup-metric-label">🟢 安全可删</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-safe-total">0</strong>
+                </div>
+                <div class="repost-cleanup-metric">
+                  <span class="repost-cleanup-metric-label">🟡 人工确认</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-manual-total">0</strong>
+                </div>
+                <div class="repost-cleanup-metric">
+                  <span class="repost-cleanup-metric-label">🔴 不可判断</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-blocked-total">0</strong>
+                </div>
+                <div class="repost-cleanup-metric">
+                  <span class="repost-cleanup-metric-label">待评估</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-pending-total">0</strong>
                 </div>
                 <div class="repost-cleanup-metric repost-cleanup-metric-wide">
                   <span class="repost-cleanup-metric-label">历史同步状态</span>
@@ -677,8 +689,8 @@
               <div class="panel-head-row repost-list-head">
                 <div>
                   <p class="eyebrow">Safe Candidates</p>
-                  <h2 class="section-title">可删除候选</h2>
-                  <p class="section-desc" id="repost-candidate-summary">请先点击“扫描可安全删除项”。候选默认不勾选。</p>
+                  <h2 class="section-title">清理候选（三级）</h2>
+                  <p class="section-desc" id="repost-candidate-summary">请先点击“评估历史抽奖”。候选默认不勾选。</p>
                 </div>
                 <div class="repost-selection-actions">
                   <span class="repost-selected-count" id="repost-selected-count">已选择 0 条</span>
@@ -687,6 +699,12 @@
                   <button type="button" class="btn btn-danger btn-compact btn-pill" id="repost-delete-selected" data-job-control disabled>删除选中的 0 条</button>
                 </div>
               </div>
+              <div class="repost-filter-bar" role="tablist" aria-label="候选筛选">
+                <button type="button" class="repost-filter-btn is-active" data-repost-filter="all">全部</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="safe">安全可删</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="manual_review">人工确认</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="blocked">不可判断</button>
+              </div>
               <div class="table-wrap">
                 <table class="data-table repost-cleanup-table">
                   <thead>
@@ -694,12 +712,12 @@
                       <th class="repost-check-cell"><span class="sr-only">选择</span></th>
                       <th>本人转发</th>
                       <th>原抽奖动态</th>
-                      <th>类型 / 开奖</th>
-                      <th>安全依据</th>
+                      <th>等级 / 类型</th>
+                      <th>判断依据</th>
                     </tr>
                   </thead>
                   <tbody id="repost-candidates-body">
-                    <tr class="empty-row"><td colspan="5">尚未扫描安全候选</td></tr>
+                    <tr class="empty-row"><td colspan="5">尚未评估历史抽奖</td></tr>
                   </tbody>
                 </table>
               </div>

@@ -15,6 +15,9 @@ from src.db.models import RepostAssessmentRow, RepostHistoryRow, RepostSyncCheck
 from src.db.session import session_scope
 
 REPOST_SOURCES = frozenset({"binggo", "history_import"})
+ASSESSMENT_LEVELS = frozenset({"safe", "manual_review", "blocked", "excluded"})
+IDENTITY_SOURCES = frozenset({"space_feed", "legacy_space_feed", "remote_detail"})
+CLASSIFICATION_SOURCES = frozenset({"activities", "public_classifier", "legacy"})
 DELETE_STATUSES = frozenset(
     {"active", "delete_pending", "deleted", "delete_failed", "unknown"}
 )
@@ -47,6 +50,10 @@ class RepostHistoryRecord:
     last_seen_at: int | None
     last_error: str | None
     updated_at: int
+    identity_source: str | None = None
+    identity_checked_at: int | None = None
+    identity_ok: bool | None = None
+    identity_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,12 +70,18 @@ class RepostSyncCheckpoint:
 class RepostAssessmentRecord:
     uid: str
     original_dynamic_id: str
-    lottery_type: str | None
-    lottery_time: int | None
-    eligible_after: int | None
-    reason: str | None
     assessed_at: int
-    updated_at: int
+    assessment_level: str = "safe"
+    reason_code: str | None = None
+    lottery_type: str | None = None
+    lottery_time: int | None = None
+    eligible_after: int | None = None
+    reason: str | None = None
+    classification_source: str = "activities"
+    summary: str | None = None
+    evaluated_at: int | None = None
+    remote_checked_at: int | None = None
+    updated_at: int = 0
 
 
 def _uid(value: object) -> str:
@@ -136,6 +149,10 @@ def _history_record(row: RepostHistoryRow) -> RepostHistoryRecord:
         deleted_at=row.deleted_at,
         last_seen_at=row.last_seen_at,
         last_error=row.last_error,
+        identity_source=row.identity_source,
+        identity_checked_at=row.identity_checked_at,
+        identity_ok=row.identity_ok,
+        identity_error=row.identity_error,
         updated_at=row.updated_at,
     )
 
@@ -178,6 +195,7 @@ def upsert_repost_records(
             raise ValueError("转发历史来源无效")
         author_uid_raw = _value(record, "original_author_uid")
         author_uid = _uid(author_uid_raw) if author_uid_raw not in (None, "") else None
+        trusted_identity = source == "history_import"
         prepared.append(
             {
                 "uid": scoped_uid,
@@ -196,6 +214,10 @@ def upsert_repost_records(
                 "deleted_at": None,
                 "last_seen_at": now,
                 "last_error": None,
+                "identity_source": "space_feed" if trusted_identity else None,
+                "identity_checked_at": now if trusted_identity else None,
+                "identity_ok": True if trusted_identity else None,
+                "identity_error": None,
                 "updated_at": now,
             }
         )
@@ -480,10 +502,16 @@ def _assessment_record(row: RepostAssessmentRow) -> RepostAssessmentRecord:
     return RepostAssessmentRecord(
         uid=row.uid,
         original_dynamic_id=row.original_dynamic_id,
+        assessment_level=row.assessment_level,
+        reason_code=row.reason_code,
         lottery_type=row.lottery_type,
         lottery_time=row.lottery_time,
         eligible_after=row.eligible_after,
         reason=row.reason,
+        classification_source=row.classification_source,
+        summary=row.summary,
+        evaluated_at=row.evaluated_at,
+        remote_checked_at=row.remote_checked_at,
         assessed_at=row.assessed_at,
         updated_at=row.updated_at,
     )
@@ -493,13 +521,23 @@ def upsert_repost_assessment(
     uid: str,
     original_dynamic_id: str,
     *,
-    lottery_type: str | None,
-    lottery_time: int | None,
-    eligible_after: int | None,
-    reason: str | None,
+    assessment_level: str,
+    reason_code: str | None = None,
+    lottery_type: str | None = None,
+    lottery_time: int | None = None,
+    eligible_after: int | None = None,
+    reason: str | None = None,
+    classification_source: str = "activities",
+    summary: str | None = None,
+    evaluated_at: int | None = None,
+    remote_checked_at: int | None = None,
     assessed_at: int | None = None,
 ) -> None:
-    """保存官方抽奖原动态最近一次“可安全清理”评估结果。"""
+    """保存原动态最近一次清理评估结果（safe/manual_review/blocked/excluded）。"""
+    if assessment_level not in ASSESSMENT_LEVELS:
+        raise ValueError("评估等级无效")
+    if classification_source not in CLASSIFICATION_SOURCES:
+        raise ValueError("评估来源无效")
     scoped_uid = _uid(uid)
     original_id = _dynamic_id(original_dynamic_id, label="原动态 ID")
     now = int(time.time()) if assessed_at is None else int(
@@ -508,6 +546,8 @@ def upsert_repost_assessment(
     values = {
         "uid": scoped_uid,
         "original_dynamic_id": original_id,
+        "assessment_level": assessment_level,
+        "reason_code": _optional_text(reason_code, max_length=32),
         "lottery_type": _optional_text(lottery_type, max_length=16),
         "lottery_time": (
             int(_timestamp(lottery_time, label="开奖时间"))
@@ -520,6 +560,18 @@ def upsert_repost_assessment(
             else None
         ),
         "reason": _optional_text(reason, max_length=256),
+        "classification_source": classification_source,
+        "summary": _optional_text(summary, max_length=512),
+        "evaluated_at": (
+            int(_timestamp(evaluated_at, label="评估完成时间"))
+            if evaluated_at is not None
+            else now
+        ),
+        "remote_checked_at": (
+            int(_timestamp(remote_checked_at, label="远程确认时间"))
+            if remote_checked_at is not None
+            else None
+        ),
         "assessed_at": now,
         "updated_at": now,
     }
@@ -534,6 +586,42 @@ def upsert_repost_assessment(
                     for key, value in values.items()
                     if key not in {"uid", "original_dynamic_id"}
                 },
+            )
+        )
+
+
+def set_repost_identity(
+    uid: str,
+    repost_id: str,
+    *,
+    ok: bool,
+    source: str,
+    error: str | None = None,
+    checked_at: int | None = None,
+) -> None:
+    """记录逐条转发动态的身份/关系验证结果。"""
+    if not isinstance(ok, bool):
+        raise ValueError("身份验证结果无效")
+    if source not in IDENTITY_SOURCES:
+        raise ValueError("身份验证来源无效")
+    scoped_uid = _uid(uid)
+    normalized_id = _dynamic_id(repost_id, label="转发动态 ID")
+    now = int(time.time()) if checked_at is None else int(
+        _timestamp(checked_at, label="身份验证时间")
+    )
+    with session_scope() as session:
+        session.execute(
+            update(RepostHistoryRow)
+            .where(
+                RepostHistoryRow.uid == scoped_uid,
+                RepostHistoryRow.repost_dynamic_id == normalized_id,
+            )
+            .values(
+                identity_ok=ok,
+                identity_source=source,
+                identity_checked_at=now,
+                identity_error=_optional_text(error, max_length=512),
+                updated_at=now,
             )
         )
 
@@ -581,6 +669,51 @@ def list_reposts_by_originals(
                 RepostHistoryRow.original_dynamic_id.in_(sorted(normalized)),
                 RepostHistoryRow.delete_status.in_(
                     {"active", "delete_failed", "unknown"}
+                ),
+            )
+            .order_by(
+                RepostHistoryRow.reposted_at.desc(),
+                RepostHistoryRow.repost_dynamic_id.desc(),
+            )
+        ).all()
+        return [_history_record(row) for row in rows]
+
+
+def list_evaluable_reposts(uid: str) -> list[RepostHistoryRecord]:
+    """删除仍可能被评估的转发（active/delete_failed/unknown）。"""
+    scoped_uid = _uid(uid)
+    with session_scope() as session:
+        rows = session.exec(
+            select(RepostHistoryRow)
+            .where(
+                RepostHistoryRow.uid == scoped_uid,
+                RepostHistoryRow.delete_status.in_(
+                    {"active", "delete_failed", "unknown"}
+                ),
+            )
+            .order_by(
+                RepostHistoryRow.reposted_at.desc(),
+                RepostHistoryRow.repost_dynamic_id.desc(),
+            )
+        ).all()
+        return [_history_record(row) for row in rows]
+
+
+def list_reposts_needing_identity(uid: str) -> list[RepostHistoryRecord]:
+    """只有身份证据缺失或冲突的转发才需要远程 detail 重新验证。"""
+    scoped_uid = _uid(uid)
+    with session_scope() as session:
+        rows = session.exec(
+            select(RepostHistoryRow)
+            .where(
+                RepostHistoryRow.uid == scoped_uid,
+                RepostHistoryRow.delete_status.in_(
+                    {"active", "delete_failed", "unknown"}
+                ),
+                or_(
+                    RepostHistoryRow.identity_ok.is_(None),
+                    RepostHistoryRow.identity_ok.is_(False),
+                    RepostHistoryRow.identity_source.is_(None),
                 ),
             )
             .order_by(

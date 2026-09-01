@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from src.repost_cleanup import CandidateAssessment, DELETE_REPOST_URL, delete_reposts
-from src.repost_history import RepostHistoryRecord
+from src.repost_history import RepostAssessmentRecord, RepostHistoryRecord
 
 UID = "123"
 REPOST_ID = "1234567890123456789"
@@ -24,6 +24,9 @@ def _record() -> RepostHistoryRecord:
         deleted_at=None,
         last_seen_at=200,
         last_error=None,
+        identity_source="space_feed",
+        identity_checked_at=200,
+        identity_ok=True,
         updated_at=200,
     )
 
@@ -82,7 +85,7 @@ def test_delete_reposts_sends_json_body_with_query_csrf_and_zero_retry(monkeypat
     monkeypatch.setattr("src.repost_cleanup.db_path", lambda: _FakeDbPath())
     monkeypatch.setattr(
         "src.repost_cleanup.load_activities",
-        lambda: [{"dynamic_id": ORIGINAL_ID}],
+        lambda: [{"dynamic_id": ORIGINAL_ID, "lottery_type": "互动抽奖", "status_classified": True}],
     )
     monkeypatch.setattr(
         "src.repost_cleanup.get_repost",
@@ -93,8 +96,22 @@ def test_delete_reposts_sends_json_body_with_query_csrf_and_zero_retry(monkeypat
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "src.repost_cleanup._assess_activity",
-        lambda *args, **kwargs: CandidateAssessment(True, "ok", "互动抽奖", 100, 100),
+        "src.repost_cleanup.list_repost_assessments",
+        lambda uid: {
+            ORIGINAL_ID: RepostAssessmentRecord(
+                uid=uid,
+                original_dynamic_id=ORIGINAL_ID,
+                assessment_level="safe",
+                reason_code="safe_official_notice",
+                assessed_at=100,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup._assess_original",
+        lambda *args, **kwargs: CandidateAssessment(
+            "safe", "ok", "safe_official_notice", "互动抽奖", 100, 100
+        ),
     )
     monkeypatch.setattr(
         "src.repost_cleanup.claim_delete_pending",
@@ -118,6 +135,144 @@ def test_delete_reposts_sends_json_body_with_query_csrf_and_zero_retry(monkeypat
     assert call["raise_on_code"] is False
     assert "original_dynamic_id" not in call["payload"]
     assert ORIGINAL_ID not in json.dumps(call["payload"])
+
+
+def test_manual_review_delete_requires_extra_confirmation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.repost_cleanup._require_verified_login",
+        lambda client: ("csrf-token", int(UID)),
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup._assert_frozen_runtime",
+        lambda *, profile_id, database_path, uid: "csrf-token",
+    )
+    monkeypatch.setattr("src.repost_cleanup.get_runtime_profile_id", lambda: "profile-1")
+    monkeypatch.setattr("src.repost_cleanup.db_path", lambda: _FakeDbPath())
+    monkeypatch.setattr("src.repost_cleanup.load_activities", lambda: [])
+    monkeypatch.setattr("src.repost_cleanup.get_repost", lambda uid, repost_id: _record())
+    monkeypatch.setattr(
+        "src.repost_cleanup._verify_owned_repost_detail",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup.list_repost_assessments",
+        lambda uid: {
+            ORIGINAL_ID: RepostAssessmentRecord(
+                uid=uid,
+                original_dynamic_id=ORIGINAL_ID,
+                assessment_level="manual_review",
+                reason_code="forward_lottery_manual",
+                assessed_at=100,
+            )
+        },
+    )
+    monkeypatch.setattr("src.repost_cleanup.claim_delete_pending", lambda *args, **kwargs: True)
+    monkeypatch.setattr("src.repost_cleanup.mark_delete_result", lambda *args, **kwargs: True)
+
+    fake = _FakeClient()
+    unconfirmed = delete_reposts([REPOST_ID], client_factory=lambda: fake)
+    assert unconfirmed["skipped_count"] == 1
+    assert fake.post_json_calls == []
+
+    confirmed = delete_reposts(
+        [REPOST_ID],
+        client_factory=lambda: fake,
+        manual_review_confirmed=True,
+    )
+    assert confirmed["deleted_count"] == 1
+    assert len(fake.post_json_calls) == 1
+
+
+def test_blocked_and_unassessed_delete_are_refused(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.repost_cleanup._require_verified_login",
+        lambda client: ("csrf-token", int(UID)),
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup._assert_frozen_runtime",
+        lambda *, profile_id, database_path, uid: "csrf-token",
+    )
+    monkeypatch.setattr("src.repost_cleanup.get_runtime_profile_id", lambda: "profile-1")
+    monkeypatch.setattr("src.repost_cleanup.db_path", lambda: _FakeDbPath())
+    monkeypatch.setattr("src.repost_cleanup.load_activities", lambda: [])
+    monkeypatch.setattr("src.repost_cleanup.get_repost", lambda uid, repost_id: _record())
+    monkeypatch.setattr(
+        "src.repost_cleanup._verify_owned_repost_detail",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup.list_repost_assessments",
+        lambda uid: {
+            ORIGINAL_ID: RepostAssessmentRecord(
+                uid=uid,
+                original_dynamic_id=ORIGINAL_ID,
+                assessment_level="blocked",
+                reason_code="identity_conflict",
+                assessed_at=100,
+            )
+        },
+    )
+    monkeypatch.setattr("src.repost_cleanup.claim_delete_pending", lambda *args, **kwargs: True)
+    monkeypatch.setattr("src.repost_cleanup.mark_delete_result", lambda *args, **kwargs: True)
+
+    fake = _FakeClient()
+    result = delete_reposts([REPOST_ID], client_factory=lambda: fake)
+    assert result["skipped_count"] == 1
+    assert fake.post_json_calls == []
+
+
+def test_delete_batch_stops_on_rate_limit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.repost_cleanup._require_verified_login",
+        lambda client: ("csrf-token", int(UID)),
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup._assert_frozen_runtime",
+        lambda *, profile_id, database_path, uid: "csrf-token",
+    )
+    monkeypatch.setattr("src.repost_cleanup.get_runtime_profile_id", lambda: "profile-1")
+    monkeypatch.setattr("src.repost_cleanup.db_path", lambda: _FakeDbPath())
+    monkeypatch.setattr("src.repost_cleanup.load_activities", lambda: [])
+    monkeypatch.setattr(
+        "src.repost_cleanup.get_repost",
+        lambda uid, repost_id: _record(),
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup._verify_owned_repost_detail",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup.list_repost_assessments",
+        lambda uid: {
+            ORIGINAL_ID: RepostAssessmentRecord(
+                uid=uid,
+                original_dynamic_id=ORIGINAL_ID,
+                assessment_level="safe",
+                assessed_at=100,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "src.repost_cleanup._assess_original",
+        lambda *args, **kwargs: CandidateAssessment(
+            "safe", "ok", "safe_official_notice", "互动抽奖", 100, 100
+        ),
+    )
+    monkeypatch.setattr("src.repost_cleanup.claim_delete_pending", lambda *args, **kwargs: True)
+    monkeypatch.setattr("src.repost_cleanup.mark_delete_result", lambda *args, **kwargs: True)
+
+    class _RateLimitedClient(_FakeClient):
+        def post_json(self, *args, **kwargs):
+            self.post_json_calls.append({"payload": kwargs.get("payload")})
+            return {"code": -352, "message": "风控校验失败"}
+
+    fake = _RateLimitedClient()
+    second_id = "1234567890123456790"
+    result = delete_reposts([REPOST_ID, second_id], client_factory=lambda: fake)
+
+    assert result["rate_limited"] is True
+    assert len(fake.post_json_calls) == 1
+    assert result["requested_count"] == 2
 
 
 def test_post_json_uses_http_post_with_json_body_and_content_type(monkeypatch) -> None:

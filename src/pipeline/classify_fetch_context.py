@@ -33,6 +33,7 @@ class ClassifyFetchContext:
 
     client: BilibiliClient
     dynamic_id: str
+    retries: int | None = None
     _additional: Any = field(default=_UNSET, repr=False)
     _detail_api_item: Any = field(default=_UNSET, repr=False)
     _detail_api_code: Any = field(default=_UNSET, repr=False)
@@ -42,6 +43,47 @@ class ClassifyFetchContext:
     _reserve_lottery_notice: Any = field(default=_UNSET, repr=False)
     _reserve_notice_resolved: Any = field(default=_UNSET, repr=False)
     _resolved_content: str = field(default="", repr=False)
+    _risk_code: int | None = field(default=None, repr=False)
+
+    @property
+    def _detail_fetch_retries(self) -> int:
+        return 2 if self.retries is None else self.retries
+
+    @property
+    def _detail_extra_retries(self) -> int:
+        return 1 if self.retries is None else self.retries
+
+    @property
+    def _notice_fetch_retries(self) -> int:
+        return 1 if self.retries is None else self.retries
+
+    @property
+    def _reserve_notice_retries(self) -> int:
+        return 2 if self.retries is None else self.retries
+
+    def _record_risk(self, code: int) -> None:
+        if self._risk_code is None:
+            self._risk_code = code
+
+    def risk_control_code(self) -> int | None:
+        """返回本轮分类中命中的风控码（-352/-509/429 等），无则 None。"""
+        if self._risk_code is not None:
+            return self._risk_code
+        code = self._detail_api_code
+        if isinstance(code, int) and code in (-352, -509, -799):
+            return code
+        message = "" if self._detail_api_message is _UNSET else str(self._detail_api_message or "")
+        lowered = message.lower()
+        for token, risk_code in (
+            ("-352", -352),
+            ("-509", -509),
+            ("429", 429),
+            ("too many", 429),
+            ("风控", -352),
+        ):
+            if token in lowered:
+                return risk_code
+        return None
 
     def _fetch_detail_api_item(self, *, retries: int) -> dict | None:
         if not is_detail_api_enabled():
@@ -60,7 +102,9 @@ class ClassifyFetchContext:
     def _ensure_detail_api_item(self) -> dict | None:
         if self._detail_api_item is not _UNSET:
             return self._detail_api_item
-        self._detail_api_item = self._fetch_detail_api_item(retries=2)
+        self._detail_api_item = self._fetch_detail_api_item(
+            retries=self._detail_fetch_retries
+        )
         return self._detail_api_item
 
     def is_deleted_link(self) -> bool:
@@ -95,11 +139,15 @@ class ClassifyFetchContext:
         item = self._ensure_detail_api_item()
         if not item and not self._detail_api_extra_attempted:
             self._detail_api_extra_attempted = True
-            item = self._fetch_detail_api_item(retries=1)
+            item = self._fetch_detail_api_item(retries=self._detail_extra_retries)
             if item:
                 self._detail_api_item = item
         if not item:
-            item = _fetch_opus_detail_item(self.client, self.dynamic_id)
+            item = _fetch_opus_detail_item(
+                self.client,
+                self.dynamic_id,
+                retries=self._detail_fetch_retries,
+            )
         if not item:
             self._detail_item = None
             return None
@@ -125,7 +173,9 @@ class ClassifyFetchContext:
             business_id=business_id,
             business_type=business_type,
             referer=opus_link(self.dynamic_id),
-            retries=2,
+            retries=self._reserve_notice_retries,
+            request_retries=self._notice_fetch_retries,
+            on_risk=self._record_risk,
         )
         if notice and notice.get("lottery_id"):
             bundle = (notice, business_id, business_type)
