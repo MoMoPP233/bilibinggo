@@ -787,3 +787,21 @@ def list_reposts_needing_identity(uid: str) -> list[RepostHistoryRecord]:
             )
         ).all()
         return [_history_record(row) for row in rows]
+
+
+def list_deleted_reposts(uid: str) -> list[RepostHistoryRecord]:
+    """已删除 tombstone：保留审计信息，绝不物理删除。"""
+    scoped_uid = _uid(uid)
+    with session_scope() as session:
+        rows = session.exec(
+            select(RepostHistoryRow)
+            .where(
+                RepostHistoryRow.uid == scoped_uid,
+                RepostHistoryRow.delete_status == "deleted",
+            )
+            .order_by(
+                RepostHistoryRow.deleted_at.desc(),
+                RepostHistoryRow.repost_dynamic_id.desc(),
+            )
+        ).all()
+        return [_history_record(row) for row in rows]

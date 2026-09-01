@@ -31,6 +31,7 @@ from src.repost_history import (
     get_checkpoint,
     get_repost,
     list_evaluable_reposts,
+    list_deleted_reposts,
     list_reposts_needing_identity,
     list_reposts_by_originals,
     list_repost_assessments,
@@ -1050,20 +1051,49 @@ def load_persisted_candidates(uid: str) -> list[dict[str, Any]]:
                 "classification_source": assessment.classification_source,
                 "evaluated_at": assessment.evaluated_at,
                 "delete_status": repost.delete_status,
+                "delete_requested_at": repost.delete_requested_at,
+                "deleted_at": repost.deleted_at,
                 "defer_reason": defer.get("defer_reason") if defer else None,
                 "deferred_at": defer.get("deferred_at") if defer else None,
                 "deferred_until": defer.get("deferred_until") if defer else None,
+                "lottery_time_reliable": assessment.lottery_time_reliable,
+                "assessment_status": assessment.assessment_status,
+                "identity_source": repost.identity_source,
+                "identity_checked_at": repost.identity_checked_at,
             }
         )
     return candidates
 
 
-def repost_cleanup_summary(uid: str) -> dict[str, Any]:
+def load_deleted_candidates(uid: str) -> list[dict[str, Any]]:
+    """已删除 tombstone 明细：仅供“已删除”筛选查看，不提供删除操作。"""
+    scoped_uid = str(uid).strip()
+    return [
+        {
+            "uid": scoped_uid,
+            "repost_dynamic_id": repost.repost_dynamic_id,
+            "original_dynamic_id": repost.original_dynamic_id,
+            "reposted_at": repost.reposted_at,
+            "original_author_uid": repost.original_author_uid,
+            "original_author_name": repost.original_author_name,
+            "level": "deleted",
+            "delete_status": "deleted",
+            "deleted_at": repost.deleted_at,
+            "delete_requested_at": repost.delete_requested_at,
+            "last_error": repost.last_error,
+        }
+        for repost in list_deleted_reposts(scoped_uid)
+    ]
+
+
+def repost_cleanup_summary(uid: str, *, show_deleted: bool = False) -> dict[str, Any]:
     """供页面零远程恢复的汇总：三级计数 + 待评估 + 候选明细。"""
     scoped_uid = str(uid).strip()
     reposts = list_evaluable_reposts(scoped_uid)
     assessments = list_repost_assessments(scoped_uid)
     candidates = load_persisted_candidates(scoped_uid)
+    deleted_candidates = load_deleted_candidates(scoped_uid) if show_deleted else []
+    checkpoint = get_checkpoint(scoped_uid)
     counts = {"safe": 0, "manual_review": 0, "blocked": 0, "deferred": 0}
     for candidate in candidates:
         level = candidate.get("level")
@@ -1091,6 +1121,17 @@ def repost_cleanup_summary(uid: str) -> dict[str, Any]:
             if assessment.assessment_level == "excluded"
         ),
         "pending_evaluation": len(pending_originals),
+        "deleted": len(list_deleted_reposts(scoped_uid)),
+        "last_synced_at": getattr(checkpoint, "last_synced_at", None),
+        "full_scan_completed": bool(getattr(checkpoint, "full_scan_completed", False)),
+        "last_evaluated_at": max(
+            (
+                int(assessment.evaluated_at or 0)
+                for assessment in assessments.values()
+            ),
+            default=None,
+        ),
+        "deleted_candidates": deleted_candidates,
         "candidates": candidates,
     }
 

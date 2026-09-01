@@ -5229,6 +5229,31 @@ body.modal-open {
   font-weight: 600;
 }
 
+.repost-search-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0 10px;
+}
+
+.repost-search-row .input {
+  min-width: 220px;
+  flex: 1 1 320px;
+}
+
+.repost-sort-select {
+  flex: 0 1 auto;
+  max-width: 260px;
+}
+
+.repost-delete-progress {
+  margin: 10px 0 0;
+  color: var(--warning);
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 18px;
+}
+
 .repost-level {
   display: inline-flex;
   align-items: center;
@@ -5255,6 +5280,11 @@ body.modal-open {
   background: var(--warning-soft);
 }
 
+.repost-level--deleted {
+  color: var(--foreground-muted);
+  background: var(--surface-soft);
+}
+
 .repost-level--blocked,
 .repost-level--pending,
 .repost-level--excluded {
@@ -5265,6 +5295,41 @@ body.modal-open {
 .repost-row-actions {
   margin-top: 8px;
   gap: 6px;
+}
+
+.repost-id {
+  overflow-wrap: anywhere;
+}
+
+.repost-id-value {
+  display: inline-block;
+  max-width: 15rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--foreground-muted);
+}
+
+.btn-mini {
+  padding: 1px 7px;
+  font-size: 11px;
+}
+
+.repost-details {
+  margin-top: 8px;
+}
+
+.repost-details summary {
+  cursor: pointer;
+  color: var(--primary);
+  font-size: 12px;
+}
+
+.repost-details .caption {
+  margin-top: 3px;
 }
 
 .repost-blocked-mark {

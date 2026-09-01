@@ -1148,6 +1148,7 @@ export function updateProgressUI(job) {
     progressDetail.hidden = job.action === "participate";
   }
   renderParticipateSteps(job);
+  window.dispatchEvent(new CustomEvent("binggo:job-progress", { detail: job }));
 }
 
 export function updateJobUI(job) {

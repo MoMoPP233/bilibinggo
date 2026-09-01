@@ -463,7 +463,9 @@ def api_repost_cleanup_history(
 
 
 @app.get("/api/repost-cleanup/candidates", tags=["stable"])
-def api_repost_cleanup_candidates() -> dict[str, Any]:
+def api_repost_cleanup_candidates(
+    show_deleted: int = Query(default=0, ge=0, le=1),
+) -> dict[str, Any]:
     """从本地评估结果恢复三级候选与计数；不触发远程接口或历史重新同步。"""
 
     from src.repost_cleanup import repost_cleanup_summary
@@ -472,7 +474,7 @@ def api_repost_cleanup_candidates() -> dict[str, Any]:
     require_login(account, message="请先扫码登录后再查看删除候选")
     uid = _require_runtime_bilibili_uid()
     try:
-        summary = repost_cleanup_summary(uid)
+        summary = repost_cleanup_summary(uid, show_deleted=bool(show_deleted))
     except ValueError as exc:
         raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
     return {"ok": True, "uid": uid, **summary}

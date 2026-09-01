@@ -175,7 +175,7 @@ def test_candidates_endpoint_reads_persisted_local_assessment() -> None:
     assert payload["uid"] == "123"
     assert payload["candidates"] == [candidate]
     assert payload["safe"] == 1
-    summary_mock.assert_called_once_with("123")
+    summary_mock.assert_called_once_with("123", show_deleted=False)
 
 
 def test_scan_job_accepts_force_original_ids_only() -> None:

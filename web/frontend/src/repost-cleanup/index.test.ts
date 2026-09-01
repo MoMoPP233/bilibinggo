@@ -47,6 +47,8 @@ function setupDom(): void {
     <button id="repost-stop-btn" data-job-control disabled>停止评估</button>
     <p id="repost-eval-status">尚未开始智能评估</p>
     <span id="repost-history-total">—</span>
+    <span id="repost-deleted-total">0</span>
+    <span id="repost-workflow-status">尚未读取</span>
     <span id="repost-safe-total">0</span>
     <span id="repost-manual-total">0</span>
     <span id="repost-deferred-total">0</span>
@@ -54,6 +56,16 @@ function setupDom(): void {
     <span id="repost-pending-total">0</span>
     <span id="repost-checkpoint-status">尚未读取</span>
     <p id="repost-candidate-summary"></p>
+    <input type="search" id="repost-search-input" />
+    <select id="repost-sort-select">
+      <option value="reposted_desc">最新优先</option>
+      <option value="reposted_asc">最早优先</option>
+      <option value="lottery_desc">最近开奖</option>
+      <option value="lottery_asc">最早开奖</option>
+      <option value="priority">清理优先级</option>
+      <option value="evaluated_desc">最近评估</option>
+    </select>
+    <p id="repost-delete-progress"></p>
     <span id="repost-selected-count"></span>
     <button id="repost-select-page">全选当前页</button>
     <button id="repost-clear-selection">取消选择</button>
@@ -62,7 +74,9 @@ function setupDom(): void {
       <button type="button" class="repost-filter-btn is-active" data-repost-filter="all">全部</button>
       <button type="button" class="repost-filter-btn" data-repost-filter="safe">安全可删</button>
       <button type="button" class="repost-filter-btn" data-repost-filter="manual_review">人工确认</button>
+      <button type="button" class="repost-filter-btn" data-repost-filter="deferred">暂缓处理</button>
       <button type="button" class="repost-filter-btn" data-repost-filter="blocked">不可判断</button>
+      <button type="button" class="repost-filter-btn" data-repost-filter="deleted">已删除</button>
     </div>
     <table><tbody id="repost-candidates-body"></tbody></table>
     <div id="repost-candidate-pagination"></div>
@@ -187,7 +201,8 @@ describe("repost cleanup UI", () => {
 
     expect(fetchJSONMock).toHaveBeenCalledOnce();
     expect(document.getElementById("repost-candidates-body")?.textContent).toContain("结果未知");
-    expect(document.querySelector<HTMLInputElement>("[data-repost-select='90001']")?.disabled).toBe(true);
+    expect(document.querySelector<HTMLInputElement>("[data-repost-select='90001']")).toBeNull();
+    expect(document.querySelector(".repost-blocked-mark")).not.toBeNull();
   });
 
   it("restores the delete control from selection state after any terminal job", async () => {
@@ -209,14 +224,14 @@ describe("repost cleanup UI", () => {
 
     await module.loadPersistedCandidates();
 
-    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates");
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates?show_deleted=1");
     expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
     expect(document.querySelector<HTMLInputElement>("[data-repost-select='90001']")).not.toBeNull();
   });
 
   it("restores candidates when the cleanup section is re-activated", async () => {
     fetchJSONMock.mockImplementation((url: string) => {
-      if (url === "/api/repost-cleanup/candidates") {
+      if (url.includes("/api/repost-cleanup/candidates")) {
         return Promise.resolve({ ok: true, candidates: [candidate] });
       }
       return Promise.resolve({ ok: true });
@@ -351,7 +366,7 @@ describe("repost cleanup UI", () => {
       state: "cancelled",
     });
 
-    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates");
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates?show_deleted=1");
     expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
   });
 
@@ -377,5 +392,86 @@ describe("repost cleanup UI", () => {
     const [url, options] = fetchJSONMock.mock.calls[0];
     expect(url).toBe("/api/repost-cleanup/restore");
     expect(JSON.parse(options.body)).toEqual({ repost_dynamic_ids: ["90001"] });
+  });
+
+  it("searches locally by author, original id, repost id and summary", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([
+      { ...candidate, repost_dynamic_id: "90001", original_dynamic_id: "80001", original_author_name: "张三", summary: "转发抽奖" },
+      { ...candidate, repost_dynamic_id: "90002", original_dynamic_id: "80002", original_author_name: "李四", summary: "预约抽奖" },
+    ]);
+    const input = document.getElementById("repost-search-input") as HTMLInputElement;
+    input.value = "张三";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(document.querySelectorAll("[data-repost-row]")).toHaveLength(1);
+    expect(document.querySelector("[data-repost-row='90001']")).not.toBeNull();
+    expect(document.querySelector("[data-repost-row='90002']")).toBeNull();
+  });
+
+  it("sorts by reposted time ascending", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([
+      { ...candidate, repost_dynamic_id: "90001", reposted_at: 200 },
+      { ...candidate, repost_dynamic_id: "90002", reposted_at: 100 },
+    ]);
+    const select = document.getElementById("repost-sort-select") as HTMLSelectElement;
+    select.value = "reposted_asc";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    const rows = [...document.querySelectorAll("[data-repost-row]")];
+    expect(rows[0]?.getAttribute("data-repost-row")).toBe("90002");
+    expect(rows[1]?.getAttribute("data-repost-row")).toBe("90001");
+  });
+
+  it("select filtered results caps at 20", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const many = Array.from({ length: 25 }, (_, index) => ({
+      ...candidate,
+      repost_dynamic_id: `900${String(index + 1).padStart(2, "0")}`,
+    }));
+    module.setCandidates(many);
+    document.getElementById("repost-select-page")!.click();
+    expect(document.getElementById("repost-selected-count")?.textContent).toBe("已选择 20 条");
+    expect(showToastMock).toHaveBeenCalledWith("单次最多处理 20 条", "info", "已选择前 20 条。");
+  });
+
+  it("deleted filter shows tombstones after local load", async () => {
+    fetchJSONMock.mockResolvedValue({
+      ok: true,
+      deleted: 1,
+      deleted_candidates: [{ repost_dynamic_id: "90099", original_dynamic_id: "80099", deleted_at: 1_750_000_000 }],
+      candidates: [],
+    });
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    await module.loadPersistedCandidates();
+    document.querySelector<HTMLButtonElement>("[data-repost-filter='deleted']")!.click();
+    expect(document.querySelector("[data-repost-row='90099']")).not.toBeNull();
+    expect(document.querySelector("[data-repost-select='90099']")).toBeNull();
+  });
+
+  it("retryable blocked shows re-evaluate, permanent blocked does not", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([
+      { ...candidate, repost_dynamic_id: "90001", level: "blocked", assessment_status: "retryable_unknown", reason: "临时失败" },
+      { ...candidate, repost_dynamic_id: "90002", level: "blocked", assessment_status: "final", reason: "永久冲突" },
+    ]);
+    expect(document.querySelector("[data-repost-reeval='80001']")).not.toBeNull();
+    expect(document.querySelector("[data-repost-reeval='80002']")).toBeNull();
+  });
+
+  it("copy button uses browser clipboard without remote", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([candidate]);
+    document.querySelector<HTMLButtonElement>("[data-repost-copy='80001']")!.click();
+    await Promise.resolve();
+    expect(writeText).toHaveBeenCalledWith("80001");
+    expect(fetchJSONMock).not.toHaveBeenCalled();
   });
 });

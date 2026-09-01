@@ -101,9 +101,19 @@ export const repostBlockedTotal = document.getElementById("repost-blocked-total"
 
 export const repostPendingTotal = document.getElementById("repost-pending-total");
 
+export const repostDeletedTotal = document.getElementById("repost-deleted-total");
+
+export const repostWorkflowStatus = document.getElementById("repost-workflow-status");
+
 export const repostEvalStatus = document.getElementById("repost-eval-status");
 
 export const repostStopBtn = document.getElementById("repost-stop-btn");
+
+export const repostSearchInput = document.getElementById("repost-search-input");
+
+export const repostSortSelect = document.getElementById("repost-sort-select");
+
+export const repostDeleteProgress = document.getElementById("repost-delete-progress");
 
 export const repostCheckpointStatus = document.getElementById("repost-checkpoint-status");
 

@@ -12,6 +12,8 @@ from src.repost_cleanup import (
 )
 from src.repost_history import (
     RepostImportRecord,
+    claim_delete_pending,
+    mark_delete_result,
     upsert_repost_assessment,
     upsert_repost_records,
 )
@@ -228,3 +230,32 @@ def test_deferred_delete_is_rejected(isolated_home, monkeypatch) -> None:
 
     assert result["skipped_count"] == 1
     assert "已暂缓" in result["items"][0]["message"]
+
+
+def test_summary_includes_deleted_tombstones_and_checkpoint(isolated_home) -> None:
+    _seed_repost()
+    upsert_repost_assessment(
+        UID,
+        ORIGINAL_ID,
+        assessment_level="safe",
+        assessment_status="final",
+        lottery_time_reliable=True,
+        reason_code="safe_official_notice",
+        lottery_time=int(time.time()) - 10 * 86400,
+        assessed_at=100,
+        evaluated_at=200,
+    )
+    claim_delete_pending(UID, REPOST_ID, requested_at=300)
+    mark_delete_result(UID, REPOST_ID, status="deleted", deleted_at=301, updated_at=301)
+
+    summary = repost_cleanup_summary(UID, show_deleted=True)
+
+    assert summary["deleted"] == 1
+    assert len(summary["deleted_candidates"]) == 1
+    assert summary["deleted_candidates"][0]["repost_dynamic_id"] == REPOST_ID
+    assert summary["deleted_candidates"][0]["deleted_at"] == 301
+    assert summary["deleted_candidates"][0]["level"] == "deleted"
+    assert summary["history_total"] == 0
+    assert summary["last_evaluated_at"] == 200
+    assert "last_synced_at" in summary
+    assert "full_scan_completed" in summary

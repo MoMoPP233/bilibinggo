@@ -639,14 +639,14 @@
           </div>
         </section>
 
-        <section class="view-section" id="section-repost-cleanup" data-title="转发清理" data-subtitle="人工同步本人转发，只删除经过严格评估确认安全的记录。">
+        <section class="view-section" id="section-repost-cleanup" data-title="转发清理" data-subtitle="抽奖转发清理中心：同步、智能评估、人工判断与删除一体工作流。">
           <div class="repost-cleanup-stack">
             <article class="panel repost-cleanup-hero">
               <div class="panel-head-row repost-cleanup-head">
                 <div>
-                  <p class="eyebrow">Manual Cleanup</p>
-                  <h2 class="section-title">过期抽奖转发清理</h2>
-                  <p class="section-desc">先同步转发历史，再点击“一键智能评估”。程序内部分批执行：单批最多 40、单任务最多 120，命中平台限流立即停止并保存已完成结果。safe 可勾选删除；manual_review 需人工核对后强确认删除；blocked 不可删除。</p>
+                  <p class="eyebrow">Cleanup Center</p>
+                  <h2 class="section-title">抽奖转发清理中心</h2>
+                  <p class="section-desc">先同步转发历史，再点击“一键智能评估”。safe 可勾选删除；manual_review 需人工核对后强确认删除；deferred 暂缓；blocked 不可删除。页面打开/刷新/切换均为 0 远程请求。</p>
                 </div>
                 <div class="action-row repost-cleanup-actions">
                   <button type="button" class="btn btn-secondary btn-pill" id="repost-sync-btn" data-action="sync_repost_history">同步我的转发历史</button>
@@ -656,7 +656,7 @@
               </div>
               <div class="repost-cleanup-safety" role="note">
                 <strong>严格安全边界</strong>
-                <span>程序只在你主动点击“一键智能评估”时串行请求远程；页面打开/切换/刷新均为 0 远程请求。命中平台限流立即停止整个任务，已完成的评估已保存，请稍后再继续。</span>
+                <span>只有你主动点击同步 / 智能评估 / 定向重评 / 删除时才允许远程请求；命中平台限流立即停止并保存已完成结果，不自动继续、不绕过限制。</span>
               </div>
               <p class="repost-eval-status" id="repost-eval-status" aria-live="polite">尚未开始智能评估</p>
               <div class="repost-cleanup-metrics" aria-live="polite">
@@ -681,12 +681,16 @@
                   <strong class="repost-cleanup-metric-value" id="repost-blocked-total">0</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">待评估</span>
+                  <span class="repost-cleanup-metric-label">⏳ 待评估</span>
                   <strong class="repost-cleanup-metric-value" id="repost-pending-total">0</strong>
                 </div>
+                <div class="repost-cleanup-metric">
+                  <span class="repost-cleanup-metric-label">已删除</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-deleted-total">0</strong>
+                </div>
                 <div class="repost-cleanup-metric repost-cleanup-metric-wide">
-                  <span class="repost-cleanup-metric-label">历史同步状态</span>
-                  <strong class="repost-cleanup-metric-text" id="repost-checkpoint-status">尚未读取</strong>
+                  <span class="repost-cleanup-metric-label">同步 / 评估状态</span>
+                  <strong class="repost-cleanup-metric-text" id="repost-workflow-status">尚未读取</strong>
                 </div>
               </div>
             </article>
@@ -694,40 +698,54 @@
             <article class="panel repost-candidates-panel">
               <div class="panel-head-row repost-list-head">
                 <div>
-                  <p class="eyebrow">Safe Candidates</p>
-                  <h2 class="section-title">清理候选（三级）</h2>
-                  <p class="section-desc" id="repost-candidate-summary">请先点击“评估历史抽奖”。候选默认不勾选。</p>
+                  <p class="eyebrow">Work List</p>
+                  <h2 class="section-title">待处理列表</h2>
+                  <p class="section-desc" id="repost-candidate-summary">请先同步并点击“一键智能评估”。候选默认不勾选。</p>
                 </div>
                 <div class="repost-selection-actions">
                   <span class="repost-selected-count" id="repost-selected-count">已选择 0 条</span>
-                  <button type="button" class="btn btn-ghost btn-compact btn-pill" id="repost-select-page">全选当前页</button>
+                  <button type="button" class="btn btn-ghost btn-compact btn-pill" id="repost-select-page">选择当前筛选结果</button>
                   <button type="button" class="btn btn-ghost btn-compact btn-pill" id="repost-clear-selection">取消选择</button>
                   <button type="button" class="btn btn-danger btn-compact btn-pill" id="repost-delete-selected" data-job-control disabled>删除选中的 0 条</button>
                 </div>
               </div>
               <div class="repost-filter-bar" role="tablist" aria-label="候选筛选">
-                <button type="button" class="repost-filter-btn is-active" data-repost-filter="all">全部</button>
-                <button type="button" class="repost-filter-btn" data-repost-filter="safe">安全可删</button>
-                <button type="button" class="repost-filter-btn" data-repost-filter="manual_review">人工确认</button>
-                <button type="button" class="repost-filter-btn" data-repost-filter="deferred">暂缓处理</button>
-                <button type="button" class="repost-filter-btn" data-repost-filter="blocked">不可判断</button>
+                <button type="button" class="repost-filter-btn is-active" data-repost-filter="all">全部待处理</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="safe">🟢 安全可删</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="manual_review">🟡 人工确认</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="deferred">🕒 暂缓处理</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="blocked">🔴 不可判断</button>
+                <button type="button" class="repost-filter-btn" data-repost-filter="deleted">已删除</button>
+              </div>
+              <div class="repost-search-row">
+                <input type="search" class="input" id="repost-search-input" placeholder="搜索原作者 / 原动态 ID / 我的转发 ID / 摘要关键词" aria-label="搜索待处理记录" />
+                <select class="input repost-sort-select" id="repost-sort-select" aria-label="排序方式">
+                  <option value="reposted_desc">我的转发时间：最新优先</option>
+                  <option value="reposted_asc">我的转发时间：最早优先</option>
+                  <option value="lottery_desc">开奖时间：最近开奖</option>
+                  <option value="lottery_asc">开奖时间：最早开奖</option>
+                  <option value="priority">清理优先级</option>
+                  <option value="evaluated_desc">最近评估时间</option>
+                </select>
               </div>
               <div class="table-wrap">
                 <table class="data-table repost-cleanup-table">
                   <thead>
                     <tr>
                       <th class="repost-check-cell"><span class="sr-only">选择</span></th>
-                      <th>本人转发</th>
-                      <th>原抽奖动态</th>
-                      <th>等级 / 类型</th>
-                      <th>判断依据</th>
+                      <th>状态 / 原作者</th>
+                      <th>摘要 / 判断依据</th>
+                      <th>时间</th>
+                      <th>原动态 / 我的转发</th>
+                      <th>操作</th>
                     </tr>
                   </thead>
                   <tbody id="repost-candidates-body">
-                    <tr class="empty-row"><td colspan="5">尚未评估历史抽奖</td></tr>
+                    <tr class="empty-row"><td colspan="6">尚未评估历史抽奖</td></tr>
                   </tbody>
                 </table>
               </div>
+              <p class="repost-delete-progress" id="repost-delete-progress" aria-live="polite"></p>
               <div class="pagination" id="repost-candidate-pagination"></div>
             </article>
 
