@@ -110,7 +110,7 @@ def test_public_classifier_forward_lottery_is_manual_review(isolated_home, monke
     candidate = load_persisted_candidates(UID)[0]
     assert candidate["level"] == "manual_review"
     assert candidate["reason_code"] == "forward_lottery_manual"
-    assert result["message"].startswith("历史抽奖评估完成")
+    assert result["message"].startswith("智能评估完成")
 
 
 def test_non_lottery_is_excluded_not_blocked(isolated_home, monkeypatch) -> None:
@@ -136,6 +136,7 @@ def test_non_lottery_is_excluded_not_blocked(isolated_home, monkeypatch) -> None
 
 def test_assessment_uses_budget_and_is_incremental(isolated_home, monkeypatch) -> None:
     monkeypatch.setattr("src.repost_cleanup.ASSESSMENT_BUDGET_PER_ROUND", 2)
+    monkeypatch.setattr("src.repost_cleanup.MAX_ASSESSMENTS_PER_JOB", 2)
     upsert_repost_records(
         UID,
         [
@@ -163,7 +164,7 @@ def test_assessment_uses_budget_and_is_incremental(isolated_home, monkeypatch) -
     second = scan_expired_reposts(now_ts=NOW_TS + 1, client_factory=lambda: _FakeClient())
     assert second["evaluated_originals"] == 1
     assert second["pending_originals"] == 0
-    assert second["message"].startswith("历史抽奖评估完成")
+    assert second["message"].startswith("智能评估完成")
 
 
 def test_classifier_risk_code_stops_round_and_keeps_results(isolated_home, monkeypatch) -> None:

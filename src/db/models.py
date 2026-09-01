@@ -100,6 +100,10 @@ class RepostHistoryRow(SQLModel, table=True):
             name="ck_repost_history_identity_source",
         ),
         CheckConstraint(
+            "cleanup_defer_reason IS NULL OR cleanup_defer_reason IN ('user')",
+            name="ck_repost_history_cleanup_defer_reason",
+        ),
+        CheckConstraint(
             "delete_status IN ('active','delete_pending','deleted','delete_failed','unknown')",
             name="ck_repost_history_delete_status",
         ),
@@ -131,6 +135,9 @@ class RepostHistoryRow(SQLModel, table=True):
     identity_checked_at: Optional[int] = None
     identity_ok: Optional[bool] = None
     identity_error: Optional[str] = Field(default=None, sa_column=Column(Text))
+    cleanup_defer_reason: Optional[str] = Field(default=None, max_length=16)
+    cleanup_deferred_at: Optional[int] = None
+    cleanup_deferred_until: Optional[int] = None
     updated_at: int = 0
 
 
@@ -164,11 +171,17 @@ class RepostAssessmentRow(SQLModel, table=True):
             "classification_source IN ('activities','public_classifier','legacy')",
             name="ck_repost_assessment_classification_source",
         ),
+        CheckConstraint(
+            "assessment_status IN ('final','refreshable','retryable_unknown')",
+            name="ck_repost_assessment_status",
+        ),
     )
 
     uid: str = Field(primary_key=True, max_length=64)
     original_dynamic_id: str = Field(primary_key=True, max_length=32)
     assessment_level: str = Field(default="safe", max_length=16)
+    assessment_status: str = Field(default="final", max_length=16)
+    lottery_time_reliable: bool = Field(default=False)
     reason_code: Optional[str] = Field(default=None, max_length=32)
     lottery_type: Optional[str] = Field(default=None, max_length=16)
     lottery_time: Optional[int] = None

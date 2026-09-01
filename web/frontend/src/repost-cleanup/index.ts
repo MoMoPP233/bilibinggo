@@ -6,6 +6,7 @@ import {
   repostCandidatesBody,
   repostSafeTotal,
   repostManualTotal,
+  repostDeferredTotal,
   repostBlockedTotal,
   repostPendingTotal,
   repostCheckpointStatus,
@@ -15,6 +16,8 @@ import {
   repostHistoryPagination,
   repostHistorySummary,
   repostHistoryTotal,
+  repostEvalStatus,
+  repostStopBtn,
   repostSelectedCount,
   repostSelectPageBtn,
 } from "../dom";
@@ -52,6 +55,9 @@ export interface CleanupCandidate {
   eligible_after?: string | number | null;
   days_since_lottery?: number | null;
   level?: "safe" | "manual_review" | "blocked" | "excluded" | string | null;
+  defer_reason?: string | null;
+  deferred_at?: string | number | null;
+  deferred_until?: string | number | null;
   reason_code?: string | null;
   summary?: string | null;
   classification_source?: string | null;
@@ -84,8 +90,10 @@ interface RepostCandidatesResponse {
   uid?: string | number;
   candidates?: unknown;
   history_total?: number;
+  assessed_total?: number;
   safe?: number;
   manual_review?: number;
+  deferred?: number;
   blocked?: number;
   excluded?: number;
   pending_evaluation?: number;
@@ -121,8 +129,18 @@ let historyPages = 1;
 let deleteSubmitting = false;
 let deletePromptOpen = false;
 let bound = false;
-let filter: "all" | "safe" | "manual_review" | "blocked" = "all";
+let filter: "all" | "safe" | "manual_review" | "deferred" | "blocked" = "all";
 let pendingEvaluation = 0;
+let assessedTotal = 0;
+
+function updateEvalStatus(): void {
+  if (!repostEvalStatus) return;
+  repostEvalStatus.textContent = pendingEvaluation > 0
+    ? `累计已评估 ${assessedTotal} 条 · 仍待评估 ${pendingEvaluation} 条`
+    : assessedTotal > 0
+      ? `累计已评估 ${assessedTotal} 条 · 全部完成`
+      : "尚未开始智能评估";
+}
 
 function validDynamicId(value: unknown): string {
   const text = String(value ?? "").trim();
@@ -192,6 +210,8 @@ function levelLabel(level: unknown): { label: string; tone: string } {
       return { label: "🟡 人工确认", tone: "manual_review" };
     case "blocked":
       return { label: "🔴 不可判断", tone: "blocked" };
+    case "deferred":
+      return { label: "🕒 暂缓处理", tone: "deferred" };
     case "excluded":
       return { label: "非抽奖", tone: "excluded" };
     default:
@@ -272,9 +292,11 @@ export function renderCandidates(): void {
 
   const safeCount = candidates.filter((c) => String(c.level) === "safe").length;
   const manualCount = candidates.filter((c) => String(c.level) === "manual_review").length;
+  const deferredCount = candidates.filter((c) => String(c.level) === "deferred").length;
   const blockedCount = candidates.filter((c) => String(c.level) === "blocked").length;
   if (repostSafeTotal) repostSafeTotal.textContent = String(safeCount);
   if (repostManualTotal) repostManualTotal.textContent = String(manualCount);
+  if (repostDeferredTotal) repostDeferredTotal.textContent = String(deferredCount);
   if (repostBlockedTotal) repostBlockedTotal.textContent = String(blockedCount);
   if (repostCandidateSummary) {
     repostCandidateSummary.textContent = pendingEvaluation > 0
@@ -299,10 +321,17 @@ export function renderCandidates(): void {
         const lotteryType = sanitizeUserText(candidate.lottery_type || "") || "官方抽奖";
         const lotteryTime = formatTimestamp(candidate.lottery_time);
         const message = sanitizeUserText(candidate.delete_message || "");
+        const isDeferred = String(candidate.level) === "deferred";
+        const isUserDeferred = String(candidate.defer_reason) === "user";
+        const deferLine = isDeferred
+          ? isUserDeferred
+            ? `已于 ${formatTimestamp(candidate.deferred_at)} 暂缓`
+            : `官方可靠开奖时间距今未满 30 天 · 预计可重新进入人工确认时间：${formatTimestamp(candidate.deferred_until)}`
+          : "";
         return `
           <tr class="repost-candidate-row" data-repost-row="${escapeHtml(repostId)}">
             <td class="repost-check-cell">
-              ${String(candidate.level) === "blocked"
+              ${String(candidate.level) === "blocked" || isDeferred
                 ? `<span class="repost-blocked-mark" title="该候选禁止勾选删除">🔒</span>`
                 : `<input type="checkbox" class="repost-checkbox" data-repost-select="${escapeHtml(repostId)}" aria-label="选择本人转发 ${escapeHtml(repostId)}" ${selectedRepostIds.has(repostId) ? "checked" : ""} ${selectable ? "" : "disabled"} />`}
             </td>
@@ -322,9 +351,18 @@ export function renderCandidates(): void {
             </td>
             <td>
               <p class="repost-reason">${escapeHtml(reason)}</p>
+              ${deferLine ? `<p class="caption repost-summary">${escapeHtml(deferLine)}</p>` : ""}
               ${summary ? `<p class="caption repost-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}</p>` : ""}
               ${!selectable && candidate.level !== "blocked" ? `<span class="repost-status repost-status--${status.tone}">${status.label}</span>` : ""}
               ${message ? `<p class="caption repost-error">${escapeHtml(message)}</p>` : ""}
+              <div class="action-row repost-row-actions">
+                ${isUserDeferred
+                  ? `<button type="button" class="btn btn-ghost btn-compact btn-pill" data-repost-restore="${escapeHtml(repostId)}">恢复</button>`
+                  : ""}
+                ${selectable
+                  ? `<button type="button" class="btn btn-ghost btn-compact btn-pill" data-repost-defer="${escapeHtml(repostId)}">暂不删除</button>`
+                  : ""}
+              </div>
             </td>
           </tr>`;
       }).join("");
@@ -416,13 +454,51 @@ export async function loadPersistedCandidates(): Promise<void> {
   try {
     const data = await fetchJSON<RepostCandidatesResponse>("/api/repost-cleanup/candidates");
     pendingEvaluation = Math.max(0, Number(data?.pending_evaluation) || 0);
+    assessedTotal = Math.max(0, Number(data?.assessed_total) || 0);
     if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
     if (repostHistoryTotal && Number(data?.history_total) >= 0) {
       repostHistoryTotal.textContent = String(Number(data?.history_total) || 0);
     }
+    updateEvalStatus();
     setCandidates(normalizeCandidates(data?.candidates));
   } catch {
     // 登录/网络异常时保留当前已渲染候选，避免误清空。
+  }
+}
+
+export async function deferCandidate(repostId: string): Promise<void> {
+  try {
+    const data = await fetchJSON<RepostCandidatesResponse>("/api/repost-cleanup/defer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repost_dynamic_ids: [repostId] }),
+    });
+    pendingEvaluation = Math.max(0, Number(data?.pending_evaluation) || 0);
+    setCandidates(normalizeCandidates(data?.candidates));
+    updateEvalStatus();
+  } catch (error) {
+    showToast(
+      sanitizeUserText(error instanceof Error ? error.message : String(error)) || "暂不删除失败",
+      "error",
+    );
+  }
+}
+
+export async function restoreCandidate(repostId: string): Promise<void> {
+  try {
+    const data = await fetchJSON<RepostCandidatesResponse>("/api/repost-cleanup/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repost_dynamic_ids: [repostId] }),
+    });
+    pendingEvaluation = Math.max(0, Number(data?.pending_evaluation) || 0);
+    setCandidates(normalizeCandidates(data?.candidates));
+    updateEvalStatus();
+  } catch (error) {
+    showToast(
+      sanitizeUserText(error instanceof Error ? error.message : String(error)) || "恢复失败",
+      "error",
+    );
   }
 }
 
@@ -562,6 +638,7 @@ export async function deleteSelectedReposts(): Promise<void> {
 
 export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<void> {
   if (!job || (job.state !== "success" && job.state !== "error" && job.state !== "cancelled")) return;
+  if (repostStopBtn instanceof HTMLButtonElement) repostStopBtn.disabled = true;
   // 全局任务管理器不会盲目重新启用 data-job-control；按本页选择状态恢复。
   renderSelectionState();
   if (job.action === "sync_repost_history") {
@@ -573,24 +650,25 @@ export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<
     return;
   }
   if (job.action === "scan_expired_reposts") {
+    // 无论成功 / 失败 / 被用户停止，都从本地库重建最终状态，避免 UI 滞后。
+    await loadPersistedCandidates().catch(() => {});
     if (job.state === "success") {
-      const found = extractJobCandidates(job);
       const result = (job.result || {}) as Record<string, unknown>;
-      pendingEvaluation = Math.max(0, Number(result.pending_originals ?? result.pending_evaluation) || 0);
-      if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
-      setCandidates(found);
       const message = String(result.message || "历史抽奖评估完成");
-      showToast(
-        result.rate_limited ? "本轮评估提前停止" : "历史抽奖评估完成",
-        result.rate_limited ? "info" : "success",
-        message,
-      );
+      if (result.rate_limited) {
+        showToast("智能评估提前停止", "info", "本次智能评估因平台限制提前停止，已完成结果已经保存，请稍后再继续。");
+      } else {
+        showToast("智能评估完成", "success", message);
+      }
+    } else if (job.state === "cancelled") {
+      showToast("智能评估已停止", "info", "已保存本次已完成结果，未完成部分将在下次继续。");
     }
     return;
   }
   if (job.action === "delete_expired_reposts") {
     applyDeleteCompletion(job);
     await loadRepostHistory(historyPage).catch(() => {});
+    await loadPersistedCandidates().catch(() => {});
   }
 }
 
@@ -634,6 +712,20 @@ export function bindRepostCleanup(): void {
   if (bound) return;
   bound = true;
   repostCandidatesBody?.addEventListener("change", handleCandidateChange);
+  repostCandidatesBody?.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    const deferButton = target?.closest<HTMLButtonElement>("[data-repost-defer]");
+    if (deferButton) {
+      const repostId = validDynamicId(deferButton.dataset.repostDefer);
+      if (repostId) deferCandidate(repostId);
+      return;
+    }
+    const restoreButton = target?.closest<HTMLButtonElement>("[data-repost-restore]");
+    if (restoreButton) {
+      const repostId = validDynamicId(restoreButton.dataset.repostRestore);
+      if (repostId) restoreCandidate(repostId);
+    }
+  });
   repostSelectPageBtn?.addEventListener("click", selectCurrentCandidatePage);
   repostClearSelectionBtn?.addEventListener("click", clearCandidateSelection);
   repostDeleteSelectedBtn?.addEventListener("click", () => {
@@ -641,12 +733,22 @@ export function bindRepostCleanup(): void {
       notifyJobStartError(error, "delete_expired_reposts", {});
     });
   });
+  repostStopBtn?.addEventListener("click", async () => {
+    try {
+      await fetchJSON("/api/jobs/cancel", { method: "POST" });
+    } catch (error) {
+      showToast(
+        sanitizeUserText(error instanceof Error ? error.message : String(error)) || "停止评估失败",
+        "error",
+      );
+    }
+  });
   repostCandidatePagination?.addEventListener("click", handlePaginationClick);
   repostHistoryPagination?.addEventListener("click", handlePaginationClick);
   document.querySelectorAll<HTMLButtonElement>("[data-repost-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       const value = button.dataset.repostFilter;
-      if (value === "all" || value === "safe" || value === "manual_review" || value === "blocked") {
+      if (value === "all" || value === "safe" || value === "manual_review" || value === "deferred" || value === "blocked") {
         filter = value;
         candidatePage = 1;
       }
@@ -659,7 +761,9 @@ export function bindRepostCleanup(): void {
   document.getElementById("repost-scan-btn")?.addEventListener("click", () => {
     // 旧候选可能已过期；每次开始重新扫描即清空，只有本轮成功结果可重新出现。
     setCandidates([]);
-    if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行评估历史抽奖…";
+    if (repostStopBtn instanceof HTMLButtonElement) repostStopBtn.disabled = false;
+    if (repostEvalStatus) repostEvalStatus.textContent = "智能评估进行中：正在本地评估…";
+    if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行分批评估历史抽奖…";
   });
   window.addEventListener("binggo:section-activated", ((event: CustomEvent<{ sectionId?: string }>) => {
     if (event.detail?.sectionId !== "repost-cleanup") return;

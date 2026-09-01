@@ -201,3 +201,40 @@ def test_scan_job_accepts_force_original_ids_only() -> None:
         source="ui",
     )
     assert rejected.status_code == 400
+
+
+def test_defer_endpoint_is_local_only_and_returns_summary() -> None:
+    with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
+        "web.app._require_runtime_bilibili_uid", return_value="123"
+    ), patch(
+        "src.repost_cleanup.defer_candidate"
+    ) as defer_mock, patch(
+        "src.repost_cleanup.repost_cleanup_summary",
+        return_value={"uid": "123", "deferred": 1, "candidates": []},
+    ):
+        response = client.post(
+            "/api/repost-cleanup/defer",
+            json={"repost_dynamic_ids": [REPOST_ID]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["deferred"] == 1
+    defer_mock.assert_called_once_with("123", REPOST_ID)
+
+
+def test_restore_endpoint_is_local_only_and_returns_summary() -> None:
+    with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
+        "web.app._require_runtime_bilibili_uid", return_value="123"
+    ), patch(
+        "src.repost_cleanup.restore_candidate"
+    ) as restore_mock, patch(
+        "src.repost_cleanup.repost_cleanup_summary",
+        return_value={"uid": "123", "deferred": 0, "candidates": []},
+    ):
+        response = client.post(
+            "/api/repost-cleanup/restore",
+            json={"repost_dynamic_ids": [REPOST_ID]},
+        )
+
+    assert response.status_code == 200
+    restore_mock.assert_called_once_with("123", REPOST_ID)

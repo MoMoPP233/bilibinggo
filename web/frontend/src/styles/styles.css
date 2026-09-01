@@ -1309,7 +1309,28 @@ html.sidebar-init-collapsed .system-btn {
 .system-btn-icon svg {
   width: 18px;
   height: 18px;
+  display: block;
   transition: transform var(--sidebar-duration) var(--sidebar-ease);
+}
+
+.system-btn-icon svg[hidden] {
+  display: none !important;
+}
+
+[data-theme="light"] .system-btn-icon .icon-moon {
+  display: block;
+}
+
+[data-theme="light"] .system-btn-icon .icon-sun {
+  display: none;
+}
+
+[data-theme="dark"] .system-btn-icon .icon-moon {
+  display: none;
+}
+
+[data-theme="dark"] .system-btn-icon .icon-sun {
+  display: block;
 }
 
 .system-btn-text {
@@ -5066,6 +5087,13 @@ body.modal-open {
   margin-top: 14px;
 }
 
+.repost-eval-status {
+  margin: 12px 0 0;
+  color: var(--foreground-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .repost-cleanup-metric {
   display: grid;
   align-content: center;
@@ -5222,11 +5250,21 @@ body.modal-open {
   background: var(--warning-soft);
 }
 
+.repost-level--deferred {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
 .repost-level--blocked,
 .repost-level--pending,
 .repost-level--excluded {
   color: var(--danger-alt);
   background: var(--danger-soft);
+}
+
+.repost-row-actions {
+  margin-top: 8px;
+  gap: 6px;
 }
 
 .repost-blocked-mark {

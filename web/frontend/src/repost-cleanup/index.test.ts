@@ -44,9 +44,12 @@ const candidate = {
 function setupDom(): void {
   document.body.innerHTML = `
     <button id="repost-scan-btn" data-action="scan_expired_reposts">扫描</button>
+    <button id="repost-stop-btn" data-job-control disabled>停止评估</button>
+    <p id="repost-eval-status">尚未开始智能评估</p>
     <span id="repost-history-total">—</span>
     <span id="repost-safe-total">0</span>
     <span id="repost-manual-total">0</span>
+    <span id="repost-deferred-total">0</span>
     <span id="repost-blocked-total">0</span>
     <span id="repost-pending-total">0</span>
     <span id="repost-checkpoint-status">尚未读取</span>
@@ -156,13 +159,17 @@ describe("repost cleanup UI", () => {
   });
 
   it("loads successful scan candidates with duplicate IDs removed and none selected", async () => {
+    fetchJSONMock.mockResolvedValue({
+      ok: true,
+      candidates: [candidate, { ...candidate, original_author_name: "重复项" }],
+    });
     const module = await loadModule();
     module.bindRepostCleanup();
 
     await module.handleRepostCleanupJobCompletion({
       action: "scan_expired_reposts",
       state: "success",
-      result: { candidates: [candidate, { ...candidate, original_author_name: "重复项" }] },
+      result: {},
     });
 
     expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
@@ -303,5 +310,72 @@ describe("repost cleanup UI", () => {
       confirmed: true,
       manual_review_confirmed: true,
     });
+  });
+
+  it("stop button cancels the running assessment job", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    (document.getElementById("repost-stop-btn") as HTMLButtonElement).disabled = false;
+
+    document.getElementById("repost-stop-btn")!.click();
+
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/jobs/cancel", { method: "POST" });
+  });
+
+  it("shows cumulative and pending counts from persisted summary", async () => {
+    fetchJSONMock.mockResolvedValue({
+      ok: true,
+      history_total: 10,
+      assessed_total: 7,
+      pending_evaluation: 3,
+      candidates: [candidate],
+    });
+    const module = await loadModule();
+    module.bindRepostCleanup();
+
+    await module.loadPersistedCandidates();
+
+    expect(document.getElementById("repost-eval-status")?.textContent).toBe(
+      "累计已评估 7 条 · 仍待评估 3 条",
+    );
+    expect(document.getElementById("repost-pending-total")?.textContent).toBe("3");
+  });
+
+  it("cancelled scan job reloads persisted results locally", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    fetchJSONMock.mockResolvedValue({ ok: true, candidates: [candidate] });
+
+    await module.handleRepostCleanupJobCompletion({
+      action: "scan_expired_reposts",
+      state: "cancelled",
+    });
+
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates");
+    expect(document.getElementById("repost-safe-total")?.textContent).toBe("1");
+  });
+
+  it("defer sends only the repost id to the local defer endpoint", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    fetchJSONMock.mockResolvedValue({ ok: true, candidates: [] });
+
+    await module.deferCandidate("90001");
+
+    const [url, options] = fetchJSONMock.mock.calls[0];
+    expect(url).toBe("/api/repost-cleanup/defer");
+    expect(JSON.parse(options.body)).toEqual({ repost_dynamic_ids: ["90001"] });
+  });
+
+  it("restore sends only the repost id to the local restore endpoint", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    fetchJSONMock.mockResolvedValue({ ok: true, candidates: [] });
+
+    await module.restoreCandidate("90001");
+
+    const [url, options] = fetchJSONMock.mock.calls[0];
+    expect(url).toBe("/api/repost-cleanup/restore");
+    expect(JSON.parse(options.body)).toEqual({ repost_dynamic_ids: ["90001"] });
   });
 });

@@ -95,9 +95,15 @@ export const repostSafeTotal = document.getElementById("repost-safe-total");
 
 export const repostManualTotal = document.getElementById("repost-manual-total");
 
+export const repostDeferredTotal = document.getElementById("repost-deferred-total");
+
 export const repostBlockedTotal = document.getElementById("repost-blocked-total");
 
 export const repostPendingTotal = document.getElementById("repost-pending-total");
+
+export const repostEvalStatus = document.getElementById("repost-eval-status");
+
+export const repostStopBtn = document.getElementById("repost-stop-btn");
 
 export const repostCheckpointStatus = document.getElementById("repost-checkpoint-status");
 

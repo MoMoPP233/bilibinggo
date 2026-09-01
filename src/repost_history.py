@@ -16,6 +16,7 @@ from src.db.session import session_scope
 
 REPOST_SOURCES = frozenset({"binggo", "history_import"})
 ASSESSMENT_LEVELS = frozenset({"safe", "manual_review", "blocked", "excluded"})
+ASSESSMENT_STATUSES = frozenset({"final", "refreshable", "retryable_unknown"})
 IDENTITY_SOURCES = frozenset({"space_feed", "legacy_space_feed", "remote_detail"})
 CLASSIFICATION_SOURCES = frozenset({"activities", "public_classifier", "legacy"})
 DELETE_STATUSES = frozenset(
@@ -54,6 +55,9 @@ class RepostHistoryRecord:
     identity_checked_at: int | None = None
     identity_ok: bool | None = None
     identity_error: str | None = None
+    cleanup_defer_reason: str | None = None
+    cleanup_deferred_at: int | None = None
+    cleanup_deferred_until: int | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,8 @@ class RepostAssessmentRecord:
     original_dynamic_id: str
     assessed_at: int
     assessment_level: str = "safe"
+    assessment_status: str = "final"
+    lottery_time_reliable: bool = False
     reason_code: str | None = None
     lottery_type: str | None = None
     lottery_time: int | None = None
@@ -153,6 +159,9 @@ def _history_record(row: RepostHistoryRow) -> RepostHistoryRecord:
         identity_checked_at=row.identity_checked_at,
         identity_ok=row.identity_ok,
         identity_error=row.identity_error,
+        cleanup_defer_reason=row.cleanup_defer_reason,
+        cleanup_deferred_at=row.cleanup_deferred_at,
+        cleanup_deferred_until=row.cleanup_deferred_until,
         updated_at=row.updated_at,
     )
 
@@ -503,6 +512,8 @@ def _assessment_record(row: RepostAssessmentRow) -> RepostAssessmentRecord:
         uid=row.uid,
         original_dynamic_id=row.original_dynamic_id,
         assessment_level=row.assessment_level,
+        assessment_status=row.assessment_status,
+        lottery_time_reliable=row.lottery_time_reliable,
         reason_code=row.reason_code,
         lottery_type=row.lottery_type,
         lottery_time=row.lottery_time,
@@ -522,6 +533,8 @@ def upsert_repost_assessment(
     original_dynamic_id: str,
     *,
     assessment_level: str,
+    assessment_status: str = "final",
+    lottery_time_reliable: bool = False,
     reason_code: str | None = None,
     lottery_type: str | None = None,
     lottery_time: int | None = None,
@@ -536,6 +549,10 @@ def upsert_repost_assessment(
     """保存原动态最近一次清理评估结果（safe/manual_review/blocked/excluded）。"""
     if assessment_level not in ASSESSMENT_LEVELS:
         raise ValueError("评估等级无效")
+    if assessment_status not in ASSESSMENT_STATUSES:
+        raise ValueError("评估生命周期状态无效")
+    if not isinstance(lottery_time_reliable, bool):
+        raise ValueError("开奖时间可靠性标记无效")
     if classification_source not in CLASSIFICATION_SOURCES:
         raise ValueError("评估来源无效")
     scoped_uid = _uid(uid)
@@ -547,6 +564,8 @@ def upsert_repost_assessment(
         "uid": scoped_uid,
         "original_dynamic_id": original_id,
         "assessment_level": assessment_level,
+        "assessment_status": assessment_status,
+        "lottery_time_reliable": lottery_time_reliable,
         "reason_code": _optional_text(reason_code, max_length=32),
         "lottery_type": _optional_text(lottery_type, max_length=16),
         "lottery_time": (
@@ -624,6 +643,52 @@ def set_repost_identity(
                 updated_at=now,
             )
         )
+
+
+def defer_repost(
+    uid: str,
+    repost_id: str,
+    *,
+    reason: str = "user",
+    deferred_at: int | None = None,
+    deferred_until: int | None = None,
+) -> None:
+    """用户主动“暂不删除”：per-repost 持久化，不触碰 assessment/original。"""
+    if reason != "user":
+        raise ValueError("暂缓原因无效")
+    scoped_uid = _uid(uid)
+    normalized_id = _dynamic_id(repost_id, label="转发动态 ID")
+    now = int(time.time()) if deferred_at is None else int(
+        _timestamp(deferred_at, label="暂缓时间")
+    )
+    until = (
+        int(_timestamp(deferred_until, label="暂缓截止时间"))
+        if deferred_until is not None
+        else None
+    )
+    with session_scope() as session:
+        row = session.get(RepostHistoryRow, (scoped_uid, normalized_id))
+        if row is None or row.delete_status not in {"active", "delete_failed"}:
+            raise ValueError("只有仍存在的候选转发才能暂不删除")
+        row.cleanup_defer_reason = reason
+        row.cleanup_deferred_at = now
+        row.cleanup_deferred_until = until
+        row.updated_at = now
+
+
+def restore_repost(uid: str, repost_id: str) -> None:
+    """恢复用户暂缓的转发；不请求远程，仅清除 per-repost 暂缓标记。"""
+    scoped_uid = _uid(uid)
+    normalized_id = _dynamic_id(repost_id, label="转发动态 ID")
+    now = int(time.time())
+    with session_scope() as session:
+        row = session.get(RepostHistoryRow, (scoped_uid, normalized_id))
+        if row is None:
+            raise ValueError("转发历史中不存在该目标")
+        row.cleanup_defer_reason = None
+        row.cleanup_deferred_at = None
+        row.cleanup_deferred_until = None
+        row.updated_at = now
 
 
 def remove_repost_assessment(uid: str, original_dynamic_id: str) -> None:

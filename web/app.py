@@ -67,6 +67,7 @@ from web.schemas import (
     OkResponse,
     ParticipateTextRequest,
     RepostCleanupDeleteRequest,
+    RepostDeferRequest,
     UpdatesCheckOut,
     WatchUserRequest,
 )
@@ -475,6 +476,47 @@ def api_repost_cleanup_candidates() -> dict[str, Any]:
     except ValueError as exc:
         raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
     return {"ok": True, "uid": uid, **summary}
+
+
+def _defer_common(request: RepostDeferRequest, *, restore: bool) -> dict[str, Any]:
+    from src.repost_cleanup import defer_candidate, repost_cleanup_summary, restore_candidate
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再管理转发清理")
+    uid = _require_runtime_bilibili_uid()
+    repost_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for raw_id in request.repost_dynamic_ids:
+        repost_id = str(raw_id or "").strip()
+        if not is_valid_dynamic_id(repost_id):
+            raise AppError(ErrorCode.VALIDATION_ERROR, "转发动态 ID 无效")
+        if repost_id not in seen_ids:
+            seen_ids.add(repost_id)
+            repost_ids.append(repost_id)
+    if not repost_ids:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "没有选择要处理的转发动态")
+    try:
+        for repost_id in repost_ids:
+            if restore:
+                restore_candidate(uid, repost_id)
+            else:
+                defer_candidate(uid, repost_id)
+        summary = repost_cleanup_summary(uid)
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "uid": uid, **summary}
+
+
+@app.post("/api/repost-cleanup/defer", tags=["stable"])
+def api_repost_cleanup_defer(request: RepostDeferRequest) -> dict[str, Any]:
+    """用户“暂不删除”：本地 per-repost 标记，0 Bilibili 远程请求。"""
+    return _defer_common(request, restore=False)
+
+
+@app.post("/api/repost-cleanup/restore", tags=["stable"])
+def api_repost_cleanup_restore(request: RepostDeferRequest) -> dict[str, Any]:
+    """恢复用户暂缓：本地清除 per-repost 标记，0 Bilibili 远程请求。"""
+    return _defer_common(request, restore=True)
 
 
 @app.post(

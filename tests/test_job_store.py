@@ -19,9 +19,9 @@ from src.job_store import (
 )
 
 
-def test_schema_version_is_v6(isolated_home: Path) -> None:
+def test_schema_version_is_v8(isolated_home: Path) -> None:
     _ = isolated_home
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 8
     with session_scope() as session:
         meta = session.get(SchemaMeta, 1)
         assert meta is not None

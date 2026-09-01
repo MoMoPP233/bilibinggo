@@ -11,7 +11,7 @@ from src.db.models import SchemaMeta
 # 确保全部表注册到 metadata
 from src.db import models as _models  # noqa: F401
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 _JOB_V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("label", "TEXT NOT NULL DEFAULT ''"),
@@ -257,6 +257,40 @@ def _validate_repost_v6_columns(session: Session) -> None:
     )
 
 
+def _validate_repost_v7_columns(session: Session) -> None:
+    _validate_columns(
+        session,
+        table="repost_assessment",
+        expected_types={"assessment_status": "VARCHAR(16)"},
+        primary_key=["uid", "original_dynamic_id"],
+        required={"assessment_status"},
+        label="repost_assessment v7",
+    )
+
+
+def _validate_repost_v8_columns(session: Session) -> None:
+    _validate_columns(
+        session,
+        table="repost_history",
+        expected_types={
+            "cleanup_defer_reason": "VARCHAR(16)",
+            "cleanup_deferred_at": "INTEGER",
+            "cleanup_deferred_until": "INTEGER",
+        },
+        primary_key=["uid", "repost_dynamic_id"],
+        required=set(),
+        label="repost_history v8",
+    )
+    _validate_columns(
+        session,
+        table="repost_assessment",
+        expected_types={"lottery_time_reliable": "BOOLEAN"},
+        primary_key=["uid", "original_dynamic_id"],
+        required={"lottery_time_reliable"},
+        label="repost_assessment v8",
+    )
+
+
 def _table_has_columns(conn, table: str, names: set[str]) -> bool:
     existing = {str(row[1]) for row in conn.execute(text(f"PRAGMA table_info({table})"))}
     return names <= existing
@@ -317,6 +351,55 @@ def migrate_v5_to_v6(session: Session) -> None:
         )
     )
     _validate_repost_v6_columns(session)
+
+
+def migrate_v6_to_v7(session: Session) -> None:
+    """纯增量升级：评估生命周期字段；既有评估回填 final，不自动重评。"""
+    conn = session.connection()
+    if not _table_has_columns(conn, "repost_assessment", {"assessment_status"}):
+        conn.execute(
+            text(
+                "ALTER TABLE repost_assessment "
+                "ADD COLUMN assessment_status VARCHAR(16) NOT NULL DEFAULT 'final'"
+            )
+        )
+    conn.execute(
+        text("UPDATE repost_assessment SET assessment_status='final' WHERE assessment_status IS NULL")
+    )
+    _validate_repost_v7_columns(session)
+
+
+def migrate_v7_to_v8(session: Session) -> None:
+    """纯增量升级：per-repost 用户暂缓字段 + 官方可靠开奖时间标记。"""
+    conn = session.connection()
+    if not _table_has_columns(
+        conn,
+        "repost_history",
+        {"cleanup_defer_reason", "cleanup_deferred_at", "cleanup_deferred_until"},
+    ):
+        conn.execute(
+            text("ALTER TABLE repost_history ADD COLUMN cleanup_defer_reason VARCHAR(16)")
+        )
+        conn.execute(
+            text("ALTER TABLE repost_history ADD COLUMN cleanup_deferred_at INTEGER")
+        )
+        conn.execute(
+            text("ALTER TABLE repost_history ADD COLUMN cleanup_deferred_until INTEGER")
+        )
+    if not _table_has_columns(conn, "repost_assessment", {"lottery_time_reliable"}):
+        conn.execute(
+            text(
+                "ALTER TABLE repost_assessment "
+                "ADD COLUMN lottery_time_reliable BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    conn.execute(
+        text(
+            "UPDATE repost_assessment SET lottery_time_reliable=1 "
+            "WHERE lottery_time IS NOT NULL AND lottery_time_reliable=0"
+        )
+    )
+    _validate_repost_v8_columns(session)
 
 
 def migrate_v3_to_v4(session: Session) -> None:
@@ -409,6 +492,8 @@ _MIGRATIONS: dict[int, Callable[[Session], None]] = {
     3: migrate_v3_to_v4,
     4: migrate_v4_to_v5,
     5: migrate_v5_to_v6,
+    6: migrate_v6_to_v7,
+    7: migrate_v7_to_v8,
 }
 
 
@@ -463,6 +548,10 @@ def init_db() -> None:
                     _validate_repost_assessment_table(session)
                 if recorded is not None and int(recorded) >= 6:
                     _validate_repost_v6_columns(session)
+                if recorded is not None and int(recorded) >= 7:
+                    _validate_repost_v7_columns(session)
+                if recorded is not None and int(recorded) >= 8:
+                    _validate_repost_v8_columns(session)
                 SQLModel.metadata.create_all(conn)
                 meta = session.get(SchemaMeta, 1)
                 current = int(meta.version) if meta is not None else 1
@@ -482,6 +571,8 @@ def init_db() -> None:
                 _validate_repost_history_tables(session)
                 _validate_repost_assessment_table(session)
                 _validate_repost_v6_columns(session)
+                _validate_repost_v7_columns(session)
+                _validate_repost_v8_columns(session)
                 session.flush()
             conn.commit()
         except Exception:

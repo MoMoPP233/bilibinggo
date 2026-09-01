@@ -27,6 +27,7 @@ from src.participation_store import get_participation
 from src.pipeline.classify_step import ClassifyOutcome, classify_for_cleanup
 from src.repost_history import (
     claim_delete_pending,
+    defer_repost,
     get_checkpoint,
     get_repost,
     list_evaluable_reposts,
@@ -35,6 +36,7 @@ from src.repost_history import (
     list_repost_assessments,
     mark_delete_result,
     remove_repost_assessment,
+    restore_repost,
     save_checkpoint,
     set_repost_identity,
     upsert_repost_assessment,
@@ -56,9 +58,19 @@ ELIGIBLE_LOTTERY_TYPES = frozenset({"互动抽奖", "预约抽奖"})
 ELIGIBLE_BUSINESS_TYPES = {"互动抽奖": 1, "预约抽奖": 10}
 ASSESSMENT_BUDGET_PER_ROUND = 40
 MAX_IDENTITY_CHECKS_PER_ROUND = 20
+MAX_ASSESSMENTS_PER_JOB = 120
+MANUAL_REVIEW_DEFER_SECONDS = 30 * 24 * 60 * 60
 CONSECUTIVE_FAILURE_LIMIT = 3
 MAX_DELETE_BATCH = 20
 TRUSTED_IDENTITY_SOURCES = frozenset({"space_feed", "legacy_space_feed"})
+RETRYABLE_ASSESSMENT_REASON_CODES = frozenset({"remote_unknown"})
+PERMANENT_IDENTITY_ERROR_MARKERS = (
+    "不属于当前账号",
+    "不是明确的转发动态",
+    "对应关系不一致",
+    "缺少原动态关系",
+    "转发动态 ID 无效",
+)
 
 
 class ProgressCallback(Protocol):
@@ -90,6 +102,7 @@ class CandidateAssessment:
     lottery_type: str = ""
     lottery_time: int | None = None
     eligible_after: int | None = None
+    lottery_time_reliable: bool = False
     classification_source: str = "activities"
     summary: str = ""
     remote_checked_at: int | None = None
@@ -499,14 +512,16 @@ def _assess_confirmed_lottery(
     if winners is None:
         return CandidateAssessment(
             "manual_review", "官方中奖结果不完整，无法确认当前账号是否中奖",
-            "notice_winners_incomplete", lottery_type,
+            "notice_winners_incomplete", lottery_type, lottery_time,
             classification_source=classification_source, summary=summary, remote_checked_at=remote_at,
+            lottery_time_reliable=True,
         )
     if uid in winners:
         return CandidateAssessment(
             "blocked", "当前账号在中奖名单中，请先领奖，禁止删除",
-            "current_account_won", lottery_type,
+            "current_account_won", lottery_type, lottery_time,
             classification_source=classification_source, summary=summary, remote_checked_at=remote_at,
+            lottery_time_reliable=True,
         )
     eligible_after = lottery_time + EXPIRY_BUFFER_SECONDS
     if now_ts < eligible_after:
@@ -514,11 +529,13 @@ def _assess_confirmed_lottery(
             "manual_review", "开奖后安全缓冲期未满 3 天",
             "buffer_not_elapsed", lottery_type, lottery_time, eligible_after,
             classification_source=classification_source, summary=summary, remote_checked_at=remote_at,
+            lottery_time_reliable=True,
         )
     return CandidateAssessment(
         "safe", "官方已开奖、中奖名单完整且当前账号未中奖，开奖后已超过 3 天",
         "safe_official_notice", lottery_type, lottery_time, eligible_after,
         classification_source=classification_source, summary=summary, remote_checked_at=remote_at,
+        lottery_time_reliable=True,
     )
 
 
@@ -728,6 +745,8 @@ def _persist_assessment(
         uid,
         original_id,
         assessment_level=assessment.level,
+        assessment_status=_assessment_status_for(assessment),
+        lottery_time_reliable=assessment.lottery_time_reliable,
         reason_code=assessment.reason_code or None,
         lottery_type=assessment.lottery_type or None,
         lottery_time=assessment.lottery_time,
@@ -740,9 +759,24 @@ def _persist_assessment(
     )
 
 
+def _assessment_status_for(assessment: CandidateAssessment) -> str:
+    """safe/manual_review/excluded 及永久 blocked 为 final；网络类未完成可重试。"""
+    if assessment.level == "blocked" and assessment.reason_code in RETRYABLE_ASSESSMENT_REASON_CODES:
+        return "retryable_unknown"
+    return "final"
+
+
 def _identity_trusted(record: object) -> bool:
     row = _record_dict(record)
     return row.get("identity_ok") is True
+
+
+def _identity_retryable(record: object) -> bool:
+    row = _record_dict(record)
+    if row.get("identity_ok") is True:
+        return row.get("identity_source") is None
+    error = str(row.get("identity_error") or "")
+    return not any(marker in error for marker in PERMANENT_IDENTITY_ERROR_MARKERS)
 
 
 def _normalize_force_originals(value: object) -> set[str]:
@@ -759,6 +793,28 @@ def _normalize_force_originals(value: object) -> set[str]:
     return result
 
 
+def _build_pending_queue(
+    *,
+    candidate_originals: set[str],
+    existing: Mapping[str, Any],
+    activities_map: Mapping[str, Any],
+) -> list[str]:
+    """按优先级排队待评估 original：activities 本地便宜项在前，公共分类/LLM 项在后。"""
+    pending = [
+        original_id
+        for original_id in candidate_originals
+        if original_id not in existing
+        or getattr(existing[original_id], "assessment_status", "final") == "retryable_unknown"
+    ]
+    return sorted(
+        pending,
+        key=lambda original_id: (
+            0 if original_id in activities_map else 1,
+            original_id,
+        ),
+    )
+
+
 def scan_expired_reposts(
     *,
     on_progress: ProgressCallback | None = None,
@@ -767,7 +823,7 @@ def scan_expired_reposts(
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
     force_original_ids: object = None,
 ) -> dict[str, Any]:
-    """用户点击“评估历史抽奖”后的串行远程评估任务（预算化 + 风控熔断）。"""
+    """一键智能评估：串行多批执行，单批 ≤40、单 Job ≤120；风控/取消立即整 Job 停止。"""
     current = int(now_ts if now_ts is not None else time.time())
     _check_cancel(cancel_check)
     forced = _normalize_force_originals(force_original_ids)
@@ -787,7 +843,10 @@ def scan_expired_reposts(
                 remove_repost_assessment(uid, original_id)
                 existing.pop(original_id, None)
 
-        identity_needed = [record for record in reposts if not _identity_trusted(record)]
+        identity_needed = [
+            record for record in reposts
+            if not _identity_trusted(record) and _identity_retryable(record)
+        ]
         identity_done = 0
         for record in identity_needed:
             if identity_done >= MAX_IDENTITY_CHECKS_PER_ROUND or breaker.stopped:
@@ -816,61 +875,83 @@ def scan_expired_reposts(
                     break
 
         candidate_originals = {record.original_dynamic_id for record in reposts}
-        pending = sorted(
-            original_id for original_id in candidate_originals if original_id not in existing
+        pending = _build_pending_queue(
+            candidate_originals=candidate_originals,
+            existing=existing,
+            activities_map=activities_map,
         )
         evaluated = 0
-        budget = min(len(pending), ASSESSMENT_BUDGET_PER_ROUND)
-        _progress(on_progress, 0, max(1, budget), f"待评估原动态 {len(pending)} 条，本轮预算 {ASSESSMENT_BUDGET_PER_ROUND} 条…")
-        for original_id in pending:
-            if evaluated >= ASSESSMENT_BUDGET_PER_ROUND or breaker.stopped:
-                break
+        total_pending = len(pending)
+        _progress(
+            on_progress,
+            0,
+            min(MAX_ASSESSMENTS_PER_JOB, max(1, total_pending)),
+            f"待评估原动态 {total_pending} 条，本任务预算 {MAX_ASSESSMENTS_PER_JOB} 条…",
+        )
+        while pending and evaluated < MAX_ASSESSMENTS_PER_JOB and not breaker.stopped:
             _check_cancel(cancel_check)
-            try:
-                assessment = _assess_original(
-                    client,
-                    original_id=original_id,
-                    uid=uid,
-                    now_ts=current,
-                    activities_map=activities_map,
+            batch = pending[:ASSESSMENT_BUDGET_PER_ROUND]
+            pending = pending[ASSESSMENT_BUDGET_PER_ROUND:]
+            batch_size = len(batch)
+            for index, original_id in enumerate(batch, 1):
+                if evaluated >= MAX_ASSESSMENTS_PER_JOB or breaker.stopped:
+                    break
+                _check_cancel(cancel_check)
+                try:
+                    assessment = _assess_original(
+                        client,
+                        original_id=original_id,
+                        uid=uid,
+                        now_ts=current,
+                        activities_map=activities_map,
+                    )
+                except AssessmentRateLimited as exc:
+                    breaker.rate_limited = True
+                    breaker.stopped = True
+                    breaker.stop_message = str(exc)
+                    break
+                except RemoteStateUnknown as exc:
+                    assessment = CandidateAssessment(
+                        "blocked", f"原动态状态无法可靠判断：{exc}",
+                        "remote_unknown", classification_source="public_classifier",
+                    )
+                _persist_assessment(uid, original_id, assessment)
+                evaluated += 1
+                breaker.note_success()
+                phase = "本地评估" if original_id in activities_map else "远程分类"
+                _progress(
+                    on_progress,
+                    evaluated,
+                    min(MAX_ASSESSMENTS_PER_JOB, max(1, total_pending)),
+                    f"智能评估：本次完成 {evaluated}/{MAX_ASSESSMENTS_PER_JOB}（{phase}）",
+                    f"{original_id}：{assessment.level}",
                 )
-            except AssessmentRateLimited as exc:
-                breaker.rate_limited = True
-                breaker.stopped = True
-                breaker.stop_message = str(exc)
+            if breaker.stopped:
                 break
-            except RemoteStateUnknown as exc:
-                assessment = CandidateAssessment(
-                    "blocked", f"原动态状态无法可靠判断：{exc}",
-                    "remote_unknown", classification_source="public_classifier",
-                )
-            _persist_assessment(uid, original_id, assessment)
-            evaluated += 1
-            breaker.note_success()
-            _progress(
-                on_progress,
-                evaluated,
-                max(1, budget),
-                f"正在评估历史抽奖 ({evaluated}/{budget})…",
-            )
 
     refreshed = list_repost_assessments(uid)
     remaining = len(
-        {record.original_dynamic_id for record in reposts}
-        - set(refreshed)
+        {
+            record.original_dynamic_id
+            for record in reposts
+            if record.original_dynamic_id not in refreshed
+            or getattr(refreshed[record.original_dynamic_id], "assessment_status", "final")
+            == "retryable_unknown"
+        }
     )
     if breaker.stop_message:
         message = breaker.stop_message
     elif remaining:
-        message = f"本轮完成 {evaluated} 条，仍有 {remaining} 条待评估，可稍后继续。"
+        message = f"本次完成 {evaluated} 条，仍有 {remaining} 条待评估，可继续点击一键智能评估。"
     else:
-        message = f"历史抽奖评估完成，共评估 {evaluated} 条原动态。"
+        message = f"智能评估完成，本次共评估 {evaluated} 条原动态。"
     return {
         "uid": uid,
         "history_total": len(reposts),
         "evaluated_originals": evaluated,
         "pending_originals": remaining,
         "budget": ASSESSMENT_BUDGET_PER_ROUND,
+        "job_budget": MAX_ASSESSMENTS_PER_JOB,
         "rate_limited": breaker.rate_limited,
         "stopped_early": breaker.stopped,
         "message": message,
@@ -901,6 +982,33 @@ def _effective_candidate_state(
     )
 
 
+def _defer_state(repost: object, assessment: Any) -> dict[str, Any] | None:
+    """计算 per-repost 暂缓状态：用户暂缓优先，其次系统 30 天暂缓（本地动态计算）。"""
+    if getattr(repost, "cleanup_defer_reason", None) == "user":
+        return {
+            "defer_reason": "user",
+            "reason_code": "user_deferred",
+            "reason": "用户暂不删除",
+            "deferred_at": getattr(repost, "cleanup_deferred_at", None),
+            "deferred_until": getattr(repost, "cleanup_deferred_until", None),
+        }
+    if (
+        getattr(assessment, "assessment_level", "") == "manual_review"
+        and getattr(assessment, "lottery_time_reliable", False) is True
+        and _strict_positive_int(getattr(assessment, "lottery_time", None)) is not None
+    ):
+        lottery_time = int(getattr(assessment, "lottery_time"))
+        deferred_until = lottery_time + MANUAL_REVIEW_DEFER_SECONDS
+        if int(time.time()) < deferred_until:
+            return {
+                "defer_reason": "recent_reliable_lottery",
+                "reason_code": "recent_reliable_lottery",
+                "reason": "官方可靠开奖时间距今未满 30 天，暂缓人工清理。",
+                "deferred_until": deferred_until,
+            }
+    return None
+
+
 def load_persisted_candidates(uid: str) -> list[dict[str, Any]]:
     """从本地评估结果重建三级候选；不访问任何远程接口，也不重新扫描。"""
     scoped_uid = str(uid).strip()
@@ -919,6 +1027,11 @@ def load_persisted_candidates(uid: str) -> list[dict[str, Any]]:
         level, reason, reason_code = _effective_candidate_state(repost, assessment)
         if level == "excluded":
             continue
+        defer = _defer_state(repost, assessment)
+        if defer is not None:
+            level = "deferred"
+            reason = defer["reason"]
+            reason_code = defer["reason_code"]
         candidates.append(
             {
                 "uid": scoped_uid,
@@ -937,6 +1050,9 @@ def load_persisted_candidates(uid: str) -> list[dict[str, Any]]:
                 "classification_source": assessment.classification_source,
                 "evaluated_at": assessment.evaluated_at,
                 "delete_status": repost.delete_status,
+                "defer_reason": defer.get("defer_reason") if defer else None,
+                "deferred_at": defer.get("deferred_at") if defer else None,
+                "deferred_until": defer.get("deferred_until") if defer else None,
             }
         )
     return candidates
@@ -948,26 +1064,45 @@ def repost_cleanup_summary(uid: str) -> dict[str, Any]:
     reposts = list_evaluable_reposts(scoped_uid)
     assessments = list_repost_assessments(scoped_uid)
     candidates = load_persisted_candidates(scoped_uid)
-    counts = {"safe": 0, "manual_review": 0, "blocked": 0}
+    counts = {"safe": 0, "manual_review": 0, "blocked": 0, "deferred": 0}
     for candidate in candidates:
         level = candidate.get("level")
         if level in counts:
             counts[level] += 1
+    pending_originals = {
+        record.original_dynamic_id
+        for record in reposts
+        if record.original_dynamic_id not in assessments
+        or getattr(
+            assessments[record.original_dynamic_id], "assessment_status", "final"
+        )
+        == "retryable_unknown"
+    }
     return {
         "uid": scoped_uid,
         "history_total": len(reposts),
+        "assessed_total": len(assessments),
         "safe": counts["safe"],
         "manual_review": counts["manual_review"],
+        "deferred": counts["deferred"],
         "blocked": counts["blocked"],
         "excluded": sum(
             1 for assessment in assessments.values()
             if assessment.assessment_level == "excluded"
         ),
-        "pending_evaluation": len(
-            {record.original_dynamic_id for record in reposts} - set(assessments)
-        ),
+        "pending_evaluation": len(pending_originals),
         "candidates": candidates,
     }
+
+
+def defer_candidate(uid: str, repost_id: str) -> None:
+    """用户“暂不删除”：只写 per-repost 暂缓标记，0 远程请求。"""
+    defer_repost(uid, repost_id, reason="user")
+
+
+def restore_candidate(uid: str, repost_id: str) -> None:
+    """恢复用户暂缓：清除 per-repost 标记，0 远程请求。"""
+    restore_repost(uid, repost_id)
 
 
 def _assert_frozen_runtime(*, profile_id: str, database_path: str, uid: str) -> str:
@@ -1088,6 +1223,8 @@ def delete_reposts(
                 stored = assessments.get(original_id)
                 if stored is None:
                     raise ValueError("该原动态尚未完成历史抽奖评估")
+                if _defer_state(record, stored) is not None:
+                    raise ValueError("该候选已暂缓，请先恢复后再删除")
                 level, reason, _ = _effective_candidate_state(record, stored)
                 if level == "blocked":
                     raise ValueError(reason)
@@ -1222,11 +1359,15 @@ __all__ = [
     "CandidateAssessment",
     "DELETE_REPOST_URL",
     "EXPIRY_BUFFER_SECONDS",
+    "MANUAL_REVIEW_DEFER_SECONDS",
+    "MAX_ASSESSMENTS_PER_JOB",
     "MAX_DELETE_BATCH",
     "RemoteStateUnknown",
+    "defer_candidate",
     "delete_reposts",
     "load_persisted_candidates",
     "repost_cleanup_summary",
+    "restore_candidate",
     "scan_expired_reposts",
     "sync_repost_history",
 ]
