@@ -339,6 +339,27 @@ def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
         raise ValueError("任务已取消")
 
 
+def _cleanup_progress_adapter(
+    progress: ProgressCallback,
+    cancel_event: threading.Event | None,
+) -> Callable[..., None]:
+    """Bridge cleanup services onto the existing JobRunner progress protocol."""
+
+    def report(done: int, total: int, message: str, log_line: str | None = None) -> None:
+        _raise_if_cancelled(cancel_event)
+        step = max(0, int(done or 0))
+        normalized_total = max(step, int(total or 0), 1)
+        cleaned_message = str(message or "正在处理…").strip()
+        progress(
+            step=step,
+            total=normalized_total,
+            message=cleaned_message,
+            log_append=str(log_line or cleaned_message).strip(),
+        )
+
+    return report
+
+
 def _make_ds_source_progress(
     progress: ProgressCallback,
     *,
@@ -825,6 +846,70 @@ def run_action(
             "result": result,
             "log": sanitize_log(message),
         }
+
+    if action == "sync_repost_history":
+        from src.repost_cleanup import sync_repost_history
+
+        if params:
+            raise ValueError("同步个人转发历史不接受额外参数")
+        progress(step=0, total=1, message="正在核对当前账号并读取个人动态…")
+        result = sync_repost_history(
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        imported = int(result.get("imported_count") or result.get("imported") or 0)
+        discovered = int(result.get("found_reposts") or result.get("discovered") or 0)
+        message = f"转发历史同步完成：发现 {discovered} 条，本次新增 {imported} 条"
+        progress(step=1, total=1, message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+
+    if action == "scan_expired_reposts":
+        from src.repost_cleanup import scan_expired_reposts
+
+        if params:
+            raise ValueError("扫描过期抽奖不接受额外参数")
+        progress(step=0, total=1, message="正在筛选可安全删除的官方抽奖转发…")
+        result = scan_expired_reposts(
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+        message = f"过期抽奖扫描完成：找到 {len(candidates)} 条可删除候选"
+        progress(step=1, total=1, message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+
+    if action == "delete_expired_reposts":
+        from src.repost_cleanup import delete_reposts
+
+        raw_ids = params.get("repost_dynamic_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError("没有选择要删除的转发动态")
+        repost_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for raw_id in raw_ids:
+            repost_id = str(raw_id or "").strip()
+            if not is_valid_dynamic_id(repost_id):
+                raise ValueError("转发动态 ID 无效")
+            if repost_id not in seen_ids:
+                seen_ids.add(repost_id)
+                repost_ids.append(repost_id)
+        if len(repost_ids) > 100:
+            raise ValueError("单次最多删除 100 条转发动态")
+        progress(step=0, total=len(repost_ids), message=f"准备逐条验证并删除 {len(repost_ids)} 条转发动态…")
+        result = delete_reposts(
+            repost_ids,
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        deleted = int(result.get("deleted_count") or result.get("deleted") or 0)
+        failed = int(result.get("failed_count") or result.get("delete_failed") or 0)
+        unknown = int(result.get("unknown_count") or result.get("unknown") or 0)
+        message = f"删除处理完成：成功 {deleted} 条，失败 {failed} 条，结果未知 {unknown} 条"
+        progress(step=len(repost_ids), total=len(repost_ids), message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 
     if action == "participate":
         dynamic_id = str(params.get("dynamic_id") or "").strip()

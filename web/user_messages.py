@@ -22,6 +22,9 @@ JOB_ACTION_LABELS: dict[str, str] = {
     "participate": "参与活动",
     "participate_triple": "三连参与",
     "refresh_watch": "更新监控用户动态",
+    "sync_repost_history": "同步我的转发历史",
+    "scan_expired_reposts": "扫描过期抽奖转发",
+    "delete_expired_reposts": "删除选中的过期抽奖转发",
 }
 
 _PATH_PATTERN = re.compile(r"[A-Za-z]:\\[^\s\"']+")

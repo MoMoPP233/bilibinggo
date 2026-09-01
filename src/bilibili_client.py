@@ -241,6 +241,7 @@ class BilibiliClient:
         url: str,
         data: dict,
         *,
+        params: dict | None = None,
         referer: str | None = None,
         retries: int = 3,
         raise_on_code: bool = True,
@@ -249,7 +250,7 @@ class BilibiliClient:
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                resp = self._http_post(url, data=data, headers=headers)
+                resp = self._http_post(url, data=data, params=params, headers=headers)
                 resp.raise_for_status()
                 payload = resp.json()
                 code = payload.get("code")

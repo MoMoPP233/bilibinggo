@@ -87,6 +87,76 @@ class ParticipationGuardRow(SQLModel, table=True):
     updated_at: int = 0
 
 
+class RepostHistoryRow(SQLModel, table=True):
+    __tablename__ = "repost_history"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('binggo','history_import')",
+            name="ck_repost_history_source",
+        ),
+        CheckConstraint(
+            "delete_status IN ('active','delete_pending','deleted','delete_failed','unknown')",
+            name="ck_repost_history_delete_status",
+        ),
+        CheckConstraint(
+            "repost_dynamic_id <> original_dynamic_id",
+            name="ck_repost_history_distinct_dynamic_ids",
+        ),
+        Index("ix_repost_history_uid_original", "uid", "original_dynamic_id"),
+        Index("ix_repost_history_uid_delete_status", "uid", "delete_status"),
+        Index("ix_repost_history_uid_reposted_at", "uid", "reposted_at"),
+    )
+
+    uid: str = Field(primary_key=True, max_length=64)
+    repost_dynamic_id: str = Field(primary_key=True, max_length=32)
+    original_dynamic_id: str = Field(max_length=32)
+    reposted_at: int
+    original_author_uid: Optional[str] = Field(default=None, max_length=64)
+    original_author_name: Optional[str] = Field(
+        default=None,
+        sa_column=Column(Text),
+    )
+    source: str = Field(default="history_import", max_length=16)
+    delete_status: str = Field(default="active", max_length=16)
+    delete_requested_at: Optional[int] = None
+    deleted_at: Optional[int] = None
+    last_seen_at: Optional[int] = None
+    last_error: Optional[str] = Field(default=None, sa_column=Column(Text))
+    updated_at: int = 0
+
+
+class RepostSyncCheckpointRow(SQLModel, table=True):
+    __tablename__ = "repost_sync_checkpoint"
+    __table_args__ = (
+        CheckConstraint(
+            "full_scan_completed IN (0,1)",
+            name="ck_repost_sync_checkpoint_completed",
+        ),
+    )
+
+    uid: str = Field(primary_key=True, max_length=64)
+    head_dynamic_id: Optional[str] = Field(default=None, max_length=32)
+    head_published_at: Optional[int] = None
+    full_scan_completed: bool = False
+    last_synced_at: Optional[int] = None
+    updated_at: int = 0
+
+
+class RepostAssessmentRow(SQLModel, table=True):
+    """每个官方抽奖原动态最近一次可安全清理评估结果（仅存 eligible）。"""
+
+    __tablename__ = "repost_assessment"
+
+    uid: str = Field(primary_key=True, max_length=64)
+    original_dynamic_id: str = Field(primary_key=True, max_length=32)
+    lottery_type: Optional[str] = Field(default=None, max_length=16)
+    lottery_time: Optional[int] = None
+    eligible_after: Optional[int] = None
+    reason: Optional[str] = Field(default=None, sa_column=Column(Text))
+    assessed_at: int
+    updated_at: int = 0
+
+
 class SourceCheckpointRow(SQLModel, table=True):
     __tablename__ = "source_checkpoints"
 

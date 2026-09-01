@@ -13,6 +13,8 @@ ALLOWED_JOB_ACTIONS = frozenset(
         "refresh_status",
         "participate",
         "participate_triple",
+        "scan_expired_reposts",
+        "sync_repost_history",
     }
 )
 

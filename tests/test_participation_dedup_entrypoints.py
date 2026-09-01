@@ -202,7 +202,7 @@ def test_cli_uses_guarded_service_before_client_creation(monkeypatch, capsys, re
     assert reason in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("version, exit_code", [(2, 0), (4, 1)])
+@pytest.mark.parametrize("version, exit_code", [(2, 0), (6, 1)])
 def test_standalone_cli_checks_runtime_profile_schema_before_client(tmp_path, version, exit_code) -> None:
     # A fresh interpreter must bootstrap without the Dashboard, using the real
     # runtime Profile path rather than isolated_home's compatibility DB shim.
@@ -271,11 +271,11 @@ finally:
     if version == 2:
         assert json.loads(completed.stdout)["skip_reason"] == "already_joined"
     else:
-        assert "schema_version=4" in json.loads(stderr_lines[0])["error"]
+        assert "schema_version=6" in json.loads(stderr_lines[0])["error"]
         assert completed.stdout == ""
     assert cookie.read_bytes() == cookie_before
     with closing(sqlite3.connect(database)) as conn:
-        assert conn.execute("SELECT version FROM schema_meta WHERE id=1").fetchone() == (3 if version == 2 else 4,)
+        assert conn.execute("SELECT version FROM schema_meta WHERE id=1").fetchone() == (5 if version == 2 else 6,)
         assert conn.execute("SELECT uid,dynamic_id,user_status,updated_at,source FROM participations").fetchone() == (
             "123", FIRST_ID, "已参加", 123, "participate",
         )

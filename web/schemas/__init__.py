@@ -9,6 +9,7 @@ from web.schemas.jobs import (
     JobStartOut,
     JobStatusOut,
 )
+from web.schemas.repost_cleanup import RepostCleanupDeleteRequest
 from web.schemas.settings import LlmSettingsRequest, ParticipateTextRequest
 from web.schemas.updates import UpdatesCheckOut
 from web.schemas.watch import WatchUserRequest
@@ -26,6 +27,7 @@ __all__ = [
     "LlmSettingsRequest",
     "OkResponse",
     "ParticipateTextRequest",
+    "RepostCleanupDeleteRequest",
     "UpdatesCheckOut",
     "WatchUserRequest",
 ]

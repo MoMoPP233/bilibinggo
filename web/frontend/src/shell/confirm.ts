@@ -6,6 +6,18 @@ import { appConfirmBackdrop, appConfirmBullets, appConfirmCancel, appConfirmDesc
 import { switchSection } from "../shell/nav";
 import { escapeHtml } from "../utils/text";
 
+export interface AppConfirmOptions {
+  eyebrow?: string;
+  title?: string;
+  desc?: string;
+  bullets?: string[];
+  confirmLabel?: string;
+  cancelLabel?: string;
+  secondaryLabel?: string;
+  danger?: boolean;
+  onSecondary?: (() => void) | null;
+}
+
 export function closeAppConfirm() {
   if (!appConfirmModal) return;
   appConfirmModal.hidden = true;
@@ -22,7 +34,7 @@ export function openAppConfirm({
   secondaryLabel = "",
   danger = false,
   onSecondary = null,
-} = {}) {
+}: AppConfirmOptions = {}): Promise<boolean> {
   return new Promise((resolve) => {
     if (!appConfirmModal || !appConfirmCancel || !appConfirmYes) {
       resolve(window.confirm(title || "确认继续？"));

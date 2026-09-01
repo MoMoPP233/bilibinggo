@@ -42,6 +42,7 @@ export function activateSection(sectionId) {
   if (sectionId === "sources") {
     loadWatchUsers().catch(() => {});
   }
+  window.dispatchEvent(new CustomEvent("binggo:section-activated", { detail: { sectionId } }));
 }
 
 export function switchSection(sectionId) {

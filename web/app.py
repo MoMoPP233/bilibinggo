@@ -66,6 +66,7 @@ from web.schemas import (
     LlmSettingsRequest,
     OkResponse,
     ParticipateTextRequest,
+    RepostCleanupDeleteRequest,
     UpdatesCheckOut,
     WatchUserRequest,
 )
@@ -123,6 +124,8 @@ _JOB_REQUIRES_LOGIN = frozenset(
         "refresh_source",
         "refresh_status",
         "refresh_watch",
+        "scan_expired_reposts",
+        "sync_repost_history",
     }
 )
 _JOB_REQUIRES_LLM = frozenset(
@@ -411,6 +414,103 @@ def api_triple_participate_targets(
     )
 
 
+def _require_runtime_bilibili_uid() -> str:
+    from src.bilibili_auth import require_login as require_bilibili_login
+
+    try:
+        _csrf, uid = require_bilibili_login()
+    except RuntimeError as exc:
+        raise AppError(ErrorCode.AUTH_REQUIRED, "请先扫码登录后再管理转发历史") from exc
+    return str(uid)
+
+
+@app.get("/api/repost-cleanup/history", tags=["stable"])
+def api_repost_cleanup_history(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    status: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Read only the current runtime Profile's local repost index."""
+
+    from dataclasses import asdict
+
+    from src.repost_history import get_checkpoint, list_repost_history
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再查看转发历史")
+    uid = _require_runtime_bilibili_uid()
+    normalized_status = str(status or "").strip() or None
+    try:
+        rows, total = list_repost_history(
+            uid,
+            page=page,
+            page_size=page_size,
+            status=normalized_status,
+        )
+        checkpoint = get_checkpoint(uid)
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {
+        "ok": True,
+        "uid": uid,
+        "items": [asdict(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "checkpoint": asdict(checkpoint) if checkpoint is not None else None,
+    }
+
+
+@app.get("/api/repost-cleanup/candidates", tags=["stable"])
+def api_repost_cleanup_candidates() -> dict[str, Any]:
+    """从本地评估结果恢复候选；不触发远程接口或历史重新同步。"""
+
+    from src.repost_cleanup import load_persisted_candidates
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再查看删除候选")
+    uid = _require_runtime_bilibili_uid()
+    try:
+        candidates = load_persisted_candidates(uid)
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "uid": uid, "candidates": candidates}
+
+
+@app.post(
+    "/api/repost-cleanup/delete",
+    response_model=JobStartOut,
+    tags=["stable"],
+)
+def api_delete_expired_reposts(request: RepostCleanupDeleteRequest) -> dict[str, Any]:
+    """Start a manually confirmed delete job; never accepts original IDs."""
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再删除转发动态")
+    _require_runtime_bilibili_uid()
+    if request.confirmed is not True:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "请先确认删除选中的转发动态")
+
+    repost_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for raw_id in request.repost_dynamic_ids:
+        repost_id = str(raw_id or "").strip()
+        if not is_valid_dynamic_id(repost_id):
+            raise AppError(ErrorCode.VALIDATION_ERROR, "转发动态 ID 无效")
+        if repost_id not in seen_ids:
+            seen_ids.add(repost_id)
+            repost_ids.append(repost_id)
+    if not repost_ids:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "没有选择要删除的转发动态")
+
+    params = {"repost_dynamic_ids": repost_ids}
+    if runner.try_start("delete_expired_reposts", params, source="ui") is None:
+        if restart_control.is_restart_pending():
+            _raise_restart_pending()
+        raise AppError(ErrorCode.JOB_BUSY, "已有任务正在运行")
+    return {"ok": True, "job": runner.get_status().to_dict()}
+
+
 @app.post("/api/jobs", response_model=JobStartOut, tags=["stable"])
 def api_start_job(request: JobRequest) -> dict[str, Any]:
     if request.action not in ALLOWED_JOB_ACTIONS:
@@ -421,6 +521,8 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
     if request.action in _JOB_REQUIRES_LLM:
         require_llm_ready()
     params = request.params or {}
+    if request.action in {"sync_repost_history", "scan_expired_reposts"} and params:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
     if request.action == "refresh_source":
         from web.actions import DS_HANDLER_BY_ID
 

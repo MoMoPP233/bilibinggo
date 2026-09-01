@@ -18,6 +18,9 @@ from src.db.session import session_scope
 def _v2_database() -> None:
     with get_engine().begin() as conn:
         conn.exec_driver_sql("DROP TABLE participation_guard")
+        conn.exec_driver_sql("DROP TABLE repost_history")
+        conn.exec_driver_sql("DROP TABLE repost_sync_checkpoint")
+        conn.exec_driver_sql("DROP TABLE repost_assessment")
         conn.exec_driver_sql("UPDATE schema_meta SET version=2 WHERE id=1")
         conn.exec_driver_sql("INSERT INTO participations(uid,dynamic_id,user_status,updated_at,source) VALUES ('u','d','已参加',123,'participate')")
         conn.exec_driver_sql("INSERT INTO activities(dynamic_id,payload_json,updated_at,status_classified,skipped) VALUES ('d','{}',234,0,0)")
@@ -32,15 +35,17 @@ def _snapshot() -> dict:
         }
 
 
-def test_v2_to_v3_preserves_existing_business_data(isolated_home) -> None:
+def test_v2_to_v5_preserves_existing_business_data(isolated_home) -> None:
     _v2_database()
     before = _snapshot()
     schema.init_db()
     schema.init_db()
     assert _snapshot() == before
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 3
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 5
         assert conn.exec_driver_sql("SELECT count(*) FROM participation_guard").scalar_one() == 0
+        assert conn.exec_driver_sql("SELECT count(*) FROM repost_history").scalar_one() == 0
+        assert conn.exec_driver_sql("SELECT count(*) FROM repost_assessment").scalar_one() == 0
 
 
 def test_existing_guard_with_v2_meta_keeps_all_rows(isolated_home) -> None:
@@ -54,7 +59,7 @@ def test_existing_guard_with_v2_meta_keeps_all_rows(isolated_home) -> None:
         assert row.repost_status == "pending" and row.updated_at == 123
 
 
-def test_v1_jobs_migration_continues_through_v3(isolated_home) -> None:
+def test_v1_jobs_migration_continues_through_v5(isolated_home) -> None:
     _v2_database()
     with get_engine().begin() as conn:
         conn.exec_driver_sql("DROP TABLE jobs")
@@ -66,7 +71,7 @@ def test_v1_jobs_migration_continues_through_v3(isolated_home) -> None:
         assert conn.exec_driver_sql("SELECT action,state,created_at FROM jobs WHERE id=1").one() == ("refresh_all", "success", 123)
         columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(jobs)")}
         assert {name for name, _ in schema._JOB_V2_COLUMNS} <= columns
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 3
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 5
 
 
 def test_migration_failure_rolls_back_table_and_version(isolated_home, monkeypatch) -> None:
@@ -90,25 +95,25 @@ def test_migration_failure_rolls_back_table_and_version(isolated_home, monkeypat
     schema.init_db()
     assert _snapshot() == before
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 3
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 5
         assert conn.exec_driver_sql("SELECT count(*) FROM participation_guard").scalar_one() == 0
 
 
 def test_future_version_rejected_before_any_create_all(isolated_home, monkeypatch) -> None:
     _v2_database()
     with get_engine().begin() as conn:
-        conn.exec_driver_sql("UPDATE schema_meta SET version=4")
+        conn.exec_driver_sql("UPDATE schema_meta SET version=6")
     before = _snapshot()
 
     def forbidden(*args, **kwargs):
         pytest.fail("future schema must be rejected before create_all")
 
     monkeypatch.setattr(schema.SQLModel.metadata, "create_all", forbidden)
-    with pytest.raises(RuntimeError, match="schema_version=4"):
+    with pytest.raises(RuntimeError, match="schema_version=6"):
         schema.init_db()
     assert _snapshot() == before
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 4
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 6
 
 
 def test_malformed_guard_is_not_rebuilt_or_upgraded(isolated_home) -> None:
@@ -182,7 +187,7 @@ def test_concurrent_initialization_is_serialized(isolated_home) -> None:
         list(executor.map(lambda _: schema.init_db(), range(2)))
     assert _snapshot() == before
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 3
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 5
 
 
 @pytest.fixture
@@ -245,4 +250,4 @@ def test_real_profile_migrations_and_same_account_guard_are_isolated(isolated_pr
     schema.init_db()
     assert participation_guard.get_guard("same-uid", "same-dynamic").repost_status == "pending"
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 3
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 5

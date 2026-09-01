@@ -55,6 +55,17 @@ export function classifyFailureText(message, action, log = "") {
       retryable: false,
     };
   }
+  if (actionName === "delete_expired_reposts") {
+    return {
+      kind: "repost_delete",
+      severity: "error",
+      title: "删除任务未完全确认",
+      message: displayMessage,
+      hint: "为避免重复删除，不提供任务重试。请先重新同步本人转发历史并核实状态。",
+      actions: [],
+      retryable: false,
+    };
+  }
   if (actionName === "login" || /二维码|扫码登录|sessdata|确认超时|登录未完成/.test(lowered)) {
     return {
       kind: "login",
@@ -1053,6 +1064,13 @@ export function setButtonsDisabled(disabled) {
   document.querySelectorAll("[data-action]").forEach((button) => {
     button.disabled = disabled;
   });
+  // 独立任务控件通常还受页面自身状态约束（例如必须先勾选候选）。
+  // 任务开始时统一禁用；任务结束后由所属页面按自身状态恢复，避免误启用。
+  if (disabled) {
+    document.querySelectorAll("[data-job-control]").forEach((button) => {
+      button.disabled = true;
+    });
+  }
 }
 
 export function setProgressAria(percent, labelText) {
@@ -1117,6 +1135,9 @@ export function updateProgressUI(job) {
       refresh_all: "同步任务",
       refresh_source: "数据源更新",
       refresh_watch: "监控扫描",
+      sync_repost_history: "转发同步",
+      scan_expired_reposts: "安全扫描",
+      delete_expired_reposts: "转发删除",
       login: "登录任务",
     };
     progressChip.textContent = chipMap[job.action] || "任务进行中";
@@ -1183,11 +1204,16 @@ export async function startJob(action, params = {}) {
     state.lastQrcodeRefresh = 0;
     openQrcodeModalFresh();
   }
+  await trackCurrentJob();
+}
+
+export async function trackCurrentJob() {
   const current = await fetchJSON("/api/jobs/current");
   state.currentJob = current;
   updateJobUI(current);
   startRealtime();
   startPolling();
+  return current;
 }
 
 export function collectFinishedDynamicIds(job) {
@@ -1244,6 +1270,8 @@ export async function handleJobCompletion(job) {
       }
     }
   }
+
+  window.dispatchEvent(new CustomEvent("binggo:job-completed", { detail: job }));
 
   const finishedDynamicIds = collectFinishedDynamicIds(job);
   try {

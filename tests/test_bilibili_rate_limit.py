@@ -97,6 +97,39 @@ def test_bilibili_client_http_methods_acquire_slots(monkeypatch) -> None:
     assert calls["n"] == 3
 
 
+def test_post_form_forwards_query_params_without_changing_retry_defaults(monkeypatch) -> None:
+    from src.bilibili_client import BilibiliClient
+
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"code": 0}
+
+    client = BilibiliClient(warmup=False)
+
+    def fake_post(url, *, data=None, json=None, params=None, headers=None):
+        captured.update(url=url, data=data, params=params, headers=headers)
+        return _Resp()
+
+    monkeypatch.setattr(client, "_http_post", fake_post)
+    payload = client.post_form(
+        "https://api.bilibili.com/x/dynamic/feed/operate/remove",
+        {"dyn_id_str": "1234567890123456789"},
+        params={"platform": "web", "csrf": "token"},
+        retries=0,
+        raise_on_code=False,
+    )
+    client.close()
+
+    assert payload == {"code": 0}
+    assert captured["data"] == {"dyn_id_str": "1234567890123456789"}
+    assert captured["params"] == {"platform": "web", "csrf": "token"}
+
+
 def test_default_bilibili_rps_is_three() -> None:
     from src.bilibili_rate_limit import DEFAULT_BILI_RPS, get_bilibili_rate_limiter
 

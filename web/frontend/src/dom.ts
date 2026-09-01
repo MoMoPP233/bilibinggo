@@ -89,6 +89,32 @@ export const filterDrawWindowHint = document.getElementById("filter-draw-window-
 
 export const pagination = document.getElementById("pagination");
 
+export const repostHistoryTotal = document.getElementById("repost-history-total");
+
+export const repostCandidateTotal = document.getElementById("repost-candidate-total");
+
+export const repostCheckpointStatus = document.getElementById("repost-checkpoint-status");
+
+export const repostCandidateSummary = document.getElementById("repost-candidate-summary");
+
+export const repostCandidatesBody = document.getElementById("repost-candidates-body");
+
+export const repostCandidatePagination = document.getElementById("repost-candidate-pagination");
+
+export const repostSelectedCount = document.getElementById("repost-selected-count");
+
+export const repostSelectPageBtn = document.getElementById("repost-select-page");
+
+export const repostClearSelectionBtn = document.getElementById("repost-clear-selection");
+
+export const repostDeleteSelectedBtn = document.getElementById("repost-delete-selected");
+
+export const repostHistorySummary = document.getElementById("repost-history-summary");
+
+export const repostHistoryBody = document.getElementById("repost-history-body");
+
+export const repostHistoryPagination = document.getElementById("repost-history-pagination");
+
 export const qrcodeModal = document.getElementById("qrcode-modal");
 
 export const qrcodeImg = document.getElementById("qrcode-img");
@@ -278,6 +304,9 @@ export const LOGIN_REQUIRED_ACTIONS = new Set([
   "refresh_status",
   "participate",
   "participate_triple",
+  "sync_repost_history",
+  "scan_expired_reposts",
+  "delete_expired_reposts",
 ]);
 
 export const LLM_REQUIRED_ACTIONS = new Set([
