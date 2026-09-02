@@ -20,6 +20,7 @@ import { bindCheckUpdates, loadRuntimeInfo } from "./runtime/index";
 import { bindWatchUsers, loadWatchUsers } from "./watch/index";
 import { bindProfiles, loadProfiles } from "./profiles/index";
 import { bindRepostCleanup } from "./repost-cleanup/index";
+import { bindUpdateAllDatasources } from "./sources/update-all";
 
 export async function init() {
   initSystemPreferences();
@@ -34,6 +35,7 @@ export async function init() {
   bindWatchUsers();
   bindProfiles();
   bindRepostCleanup();
+  bindUpdateAllDatasources();
   bindOnboardingPanel();
   bindActionButtons();
   bindDiagnosticsExport();

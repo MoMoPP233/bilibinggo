@@ -1134,6 +1134,7 @@ export function updateProgressUI(job) {
       participate_triple: "三连参与",
       refresh_all: "同步任务",
       refresh_source: "数据源更新",
+      update_all_datasources: "全部数据源更新",
       refresh_watch: "监控扫描",
       sync_repost_history: "转发同步",
       scan_expired_reposts: "智能评估",

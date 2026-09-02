@@ -340,11 +340,10 @@
 
             <article class="panel quick-actions">
               <h2 class="section-title">快捷操作</h2>
-              <p class="section-desc quick-actions-desc">从 UP 合集或监控用户动态增量更新活动链接，或直接进入活动列表参与抽奖。</p>
+              <p class="section-desc quick-actions-desc">在数据源页可「一键更新全部数据源」（严格串行）；此处可更新监控用户动态或刷新任务状态，或直接进入活动列表参与抽奖。</p>
               <div class="action-row quick-actions-row">
                 <button class="btn btn-primary btn-pill" data-action="refresh_watch">更新监控用户动态</button>
                 <button class="btn btn-secondary btn-pill" data-action="refresh_status">刷新任务状态</button>
-                <button class="btn btn-secondary btn-pill" data-action="refresh_all">一键更新活动链接</button>
                 <button class="btn btn-ghost btn-pill" data-section-jump="activities">查看活动列表</button>
               </div>
             </article>
@@ -570,9 +569,18 @@
                 <div>
                   <p class="eyebrow">合集数据源</p>
                   <h2 class="section-title">UP 合集</h2>
-                  <p class="section-desc">检查新专栏 → 分类 → 拉取详情 → 入库，仅处理新增链接。</p>
+                  <p class="section-desc">检查新专栏 → 分类 → 拉取详情 → 入库，仅处理新增链接。逐源严格串行，一个源完整导入后才更新下一个。</p>
                 </div>
-                <button type="button" class="btn btn-secondary btn-pill" data-action="refresh_all">一键更新</button>
+                <div class="action-row">
+                  <button type="button" class="btn btn-primary btn-pill" id="update-all-sources-btn">一键更新全部数据源（串行）</button>
+                </div>
+              </div>
+              <div class="update-all-panel" id="update-all-panel" hidden>
+                <div class="update-all-panel-head">
+                  <p class="update-all-title" id="update-all-summary">准备更新全部数据源…</p>
+                  <button type="button" class="btn btn-ghost btn-compact btn-pill" id="update-all-stop-btn" disabled>停止更新</button>
+                </div>
+                <div class="update-all-lanes" id="update-all-lanes" aria-live="polite"></div>
               </div>
               <div class="source-list" id="source-grid"></div>
             </div>

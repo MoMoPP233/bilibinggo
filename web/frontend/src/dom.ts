@@ -334,6 +334,7 @@ export const LOGIN_REQUIRED_ACTIONS = new Set([
   "refresh_source",
   "refresh_watch",
   "refresh_status",
+  "update_all_datasources",
   "participate",
   "participate_triple",
   "sync_repost_history",
@@ -345,6 +346,7 @@ export const LLM_REQUIRED_ACTIONS = new Set([
   "refresh_all",
   "refresh_source",
   "refresh_watch",
+  "update_all_datasources",
   "participate",
   "participate_triple",
 ]);

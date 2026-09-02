@@ -18,6 +18,7 @@ JOB_ACTION_LABELS: dict[str, str] = {
     "login": "扫码登录",
     "refresh_all": "一键更新活动链接",
     "refresh_source": "更新数据源",
+    "update_all_datasources": "一键更新全部数据源",
     "refresh_status": "刷新任务状态",
     "participate": "参与活动",
     "participate_triple": "三连参与",
