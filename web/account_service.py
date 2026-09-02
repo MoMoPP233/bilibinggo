@@ -11,6 +11,8 @@ from web.user_messages import friendly_network_error
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 NAV_STAT_URL = "https://api.bilibili.com/x/web-interface/nav/stat"
 ACCOUNT_CLIENT_TIMEOUT = 8.0
+# 平台风控 / 限流：Cookie 并未失效，只是暂时不可读，不能当成“已过期”显示。
+_NAV_RISK_CODES = frozenset({-352, -509, -799, 429})
 
 
 def _api_code(payload: dict[str, Any]) -> int:
@@ -198,6 +200,13 @@ def get_account_profile() -> dict[str, Any]:
             code = _api_code(nav_payload)
             data = nav_payload.get("data") or {}
             is_login = bool(data.get("isLogin"))
+            if not is_login and code in _NAV_RISK_CODES:
+                # 平台风控 / 限流会临时让 NAV 不可用，但不代表 Cookie 失效。
+                return _profile_from_network_error(
+                    RuntimeError(
+                        f"平台暂时限流（{code}），本地 Cookie 仍已保存，稍后可刷新账号"
+                    )
+                )
             if code == -101 or not is_login:
                 return _empty_profile("Cookie 已过期，请重新扫码登录")
 

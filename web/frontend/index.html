@@ -672,7 +672,7 @@
               <p class="repost-eval-status" id="repost-eval-status" aria-live="polite">尚未开始智能评估</p>
               <div class="repost-cleanup-metrics" aria-live="polite">
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">历史转发</span>
+                  <span class="repost-cleanup-metric-label">全部历史（含已删除）</span>
                   <strong class="repost-cleanup-metric-value" id="repost-history-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
@@ -695,15 +695,51 @@
                   <span class="repost-cleanup-metric-label">⏳ 待评估</span>
                   <strong class="repost-cleanup-metric-value" id="repost-pending-total">0</strong>
                 </div>
-                <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">已删除</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-deleted-total">0</strong>
-                </div>
                 <div class="repost-cleanup-metric repost-cleanup-metric-wide">
                   <span class="repost-cleanup-metric-label">同步 / 评估状态</span>
                   <strong class="repost-cleanup-metric-text" id="repost-workflow-status">尚未读取</strong>
                 </div>
               </div>
+            </article>
+
+            <article class="panel repost-health-panel">
+              <div class="panel-head-row repost-list-head">
+                <div>
+                  <p class="eyebrow">Maintenance Health</p>
+                  <h2 class="section-title">清理维护状态</h2>
+                  <p class="section-desc">纯本地健康检查，打开 / 刷新页面 0 远程请求；只展示问题，绝不自动恢复或重新删除任何记录。</p>
+                </div>
+                <span class="repost-health-pill" id="repost-health-pill" data-tone="idle">—</span>
+              </div>
+              <div class="repost-health-stats" aria-live="polite">
+                <div class="repost-health-stat">
+                  <span class="repost-health-stat-label">全部历史</span>
+                  <strong class="repost-health-stat-value" id="repost-health-all">—</strong>
+                </div>
+                <div class="repost-health-stat">
+                  <span class="repost-health-stat-label">现存转发（未删除）</span>
+                  <strong class="repost-health-stat-value" id="repost-health-existing">—</strong>
+                </div>
+                <div class="repost-health-stat">
+                  <span class="repost-health-stat-label">已删除</span>
+                  <strong class="repost-health-stat-value" id="repost-health-deleted">—</strong>
+                </div>
+                <div class="repost-health-stat">
+                  <span class="repost-health-stat-label">未完成删除</span>
+                  <strong class="repost-health-stat-value" id="repost-health-pending">—</strong>
+                </div>
+                <div class="repost-health-stat">
+                  <span class="repost-health-stat-label">删除失败</span>
+                  <strong class="repost-health-stat-value" id="repost-health-failed">—</strong>
+                </div>
+                <div class="repost-health-stat">
+                  <span class="repost-health-stat-label">删除结果未知</span>
+                  <strong class="repost-health-stat-value" id="repost-health-unknown">—</strong>
+                </div>
+              </div>
+              <p class="repost-health-legend">统计口径：全部历史＝现存转发＋未完成删除＋已删除；现存转发（未删除）＝仍存在＋删除失败＋删除结果未知，是上方候选分级与“待评估”的统计范围。</p>
+              <div class="repost-health-lines" id="repost-health-lines" aria-live="polite">正在读取维护状态…</div>
+              <div class="repost-health-issues" id="repost-health-issues" hidden></div>
             </article>
 
             <article class="panel repost-candidates-panel">

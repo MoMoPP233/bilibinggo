@@ -78,3 +78,36 @@ def test_get_account_profile_logged_in_shape(monkeypatch) -> None:
     assert profile["extras_loading"] is True
     assert profile["unread_at"] is None
     update_profile_metadata.assert_called_once_with(mid=123, nickname="tester")
+
+
+def test_get_account_profile_risk_code_is_transient_not_expired(monkeypatch) -> None:
+    """平台风控/限流下的 NAV 不应把账号当成“Cookie 已过期”显示。"""
+
+    class FakeRiskClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def request_json(self, url, params=None, *, referer=None, retries=0):
+            return {"code": -352, "data": {}, "message": "risk-control"}
+
+    monkeypatch.setattr("web.account_service.has_login_cookie", lambda: True)
+    monkeypatch.setattr("web.account_service.get_login_uid", lambda: 12345)
+    monkeypatch.setattr(
+        "web.account_service._load_account_cache",
+        lambda: {"uname": "cached_user", "mid": 12345},
+    )
+    with patch("web.account_service.BilibiliClient", FakeRiskClient):
+        profile = get_account_profile()
+
+    assert profile["logged_in"] is False
+    assert profile["network_error"] is True
+    assert profile["cookie_saved"] is True
+    assert profile["mid"] == 12345
+    assert profile["uname"] == "cached_user"
+    assert "-352" in profile["message"]

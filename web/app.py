@@ -481,6 +481,32 @@ def api_repost_cleanup_candidates(
     return {"ok": True, "uid": uid, **summary}
 
 
+@app.get("/api/repost-cleanup/health", tags=["stable"])
+def api_repost_cleanup_health() -> dict[str, Any]:
+    """当前 runtime Profile 的清理维护健康检查。
+
+    纯本地：0 Bilibili 请求 / 0 LLM / 0 DELETE。只读本地库与本地文件，
+    不自动恢复 pending、不自动重试 unknown/delete_failed、不自动重新删除。
+    """
+
+    from src.repost_cleanup import cleanup_health_check
+    from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, cleanup_maintain_enabled
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再查看维护状态")
+    uid = _require_runtime_bilibili_uid()
+    job = runner.get_status().to_dict()
+    delete_job_in_progress = bool(
+        job.get("state") == "running" and job.get("action") == "delete_expired_reposts"
+    )
+    payload = cleanup_health_check(
+        uid, delete_job_in_progress=delete_job_in_progress
+    )
+    payload["maintenance"]["enabled"] = cleanup_maintain_enabled()
+    payload["maintenance"]["interval_hours"] = CLEANUP_MAINTAIN_INTERVAL_HOURS
+    return {"ok": True, "uid": uid, **payload}
+
+
 def _defer_common(request: RepostDeferRequest, *, restore: bool) -> dict[str, Any]:
     from src.repost_cleanup import defer_candidate, repost_cleanup_summary, restore_candidate
 

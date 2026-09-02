@@ -24,6 +24,8 @@ DELETE_STATUSES = frozenset(
 )
 DELETE_RESULT_STATUSES = frozenset({"deleted", "delete_failed", "unknown"})
 DELETE_CLAIMABLE_STATUSES = frozenset({"active", "delete_failed"})
+# 需要人工确认的删除状态：pending 是“可能中断遗留”，failed/unknown 是“不自动重试”。
+DELETE_ISSUE_STATUSES = frozenset({"delete_pending", "delete_failed", "unknown"})
 
 
 @dataclass(frozen=True)
@@ -953,5 +955,54 @@ def list_deleted_reposts(uid: str) -> list[RepostHistoryRecord]:
                 RepostHistoryRow.deleted_at.desc(),
                 RepostHistoryRow.repost_dynamic_id.desc(),
             )
+        ).all()
+        return [_history_record(row) for row in rows]
+
+
+def count_repost_delete_statuses(uid: str) -> dict[str, int]:
+    """全量 delete_status 计数（含 total）。只读本地，供健康检查与统计口径。"""
+    scoped_uid = _uid(uid)
+    counts = {status: 0 for status in DELETE_STATUSES}
+    with session_scope() as session:
+        rows = session.exec(
+            select(RepostHistoryRow.delete_status, func.count())
+            .select_from(RepostHistoryRow)
+            .where(RepostHistoryRow.uid == scoped_uid)
+            .group_by(RepostHistoryRow.delete_status)
+        ).all()
+    for status, count in rows:
+        status = str(status)
+        if status not in counts:
+            raise RuntimeError(f"转发历史包含未知删除状态: {status}")
+        counts[status] = int(count)
+    counts["total"] = sum(counts[status] for status in DELETE_STATUSES)
+    return counts
+
+
+def list_repost_issues(
+    uid: str,
+    *,
+    limit: int = 20,
+) -> list[RepostHistoryRecord]:
+    """只读列出需要人工检查的删除状态记录（pending/failed/unknown）。
+
+    仅用于“让用户看见问题”；绝不自动恢复 pending、不自动重发 DELETE、
+    不把 unknown/delete_failed 自动降级或清除。
+    """
+    scoped_uid = _uid(uid)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        raise ValueError("问题记录数量无效")
+    with session_scope() as session:
+        rows = session.exec(
+            select(RepostHistoryRow)
+            .where(
+                RepostHistoryRow.uid == scoped_uid,
+                RepostHistoryRow.delete_status.in_(DELETE_ISSUE_STATUSES),
+            )
+            .order_by(
+                RepostHistoryRow.updated_at.desc(),
+                RepostHistoryRow.repost_dynamic_id.desc(),
+            )
+            .limit(limit)
         ).all()
         return [_history_record(row) for row in rows]

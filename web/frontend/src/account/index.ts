@@ -4,6 +4,7 @@
 
 import { state } from "../state";
 import { fetchJSON } from "../api/client";
+import { shouldPreserveLoggedInSnapshot } from "./account-preserve";
 import { LLM_REQUIRED_ACTIONS, LOGIN_REQUIRED_ACTIONS, ONBOARDING_STEPS, ONBOARDING_STORAGE_KEY, accountHero, onboardingFootNote, onboardingPanel, onboardingPrimaryBtn, onboardingProgressFill, onboardingProgressLabel, onboardingSkipBtn, onboardingStepsEl, sidebarAccountCard, sidebarLoginBtn, sidebarLogoutBtn } from "../dom";
 import { loadSettings } from "../settings/index";
 import { closeAppConfirm, openAppConfirm } from "../shell/confirm";
@@ -16,6 +17,17 @@ import { renderWatchUsersPanel, updateWatchUserFormState } from "../watch/index"
 
 export function isLoggedIn() {
   return Boolean(state.account?.logged_in && !state.account?.expired);
+}
+
+export function hasLoggedInSnapshot() {
+  return Boolean(state.account?.logged_in && !state.account?.expired);
+}
+
+export function restoreAccountViewsFromSnapshot() {
+  // 仅用本地 runtime 账号快照恢复 UI；0 远程请求，不触发额外 NAV。
+  if (!hasLoggedInSnapshot()) return false;
+  renderAccountViews(state.account);
+  return true;
 }
 
 export function isLlmConfigured() {
@@ -436,6 +448,12 @@ export function renderAccountViews(account) {
 export async function loadAccount() {
   try {
     const account = await fetchJSON("/api/account", { timeoutMs: 12000 });
+    if (shouldPreserveLoggedInSnapshot(state.account, account)) {
+      // 平台瞬时不可达（风控 / 网络抖动）时，保留最近一次成功登录显示，
+      // 避免把“已登录”误切成“未登录 / 网络异常”，也不需要用户按 F5 恢复。
+      renderAccountViews(state.account);
+      return state.account;
+    }
     renderAccountViews(account);
     return account;
   } catch (error) {

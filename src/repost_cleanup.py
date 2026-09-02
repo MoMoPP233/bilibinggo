@@ -18,7 +18,7 @@ import httpx
 from src.activity_store import load_activities
 from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient, api_code
-from src.data_paths import get_runtime_profile_id
+from src.data_paths import get_runtime_profile_id, get_selected_profile_id
 from src.db.engine import db_path
 from src.lottery_api import DYNAMIC_DETAIL_URL, LOTTERY_NOTICE_URL
 from src.lottery_classifier import is_charging_lottery_activity
@@ -33,6 +33,7 @@ from src.repost_history import (
     claim_delete_pending,
     clear_maintenance_risk,
     clear_sync_needed_if_unchanged,
+    count_repost_delete_statuses,
     defer_repost,
     get_checkpoint,
     get_repost,
@@ -41,6 +42,7 @@ from src.repost_history import (
     list_reposts_needing_identity,
     list_reposts_by_originals,
     list_repost_assessments,
+    list_repost_issues,
     mark_delete_result,
     pause_maintenance_risk,
     remove_repost_assessment,
@@ -71,6 +73,7 @@ AUTO_ASSESSMENT_BUDGET = 20
 MANUAL_REVIEW_DEFER_SECONDS = 30 * 24 * 60 * 60
 CONSECUTIVE_FAILURE_LIMIT = 3
 MAX_DELETE_BATCH = 20
+HEALTH_ISSUE_LIMIT = 20
 TRUSTED_IDENTITY_SOURCES = frozenset({"space_feed", "legacy_space_feed"})
 RETRYABLE_ASSESSMENT_REASON_CODES = frozenset({"remote_unknown"})
 PERMANENT_IDENTITY_ERROR_MARKERS = (
@@ -1408,13 +1411,21 @@ def load_deleted_candidates(uid: str) -> list[dict[str, Any]]:
 
 
 def repost_cleanup_summary(uid: str, *, show_deleted: bool = False) -> dict[str, Any]:
-    """供页面零远程恢复的汇总：三级计数 + 待评估 + 候选明细。"""
+    """供页面零远程恢复的汇总：三级计数 + 待评估 + 候选明细。
+
+    统计口径（只读本地，0 远程）：
+    - all_total    : 全部历史，含已删除/未完成删除等所有 delete_status 行。
+    - history_total: 现存可处理转发 = active + delete_failed + unknown（候选评估范围）。
+    - active / delete_pending / delete_failed / unknown / deleted : 按 delete_status 互斥计数。
+    - 其余 safe/manual_review/deferred/blocked/excluded : 按评估等级计数（仅现存可处理范围）。
+    """
     scoped_uid = str(uid).strip()
     reposts = list_evaluable_reposts(scoped_uid)
     assessments = list_repost_assessments(scoped_uid)
     candidates = load_persisted_candidates(scoped_uid)
     deleted_candidates = load_deleted_candidates(scoped_uid) if show_deleted else []
     checkpoint = get_checkpoint(scoped_uid)
+    status_counts = count_repost_delete_statuses(scoped_uid)
     counts = {"safe": 0, "manual_review": 0, "blocked": 0, "deferred": 0}
     for candidate in candidates:
         level = candidate.get("level")
@@ -1431,6 +1442,11 @@ def repost_cleanup_summary(uid: str, *, show_deleted: bool = False) -> dict[str,
     }
     return {
         "uid": scoped_uid,
+        "all_total": status_counts["total"],
+        "active": status_counts["active"],
+        "delete_pending": status_counts["delete_pending"],
+        "delete_failed": status_counts["delete_failed"],
+        "unknown": status_counts["unknown"],
         "history_total": len(reposts),
         "assessed_total": len(assessments),
         "safe": counts["safe"],
@@ -1442,7 +1458,7 @@ def repost_cleanup_summary(uid: str, *, show_deleted: bool = False) -> dict[str,
             if assessment.assessment_level == "excluded"
         ),
         "pending_evaluation": len(pending_originals),
-        "deleted": len(list_deleted_reposts(scoped_uid)),
+        "deleted": status_counts["deleted"],
         "last_synced_at": getattr(checkpoint, "last_synced_at", None),
         "full_scan_completed": bool(getattr(checkpoint, "full_scan_completed", False)),
         "last_evaluated_at": max(
@@ -1454,6 +1470,286 @@ def repost_cleanup_summary(uid: str, *, show_deleted: bool = False) -> dict[str,
         ),
         "deleted_candidates": deleted_candidates,
         "candidates": candidates,
+    }
+
+
+def _health_dt(value: object) -> str:
+    """本地显示时间（固定 UTC+8，与业务时间一致）；空值返回「—」。"""
+    try:
+        ts = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—"
+    if ts <= 0:
+        return "—"
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        dt = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8)))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return str(ts)
+
+
+def cleanup_health_check(
+    uid: str,
+    *,
+    delete_job_in_progress: bool = False,
+) -> dict[str, Any]:
+    """当前 runtime Profile 清理维护的纯本地健康检查。
+
+    约束：0 Bilibili 请求 / 0 LLM / 0 DELETE；只读本地库与本地文件。
+    只负责「让用户看见问题」：绝不自动恢复 delete_pending、绝不自动重试
+    unknown/delete_failed、绝不自动重新删除、绝不自动解除风控暂停。
+    """
+    scoped_uid = str(uid).strip()
+    summary = repost_cleanup_summary(scoped_uid)
+    status_counts = count_repost_delete_statuses(scoped_uid)
+    checkpoint = get_checkpoint(scoped_uid)
+    sync_needed = bool(getattr(checkpoint, "sync_needed", False))
+    sync_needed_at = getattr(checkpoint, "sync_needed_at", None)
+    full_scan_completed = bool(getattr(checkpoint, "full_scan_completed", False))
+    last_synced_at = getattr(checkpoint, "last_synced_at", None)
+    reconciliation_missing = reconciliation_needs_sync(scoped_uid)
+    pending_evaluation = int(summary.get("pending_evaluation") or 0)
+    risk = maintenance_risk_state(scoped_uid)
+    risk_paused = bool(risk.get("risk_paused"))
+
+    issue_counts = {
+        "delete_pending": int(status_counts["delete_pending"]),
+        "delete_failed": int(status_counts["delete_failed"]),
+        "unknown": int(status_counts["unknown"]),
+    }
+    issue_total = sum(issue_counts.values())
+
+    issue_rows = [
+        {
+            "repost_dynamic_id": record.repost_dynamic_id,
+            "original_dynamic_id": record.original_dynamic_id,
+            "delete_status": record.delete_status,
+            "last_error": record.last_error,
+            "delete_requested_at": record.delete_requested_at,
+            "updated_at": record.updated_at,
+        }
+        for record in list_repost_issues(scoped_uid, limit=HEALTH_ISSUE_LIMIT)
+    ]
+
+    checks: list[dict[str, str]] = []
+    runtime_error = False
+
+    profile_id = get_runtime_profile_id()
+    selected_id = get_selected_profile_id()
+    if selected_id and selected_id != profile_id:
+        checks.append(
+            {
+                "key": "profile_switch_pending",
+                "tone": "info",
+                "text": (
+                    f"已选择切换 Profile「{selected_id}」，将在重启后生效；"
+                    f"当前进程仍运行「{profile_id}」，不会访问新账号。"
+                ),
+            }
+        )
+    try:
+        from src.profile_manager import get_profile_metadata
+
+        metadata_mid = str(get_profile_metadata(profile_id).get("mid") or "").strip()
+    except Exception:
+        metadata_mid = ""
+    if metadata_mid and metadata_mid != scoped_uid:
+        runtime_error = True
+        checks.append(
+            {
+                "key": "runtime_identity_mismatch",
+                "tone": "error",
+                "text": (
+                    f"运行状态异常：Profile「{profile_id}」元数据账号 {metadata_mid} "
+                    f"与当前登录 Cookie 账号 {scoped_uid} 不一致。程序不会猜测账号，"
+                    f"请重启 Binggo 并切换到正确的 Profile 后使用。"
+                ),
+            }
+        )
+
+    if checkpoint is None:
+        checks.append(
+            {
+                "key": "sync_not_started",
+                "tone": "info",
+                "text": "尚未开始转发历史同步；可在上方点击「同步我的转发历史」。",
+            }
+        )
+    else:
+        if sync_needed:
+            checks.append(
+                {
+                    "key": "sync_needed",
+                    "tone": "info",
+                    "text": f"有新的转发等待增量同步（标记于 {_health_dt(sync_needed_at)}）。",
+                }
+            )
+        if reconciliation_missing:
+            checks.append(
+                {
+                    "key": "sync_reconciliation",
+                    "tone": "info",
+                    "text": (
+                        "检测到最近参与的转发可能尚未被同步覆盖，"
+                        "下一维护周期会保守地补同步一次。"
+                    ),
+                }
+            )
+        if not full_scan_completed:
+            checks.append(
+                {
+                    "key": "full_scan_pending",
+                    "tone": "info",
+                    "text": "历史索引尚未完成首次完整扫描。",
+                }
+            )
+        checks.append(
+            {
+                "key": "last_synced_at",
+                "tone": "ok",
+                "text": f"最近成功同步：{_health_dt(last_synced_at)}。"
+                if last_synced_at
+                else "尚无成功的增量同步。",
+            }
+        )
+
+    if pending_evaluation:
+        checks.append(
+            {
+                "key": "pending_evaluation",
+                "tone": "info",
+                "text": (
+                    f"还有 {pending_evaluation} 条转发待评估；"
+                    f"自动评估每轮最多 {AUTO_ASSESSMENT_BUDGET} 条，人工评估最多 "
+                    f"{MAX_ASSESSMENTS_PER_JOB} 条。"
+                ),
+            }
+        )
+    else:
+        checks.append(
+            {
+                "key": "pending_evaluation",
+                "tone": "ok",
+                "text": "所有可评估转发均已完成评估。",
+            }
+        )
+
+    if risk_paused:
+        reason = str(risk.get("risk_reason") or "平台风控暂停")
+        paused_at = risk.get("risk_paused_at")
+        checks.append(
+            {
+                "key": "maintenance_risk_paused",
+                "tone": "warn",
+                "text": (
+                    f"自动维护因平台限制已暂停：{reason}"
+                    f"（暂停于 {_health_dt(paused_at)}）。"
+                    "需要人工在「自动维护」面板点击恢复；恢复后不会立即联网。"
+                ),
+            }
+        )
+    if issue_counts["delete_pending"]:
+        if delete_job_in_progress:
+            tone = "info"
+            text = (
+                f"有 {issue_counts['delete_pending']} 条未完成删除操作，"
+                "删除任务正在运行，请等待结果。"
+            )
+        else:
+            tone = "warn"
+            text = (
+                f"有 {issue_counts['delete_pending']} 条未完成删除操作"
+                "（可能因删除任务中断遗留），需要人工检查；不会自动恢复，"
+                "也不会自动重新发送删除请求。"
+            )
+        checks.append({"key": "delete_pending", "tone": tone, "text": text})
+    if issue_counts["unknown"]:
+        checks.append(
+            {
+                "key": "delete_unknown",
+                "tone": "warn",
+                "text": (
+                    f"有 {issue_counts['unknown']} 条删除结果无法确认，"
+                    "程序不会自动再次删除；可在下方查看原动态后重新同步核实。"
+                ),
+            }
+        )
+    if issue_counts["delete_failed"]:
+        checks.append(
+            {
+                "key": "delete_failed",
+                "tone": "warn",
+                "text": (
+                    f"有 {issue_counts['delete_failed']} 条删除已明确失败，"
+                    "不会在后台自动重试；可点击下方记录查看失败原因。"
+                ),
+            }
+        )
+    if not risk_paused and not issue_total:
+        checks.append(
+            {
+                "key": "no_issue",
+                "tone": "ok",
+                "text": "没有需要人工检查的删除记录。",
+            }
+        )
+
+    if runtime_error:
+        status = "runtime_error"
+        status_text = "运行状态异常"
+    elif risk_paused:
+        status = "risk_paused"
+        status_text = "维护已暂停（风控）"
+    elif issue_total:
+        status = "review_needed"
+        status_text = "需要人工检查"
+    elif sync_needed or reconciliation_missing:
+        status = "sync_pending"
+        status_text = "有待同步数据"
+    else:
+        status = "normal"
+        status_text = "维护状态正常"
+
+    return {
+        "uid": scoped_uid,
+        "runtime": {
+            "profile_id": profile_id,
+            "uid": scoped_uid,
+            "database_path": str(db_path().resolve()),
+            "selected_profile_id": selected_id or None,
+            "consistent": not runtime_error,
+        },
+        "checkpoint": {
+            "exists": checkpoint is not None,
+            "full_scan_completed": full_scan_completed,
+            "sync_needed": sync_needed,
+            "sync_needed_at": sync_needed_at,
+            "last_synced_at": last_synced_at,
+            "head_dynamic_id": getattr(checkpoint, "head_dynamic_id", None),
+        },
+        "counts": {
+            "all_total": int(status_counts["total"]),
+            "active": int(status_counts["active"]),
+            "delete_pending": int(status_counts["delete_pending"]),
+            "delete_failed": int(status_counts["delete_failed"]),
+            "unknown": int(status_counts["unknown"]),
+            "deleted": int(status_counts["deleted"]),
+            "history_total": int(summary.get("history_total") or 0),
+            "pending_evaluation": pending_evaluation,
+        },
+        "maintenance": {
+            "risk_paused": risk_paused,
+            "risk_paused_at": risk.get("risk_paused_at"),
+            "risk_reason": risk.get("risk_reason"),
+        },
+        "issues": issue_rows,
+        "issue_total": issue_total,
+        "issue_counts": issue_counts,
+        "checks": checks,
+        "status": status,
+        "status_text": status_text,
     }
 
 
@@ -1727,6 +2023,7 @@ __all__ = [
     "MAX_DELETE_BATCH",
     "RemoteStateUnknown",
     "auto_maintain",
+    "cleanup_health_check",
     "defer_candidate",
     "delete_reposts",
     "load_persisted_candidates",

@@ -10,6 +10,8 @@ const {
   showToastMock,
   startJobMock,
   trackCurrentJobMock,
+  restoreAccountViewsFromSnapshotMock,
+  loadAccountMock,
 } = vi.hoisted(() => ({
   fetchJSONMock: vi.fn(),
   notifyJobStartErrorMock: vi.fn(),
@@ -18,14 +20,21 @@ const {
   showToastMock: vi.fn(),
   startJobMock: vi.fn(),
   trackCurrentJobMock: vi.fn(),
+  restoreAccountViewsFromSnapshotMock: vi.fn(),
+  loadAccountMock: vi.fn(),
 }));
 
-vi.mock("../account/index", () => ({ requireSetup: requireSetupMock }));
+vi.mock("../account/index", () => ({
+  requireSetup: requireSetupMock,
+  restoreAccountViewsFromSnapshot: restoreAccountViewsFromSnapshotMock,
+  loadAccount: loadAccountMock,
+}));
 vi.mock("../api/client", () => ({ fetchJSON: fetchJSONMock }));
 vi.mock("../jobs/index", () => ({
   notifyJobStartError: notifyJobStartErrorMock,
   startJob: startJobMock,
   trackCurrentJob: trackCurrentJobMock,
+  updateJobUI: () => {},
 }));
 vi.mock("../shell/confirm", () => ({ openAppConfirm: openAppConfirmMock }));
 vi.mock("../shell/toast", () => ({ showToast: showToastMock }));
@@ -43,6 +52,7 @@ const candidate = {
 
 function setupDom(): void {
   document.body.innerHTML = `
+    <button id="repost-sync-btn" data-action="sync_repost_history">同步历史</button>
     <button id="repost-scan-btn" data-action="scan_expired_reposts">扫描</button>
     <button id="repost-stop-btn" data-job-control disabled>停止评估</button>
     <p id="repost-eval-status">尚未开始智能评估</p>
@@ -82,7 +92,16 @@ function setupDom(): void {
     <div id="repost-candidate-pagination"></div>
     <p id="repost-history-summary"></p>
     <table><tbody id="repost-history-body"></tbody></table>
-    <div id="repost-history-pagination"></div>`;
+    <div id="repost-history-pagination"></div>
+    <span id="repost-health-pill">—</span>
+    <strong id="repost-health-all">—</strong>
+    <strong id="repost-health-existing">—</strong>
+    <strong id="repost-health-deleted">—</strong>
+    <strong id="repost-health-pending">—</strong>
+    <strong id="repost-health-failed">—</strong>
+    <strong id="repost-health-unknown">—</strong>
+    <div id="repost-health-lines">读取中…</div>
+    <div id="repost-health-issues"></div>`;
 }
 
 async function loadModule() {
@@ -107,10 +126,14 @@ describe("repost cleanup UI", () => {
     showToastMock.mockReset();
     startJobMock.mockReset();
     trackCurrentJobMock.mockReset();
+    restoreAccountViewsFromSnapshotMock.mockReset();
+    loadAccountMock.mockReset();
     requireSetupMock.mockReturnValue(true);
     openAppConfirmMock.mockResolvedValue(true);
     fetchJSONMock.mockResolvedValue({ ok: true });
     trackCurrentJobMock.mockResolvedValue({ state: "running" });
+    restoreAccountViewsFromSnapshotMock.mockReturnValue(true);
+    loadAccountMock.mockResolvedValue({ logged_in: true, expired: false });
     setupDom();
   });
 
@@ -347,13 +370,22 @@ describe("repost cleanup UI", () => {
   });
 
   it("stop button cancels the running assessment job", async () => {
+    const freshState = await import("../state");
+    (freshState.state as unknown as { currentJob: unknown }).currentJob = {
+      id: 55,
+      state: "running",
+      action: "scan_expired_reposts",
+      source: "ui",
+      message: "评估中",
+    };
     const module = await loadModule();
     module.bindRepostCleanup();
-    (document.getElementById("repost-stop-btn") as HTMLButtonElement).disabled = false;
-
-    document.getElementById("repost-stop-btn")!.click();
-
-    expect(fetchJSONMock).toHaveBeenCalledWith("/api/jobs/cancel", { method: "POST" });
+    const stopBtn = document.getElementById("repost-stop-btn") as HTMLButtonElement;
+    expect(stopBtn.disabled).toBe(false);
+    stopBtn.click();
+    await vi.waitFor(() => {
+      expect(fetchJSONMock).toHaveBeenCalledWith("/api/jobs/cancel", { method: "POST" });
+    });
   });
 
   it("shows cumulative and pending counts from persisted summary", async () => {
@@ -492,5 +524,193 @@ describe("repost cleanup UI", () => {
     await Promise.resolve();
     expect(writeText).toHaveBeenCalledWith("80001");
     expect(fetchJSONMock).not.toHaveBeenCalled();
+  });
+
+  it("sync start locks buttons instantly and an ultra-fast second click is ignored", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
+    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
+    expect(syncBtn.disabled).toBe(false);
+
+    syncBtn.click();
+    expect(syncBtn.disabled).toBe(true);
+    expect(scanBtn.disabled).toBe(true);
+
+    syncBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await vi.waitFor(() => expect(startJobMock).toHaveBeenCalledTimes(1));
+    expect(startJobMock).toHaveBeenCalledWith("sync_repost_history", {});
+  });
+
+  it("evaluate start locks instantly and ignores ultra-fast double click", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
+    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
+
+    scanBtn.click();
+    expect(scanBtn.disabled).toBe(true);
+    expect(syncBtn.disabled).toBe(true);
+    expect(document.getElementById("repost-eval-status")?.textContent).toBe("智能评估进行中…");
+
+    scanBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await vi.waitFor(() => expect(startJobMock).toHaveBeenCalledTimes(1));
+    expect(startJobMock).toHaveBeenCalledWith("scan_expired_reposts", {});
+  });
+
+  it("stop request sends exactly one cancel even under rapid double click", async () => {
+    const freshState = await import("../state");
+    (freshState.state as unknown as { currentJob: unknown }).currentJob = {
+      id: 66,
+      state: "running",
+      action: "scan_expired_reposts",
+      source: "ui",
+    };
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const stopBtn = document.getElementById("repost-stop-btn") as HTMLButtonElement;
+
+    stopBtn.click();
+    expect(stopBtn.disabled).toBe(true);
+    stopBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await vi.waitFor(() =>
+      expect(fetchJSONMock).toHaveBeenCalledWith("/api/jobs/cancel", { method: "POST" }),
+    );
+    expect(fetchJSONMock.mock.calls.filter(([url]) => url === "/api/jobs/cancel")).toHaveLength(1);
+  });
+
+  it("recovers buttons when the job start API fails", async () => {
+    startJobMock.mockRejectedValueOnce(new Error("网络异常"));
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
+    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
+
+    syncBtn.click();
+    await vi.waitFor(() => expect(notifyJobStartErrorMock).toHaveBeenCalled());
+
+    expect(syncBtn.disabled).toBe(false);
+    expect(scanBtn.disabled).toBe(false);
+    expect(startJobMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps buttons locked when the job transitions to a real running state", async () => {
+    const freshState = await import("../state");
+    startJobMock.mockImplementation(async () => {
+      (freshState.state as unknown as { currentJob: unknown }).currentJob = {
+        id: 77,
+        state: "running",
+        action: "sync_repost_history",
+        source: "ui",
+      };
+    });
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
+    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
+    const stopBtn = document.getElementById("repost-stop-btn") as HTMLButtonElement;
+
+    syncBtn.click();
+    await vi.waitFor(() => expect(startJobMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(syncBtn.disabled).toBe(true));
+    expect(scanBtn.disabled).toBe(true);
+    expect(stopBtn.disabled).toBe(false);
+  });
+
+  it("delete completion restores account UI from local snapshot without an extra account request", async () => {
+    fetchJSONMock.mockResolvedValue({ ok: true, candidates: [] });
+    const module = await loadModule();
+    module.bindRepostCleanup();
+
+    await module.handleRepostCleanupJobCompletion({
+      action: "delete_expired_reposts",
+      state: "success",
+      result: { items: [], deleted_count: 1 },
+    });
+
+    expect(restoreAccountViewsFromSnapshotMock).toHaveBeenCalled();
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates?show_deleted=1");
+    const accountCalls = fetchJSONMock.mock.calls.filter(([url]) =>
+      String(url).startsWith("/api/account"),
+    );
+    expect(accountCalls).toHaveLength(0);
+    expect(loadAccountMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("repost cleanup maintenance health", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    fetchJSONMock.mockReset();
+    showToastMock.mockReset();
+    setupDom();
+  });
+
+  it("normal health renders pill, counts and human lines", async () => {
+    const module = await loadModule();
+    module.renderHealth({
+      status: "normal",
+      status_text: "维护状态正常",
+      counts: { all_total: 6, history_total: 3, deleted: 1, delete_pending: 1, delete_failed: 1, unknown: 1 },
+      maintenance: { enabled: true, interval_hours: 2, risk_paused: false, risk_reason: null },
+      issues: [],
+      issue_total: 0,
+      checks: [{ key: "ok", tone: "ok", text: "没有需要人工检查的删除记录。" }],
+    });
+    expect(document.getElementById("repost-health-pill")?.textContent).toBe("维护状态正常");
+    expect(document.getElementById("repost-health-pill")?.getAttribute("data-tone")).toBe("ok");
+    expect(document.getElementById("repost-health-all")?.textContent).toBe("6");
+    expect(document.getElementById("repost-health-existing")?.textContent).toBe("3");
+    expect(document.getElementById("repost-health-deleted")?.textContent).toBe("1");
+    expect(document.getElementById("repost-health-pending")?.textContent).toBe("1");
+    expect(document.getElementById("repost-health-failed")?.textContent).toBe("1");
+    expect(document.getElementById("repost-health-unknown")?.textContent).toBe("1");
+    const lines = document.getElementById("repost-health-lines")?.textContent || "";
+    expect(lines).toContain("自动维护：开启");
+    expect(lines).toContain("没有需要人工检查");
+    expect(document.getElementById("repost-health-issues")?.hasAttribute("hidden")).toBe(true);
+  });
+
+  it("maintenance off shows a clear disabled line", async () => {
+    const module = await loadModule();
+    module.renderHealth({
+      status: "normal",
+      status_text: "维护状态正常",
+      counts: {},
+      maintenance: { enabled: false, interval_hours: 2 },
+      issues: [],
+      issue_total: 0,
+      checks: [],
+    });
+    const lines = document.getElementById("repost-health-lines")?.textContent || "";
+    expect(lines).toContain("自动维护：关闭");
+  });
+
+  it("issue rows are visible with copy but no auto re-delete controls", async () => {
+    const module = await loadModule();
+    module.renderHealth({
+      status: "review_needed",
+      status_text: "需要人工检查",
+      counts: { all_total: 3, delete_pending: 1, delete_failed: 1, unknown: 1 },
+      maintenance: { enabled: true, interval_hours: 2, risk_paused: false },
+      issue_total: 2,
+      issues: [
+        { repost_dynamic_id: "91001", original_dynamic_id: "81001", delete_status: "delete_pending", last_error: null, delete_requested_at: 1_750_000_000 },
+        { repost_dynamic_id: "91002", original_dynamic_id: "81002", delete_status: "delete_failed", last_error: "Bilibili API error -101", delete_requested_at: 1_750_000_001 },
+      ],
+      checks: [{ key: "pending", tone: "warn", text: "未完成删除操作" }],
+    });
+    const issues = document.getElementById("repost-health-issues");
+    expect(issues?.hasAttribute("hidden")).toBe(false);
+    const html = issues?.innerHTML || "";
+    expect(html).toContain("91001");
+    expect(html).toContain("91002");
+    expect(html).toContain("81002");
+    expect(html).toContain("Bilibili API error -101");
+    expect(html).toContain("未完成删除");
+    expect(html).toContain("data-repost-copy=");
+    expect(html).not.toContain("data-auto-");
+    expect(html).not.toContain('data-repost-delete');
+    expect(document.getElementById("repost-health-pill")?.getAttribute("data-tone")).toBe("warn");
   });
 });

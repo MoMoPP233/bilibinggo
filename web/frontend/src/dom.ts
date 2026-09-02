@@ -137,6 +137,16 @@ export const repostHistoryBody = document.getElementById("repost-history-body");
 
 export const repostHistoryPagination = document.getElementById("repost-history-pagination");
 
+export const repostHealthPill = document.getElementById("repost-health-pill");
+export const repostHealthAll = document.getElementById("repost-health-all");
+export const repostHealthExisting = document.getElementById("repost-health-existing");
+export const repostHealthDeleted = document.getElementById("repost-health-deleted");
+export const repostHealthPending = document.getElementById("repost-health-pending");
+export const repostHealthFailed = document.getElementById("repost-health-failed");
+export const repostHealthUnknown = document.getElementById("repost-health-unknown");
+export const repostHealthLines = document.getElementById("repost-health-lines");
+export const repostHealthIssues = document.getElementById("repost-health-issues");
+
 export const qrcodeModal = document.getElementById("qrcode-modal");
 
 export const qrcodeImg = document.getElementById("qrcode-img");

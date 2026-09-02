@@ -295,3 +295,64 @@ def test_cleanup_maintain_recover_is_local_only() -> None:
     assert response.status_code == 200
     assert response.json()["risk_paused"] is False
     recover_mock.assert_called_once_with("123")
+
+
+def test_health_endpoint_is_local_and_flags_delete_job_in_progress() -> None:
+    health_payload = {
+        "uid": "123",
+        "status": "normal",
+        "status_text": "维护状态正常",
+        "maintenance": {"risk_paused": False, "risk_paused_at": None, "risk_reason": None},
+        "counts": {"all_total": 0, "delete_pending": 0, "delete_failed": 0, "unknown": 0},
+        "issues": [],
+        "issue_total": 0,
+        "checks": [],
+    }
+    with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
+        "web.app._require_runtime_bilibili_uid", return_value="123"
+    ), patch(
+        "src.repost_cleanup.cleanup_health_check", return_value=dict(health_payload)
+    ) as health_mock, patch(
+        "web.auto_config.cleanup_maintain_enabled", return_value=True
+    ), patch("web.app.runner.get_status") as status_mock:
+        status_mock.return_value.to_dict.return_value = _running_job(
+            "delete_expired_reposts", 91
+        )
+        response = client.get("/api/repost-cleanup/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["status"] == "normal"
+    assert payload["maintenance"]["enabled"] is True
+    assert payload["maintenance"]["interval_hours"] == 2
+    health_mock.assert_called_once_with("123", delete_job_in_progress=True)
+
+
+def test_health_endpoint_never_constructs_a_bilibili_client() -> None:
+    health_payload = {
+        "uid": "123",
+        "status": "normal",
+        "status_text": "维护状态正常",
+        "maintenance": {"risk_paused": False, "risk_paused_at": None, "risk_reason": None},
+        "counts": {"all_total": 0, "delete_pending": 0, "delete_failed": 0, "unknown": 0},
+        "issues": [],
+        "issue_total": 0,
+        "checks": [],
+    }
+    with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
+        "web.app._require_runtime_bilibili_uid", return_value="123"
+    ), patch(
+        "src.repost_cleanup.cleanup_health_check", return_value=dict(health_payload)
+    ), patch("web.app.runner.get_status") as status_mock, patch(
+        "src.bilibili_client.BilibiliClient", side_effect=AssertionError("health 不得联网")
+    ):
+        status_mock.return_value.to_dict.return_value = {
+            "id": None,
+            "state": "idle",
+            "action": "",
+        }
+        response = client.get("/api/repost-cleanup/health")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True

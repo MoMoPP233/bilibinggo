@@ -1,5 +1,6 @@
-import { requireSetup } from "../account/index";
+import { requireSetup, restoreAccountViewsFromSnapshot, loadAccount } from "../account/index";
 import { fetchJSON } from "../api/client";
+import { state } from "../state";
 import {
   repostCandidatePagination,
   repostCandidateSummary,
@@ -25,8 +26,17 @@ import {
   repostDeleteProgress,
   repostSelectedCount,
   repostSelectPageBtn,
+  repostHealthPill,
+  repostHealthAll,
+  repostHealthExisting,
+  repostHealthDeleted,
+  repostHealthPending,
+  repostHealthFailed,
+  repostHealthUnknown,
+  repostHealthLines,
+  repostHealthIssues,
 } from "../dom";
-import { notifyJobStartError, startJob, trackCurrentJob } from "../jobs/index";
+import { notifyJobStartError, startJob, trackCurrentJob, updateJobUI } from "../jobs/index";
 import { openAppConfirm } from "../shell/confirm";
 import { showToast } from "../shell/toast";
 import type { JobStatus } from "../types";
@@ -101,6 +111,7 @@ interface RepostCandidatesResponse {
   ok?: boolean;
   uid?: string | number;
   candidates?: unknown;
+  all_total?: number;
   history_total?: number;
   assessed_total?: number;
   safe?: number;
@@ -114,6 +125,54 @@ interface RepostCandidatesResponse {
   last_synced_at?: string | number | null;
   full_scan_completed?: boolean;
   last_evaluated_at?: string | number | null;
+}
+
+interface RepostHealthIssue {
+  repost_dynamic_id?: string;
+  original_dynamic_id?: string;
+  delete_status?: string;
+  last_error?: string | null;
+  delete_requested_at?: string | number | null;
+  updated_at?: string | number | null;
+}
+
+interface RepostHealthCheck {
+  key?: string;
+  tone?: string;
+  text?: string;
+}
+
+interface RepostHealthResponse {
+  ok?: boolean;
+  uid?: string | number;
+  status?: string;
+  status_text?: string;
+  issue_total?: number;
+  issues?: RepostHealthIssue[];
+  counts?: {
+    all_total?: number;
+    active?: number;
+    delete_pending?: number;
+    delete_failed?: number;
+    unknown?: number;
+    deleted?: number;
+    history_total?: number;
+    pending_evaluation?: number;
+  };
+  maintenance?: {
+    enabled?: boolean;
+    interval_hours?: number;
+    risk_paused?: boolean;
+    risk_paused_at?: string | number | null;
+    risk_reason?: string | null;
+  };
+  checkpoint?: {
+    exists?: boolean;
+    full_scan_completed?: boolean;
+    sync_needed?: boolean;
+    last_synced_at?: string | number | null;
+  } | null;
+  checks?: RepostHealthCheck[];
 }
 
 interface DeleteResultItem {
@@ -590,8 +649,8 @@ export async function loadPersistedCandidates(): Promise<void> {
       delete_status: "deleted",
     }));
     if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
-    if (repostHistoryTotal && Number(data?.history_total) >= 0) {
-      repostHistoryTotal.textContent = String(Number(data?.history_total) || 0);
+    if (repostHistoryTotal && Number(data?.all_total) >= 0) {
+      repostHistoryTotal.textContent = String(Number(data?.all_total) || 0);
     }
     updateWorkflowStatus(data);
     updateEvalStatus();
@@ -608,6 +667,152 @@ function updateWorkflowStatus(data: RepostCandidatesResponse): void {
   const evaluatedAt = formatTimestamp(data.last_evaluated_at);
   repostWorkflowStatus.textContent =
     `历史同步：${syncState} · 最近同步：${syncedAt} · 已评估：${assessedTotal} · 待评估：${pendingEvaluation} · 最近评估：${evaluatedAt}`;
+}
+
+function setHealthNumber(el: Element | null, value: unknown): void {
+  if (!el) return;
+  const num = Number(value);
+  el.textContent = String(Number.isFinite(num) && num > 0 ? Math.trunc(num) : 0);
+}
+
+function healthStatusTone(status: unknown): string {
+  switch (String(status || "normal")) {
+    case "runtime_error":
+      return "error";
+    case "risk_paused":
+    case "review_needed":
+      return "warn";
+    case "sync_pending":
+      return "info";
+    default:
+      return "ok";
+  }
+}
+
+function healthLineTone(tone: unknown): string {
+  const value = String(tone || "info");
+  return value === "ok" || value === "info" || value === "warn" || value === "error" ? value : "info";
+}
+
+function issueStatusMeta(status: unknown): { label: string; tone: string } {
+  switch (String(status || "")) {
+    case "delete_pending":
+      return { label: "未完成删除", tone: "pending" };
+    case "delete_failed":
+      return { label: "删除失败", tone: "failed" };
+    case "unknown":
+      return { label: "结果未知", tone: "unknown" };
+    default:
+      return { label: sanitizeUserText(String(status || "—")) || "—", tone: "unknown" };
+  }
+}
+
+function issueExplain(issue: RepostHealthIssue): string {
+  const status = String(issue?.delete_status || "");
+  const lastError = sanitizeUserText(issue?.last_error || "") || "";
+  if (status === "delete_failed") {
+    return lastError || "删除请求已被平台明确拒绝，但未记录具体原因。";
+  }
+  if (status === "unknown") {
+    return lastError
+      ? `删除请求结果无法确认：${lastError}`
+      : "删除请求结果无法确认，程序不会自动再次删除。";
+  }
+  return "存在未完成的删除操作，需要人工确认；程序不会自动恢复或重发删除请求。";
+}
+
+function renderHealthIssues(data: RepostHealthResponse): void {
+  if (!repostHealthIssues) return;
+  const issues = Array.isArray(data?.issues) ? data.issues : [];
+  const total = Math.max(0, Number(data?.issue_total) || 0);
+  if (!total || !issues.length) {
+    repostHealthIssues.hidden = true;
+    repostHealthIssues.innerHTML = "";
+    return;
+  }
+  const shown = issues.length;
+  const rows = issues.map((issue) => {
+    const repostId = validDynamicId(issue?.repost_dynamic_id);
+    const originalId = validDynamicId(issue?.original_dynamic_id);
+    const meta = issueStatusMeta(issue?.delete_status);
+    const stamp = issue?.delete_requested_at ?? issue?.updated_at;
+    const timeText = formatTimestamp(stamp);
+    const reason = sanitizeUserText(issueExplain(issue));
+    return `<tr>
+      <td><span class="repost-status repost-status--${meta.tone}">${meta.label}</span></td>
+      <td>
+        ${repostId ? `<span class="repost-id">${escapeHtml(repostId)}</span>` : "—"}
+        ${repostId ? `<button type="button" class="btn btn-ghost btn-compact btn-pill repost-health-copy" data-repost-copy="${escapeHtml(repostId)}">复制</button>` : ""}
+      </td>
+      <td>${originalId ? `<a class="activity-link" href="${opusUrl(originalId)}" target="_blank" rel="noopener">${escapeHtml(originalId)}</a>` : "—"}</td>
+      <td>${reason ? `<p class="repost-error" title="${escapeHtml(reason)}">${escapeHtml(reason)}</p>` : "—"}</td>
+      <td class="time-cell">${escapeHtml(timeText)}</td>
+    </tr>`;
+  }).join("");
+  repostHealthIssues.hidden = false;
+  repostHealthIssues.innerHTML = `
+    <div class="repost-health-issues-head">
+      <strong>需要人工检查：${total} 条${shown < total ? `（当前显示前 ${shown} 条）` : ""}</strong>
+      <span>此区域只展示问题，不提供任何自动重试 / 自动恢复 / 自动删除按钮。</span>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table repost-health-table">
+        <thead><tr>
+          <th>状态</th>
+          <th>我的转发</th>
+          <th>原动态</th>
+          <th>说明 / 错误</th>
+          <th>时间</th>
+        </tr></thead>
+        <tbody>${rows || '<tr class="empty-row"><td colspan="5">—</td></tr>'}</tbody>
+      </table>
+    </div>`;
+}
+
+export function renderHealth(data: RepostHealthResponse): void {
+  const status = String(data?.status || "normal");
+  if (repostHealthPill) {
+    repostHealthPill.textContent = sanitizeUserText(data?.status_text || "维护状态正常");
+    repostHealthPill.dataset.tone = healthStatusTone(status);
+  }
+  const counts = data?.counts || {};
+  setHealthNumber(repostHealthAll, counts?.all_total);
+  setHealthNumber(repostHealthExisting, counts?.history_total);
+  setHealthNumber(repostHealthDeleted, counts?.deleted);
+  setHealthNumber(repostHealthPending, counts?.delete_pending);
+  setHealthNumber(repostHealthFailed, counts?.delete_failed);
+  setHealthNumber(repostHealthUnknown, counts?.unknown);
+  if (repostHealthLines) {
+    const maintenance = data?.maintenance || {};
+    const enabled = Boolean(maintenance.enabled);
+    const intervalHours = Math.max(1, Number(maintenance.interval_hours) || 2);
+    const toggleLine = enabled
+      ? `自动维护：开启（每 ${intervalHours} 小时一次；只同步与评估，从不自动删除）`
+      : "自动维护：关闭（不会自动联网）";
+    const checks = Array.isArray(data?.checks) ? data.checks : [];
+    const lines = [
+      { tone: "info", text: toggleLine },
+      ...checks.map((check) => ({ tone: healthLineTone(check?.tone), text: String(check?.text || "") })),
+    ].filter((line) => line.text);
+    repostHealthLines.innerHTML = lines.map((line) =>
+      `<p class="repost-health-line is-${line.tone}"><span class="repost-health-dot" aria-hidden="true"></span>${escapeHtml(line.text)}</p>`,
+    ).join("");
+  }
+  renderHealthIssues(data);
+}
+
+export async function loadRepostHealth(): Promise<void> {
+  let data: RepostHealthResponse;
+  try {
+    data = await fetchJSON<RepostHealthResponse>("/api/repost-cleanup/health");
+  } catch (error) {
+    const message = sanitizeUserText(error instanceof Error ? error.message : String(error));
+    if (repostHealthLines) {
+      repostHealthLines.innerHTML = `<p class="repost-health-line is-error">维护状态读取失败：${escapeHtml(message || "未知错误")}</p>`;
+    }
+    return;
+  }
+  renderHealth(data || {});
 }
 
 export async function deferCandidate(repostId: string): Promise<void> {
@@ -787,55 +992,65 @@ export async function deleteSelectedReposts(): Promise<void> {
   }
 }
 
+async function restoreAccountAfterCleanupDelete(): Promise<void> {
+  // 优先用本地 runtime 账号快照恢复登录 UI（0 远程）；没有快照时才回退到账号 API。
+  if (restoreAccountViewsFromSnapshot()) return;
+  await loadAccount().catch(() => {});
+}
+
 export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<void> {
   if (!job || (job.state !== "success" && job.state !== "error" && job.state !== "cancelled")) return;
-  if (repostStopBtn instanceof HTMLButtonElement) repostStopBtn.disabled = true;
-  // 全局任务管理器不会盲目重新启用 data-job-control；按本页选择状态恢复。
-  renderSelectionState();
-  if (job.action === "sync_repost_history") {
-    if (job.state === "success") {
-      const result = (job.result || {}) as Record<string, unknown>;
-      const reconciliation = (result.guard_reconciliation || {}) as Record<string, unknown>;
-      const resolved = Number(reconciliation.resolved) || 0;
-      const resolvedText = resolved > 0
-        ? `，已根据本地转发历史自动确认 ${resolved} 条历史参与记录`
-        : "";
-      showToast("转发历史同步完成", "success", `本次导入 ${Number(result.imported_count) || 0} 条${resolvedText}`);
-      await loadRepostHistory(1).catch(() => {});
-    }
-    return;
-  }
-  if (job.action === "scan_expired_reposts") {
-    // 无论成功 / 失败 / 被用户停止，都从本地库重建最终状态，避免 UI 滞后。
-    await loadPersistedCandidates().catch(() => {});
-    if (job.state === "success") {
-      const result = (job.result || {}) as Record<string, unknown>;
-      const message = String(result.message || "历史抽奖评估完成");
-      if (result.rate_limited) {
-        showToast("智能评估提前停止", "info", "本次智能评估因平台限制提前停止，已完成结果已经保存，请稍后再继续。");
-      } else {
-        showToast("智能评估完成", "success", message);
+  try {
+    // 全局任务管理器不会盲目重新启用 data-job-control；按本页选择状态恢复。
+    renderSelectionState();
+    if (job.action === "sync_repost_history") {
+      if (job.state === "success") {
+        const result = (job.result || {}) as Record<string, unknown>;
+        const reconciliation = (result.guard_reconciliation || {}) as Record<string, unknown>;
+        const resolved = Number(reconciliation.resolved) || 0;
+        const resolvedText = resolved > 0
+          ? `，已根据本地转发历史自动确认 ${resolved} 条历史参与记录`
+          : "";
+        showToast("转发历史同步完成", "success", `本次导入 ${Number(result.imported_count) || 0} 条${resolvedText}`);
+        await loadRepostHistory(1).catch(() => {});
+        await loadRepostHealth().catch(() => {});
       }
-    } else if (job.state === "cancelled") {
-      showToast("智能评估已停止", "info", "已保存本次已完成结果，未完成部分将在下次继续。");
+    } else if (job.action === "scan_expired_reposts") {
+      // 无论成功 / 失败 / 被用户停止，都从本地库重建最终状态，避免 UI 滞后。
+      await loadPersistedCandidates().catch(() => {});
+      await loadRepostHealth().catch(() => {});
+      if (job.state === "success") {
+        const result = (job.result || {}) as Record<string, unknown>;
+        const message = String(result.message || "历史抽奖评估完成");
+        if (result.rate_limited) {
+          showToast("智能评估提前停止", "info", "本次智能评估因平台限制提前停止，已完成结果已经保存，请稍后再继续。");
+        } else {
+          showToast("智能评估完成", "success", message);
+        }
+      } else if (job.state === "cancelled") {
+        showToast("智能评估已停止", "info", "已保存本次已完成结果，未完成部分将在下次继续。");
+      }
+    } else if (job.action === "delete_expired_reposts") {
+      applyDeleteCompletion(job);
+      if (repostDeleteProgress) {
+        const result = deleteJobResult(job);
+        const deleted = Number(result.deleted_count) || 0;
+        const failed = Number(result.failed_count) || 0;
+        const unknown = Number(result.unknown_count) || 0;
+        const skipped = Number(result.skipped_count) || 0;
+        const riskStopped = Boolean((job.result as Record<string, unknown> | undefined)?.rate_limited);
+        repostDeleteProgress.textContent = riskStopped
+          ? `平台限制，本批次已提前停止。已删除 ${deleted} · 失败 ${failed} · 结果未知 ${unknown} · 剩余未执行 ${skipped}。已经完成的结果已保存，剩余项目未执行。`
+          : `本次删除：已删除 ${deleted} · 明确失败 ${failed} · 结果未知 ${unknown} · 未执行 ${skipped}`;
+      }
+      await loadRepostHistory(historyPage).catch(() => {});
+      await loadPersistedCandidates().catch(() => {});
+      await loadRepostHealth().catch(() => {});
+      // 删除任意终态后恢复账号登录 UI（本地快照，0 远程，无需 F5）。
+      await restoreAccountAfterCleanupDelete();
     }
-    return;
-  }
-  if (job.action === "delete_expired_reposts") {
-    applyDeleteCompletion(job);
-    if (repostDeleteProgress) {
-      const result = deleteJobResult(job);
-      const deleted = Number(result.deleted_count) || 0;
-      const failed = Number(result.failed_count) || 0;
-      const unknown = Number(result.unknown_count) || 0;
-      const skipped = Number(result.skipped_count) || 0;
-      const riskStopped = Boolean((job.result as Record<string, unknown> | undefined)?.rate_limited);
-      repostDeleteProgress.textContent = riskStopped
-        ? `平台限制，本批次已提前停止。已删除 ${deleted} · 失败 ${failed} · 结果未知 ${unknown} · 剩余未执行 ${skipped}。已经完成的结果已保存，剩余项目未执行。`
-        : `本次删除：已删除 ${deleted} · 明确失败 ${failed} · 结果未知 ${unknown} · 未执行 ${skipped}`;
-    }
-    await loadRepostHistory(historyPage).catch(() => {});
-    await loadPersistedCandidates().catch(() => {});
+  } finally {
+    refreshCleanupJobControls();
   }
 }
 
@@ -879,9 +1094,158 @@ async function handlePaginationClick(event: Event): Promise<void> {
   });
 }
 
+type CleanupStartAction = "sync_repost_history" | "scan_expired_reposts";
+
+const CLEANUP_ACTION_LABELS: Record<CleanupStartAction, string> = {
+  sync_repost_history: "同步我的转发历史",
+  scan_expired_reposts: "一键智能评估",
+};
+const CLEANUP_ACTION_STARTING: Record<CleanupStartAction, string> = {
+  sync_repost_history: "正在启动同步任务…",
+  scan_expired_reposts: "正在启动智能评估…",
+};
+
+let cleanupStartBusy: CleanupStartAction | "" = "";
+let cleanupStopBusy = false;
+
+function cleanupRunningJob(): JobStatus | null {
+  const job = state.currentJob || null;
+  return job && job.state === "running" ? job : null;
+}
+
+function cleanupCancellableJob(): JobStatus | null {
+  const job = cleanupRunningJob();
+  if (!job) return null;
+  return job.action === "sync_repost_history" || job.action === "scan_expired_reposts" ? job : null;
+}
+
+function waitForNextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => resolve());
+    } else {
+      window.setTimeout(resolve, 0);
+    }
+  });
+}
+
+function setRepostStartButtonsDisabled(disabled: boolean): void {
+  const sync = document.getElementById("repost-sync-btn");
+  const scan = document.getElementById("repost-scan-btn");
+  if (sync instanceof HTMLButtonElement) sync.disabled = disabled;
+  if (scan instanceof HTMLButtonElement) scan.disabled = disabled;
+}
+
+function setRepostStopDisabled(disabled: boolean): void {
+  if (repostStopBtn instanceof HTMLButtonElement) repostStopBtn.disabled = disabled;
+}
+
+function refreshCleanupJobControls(): void {
+  const anyRunning = cleanupRunningJob() !== null;
+  const cancellable = cleanupCancellableJob() !== null;
+  const startsLocked = cleanupStartBusy !== "" || anyRunning || cleanupStopBusy;
+  setRepostStartButtonsDisabled(startsLocked);
+  setRepostStopDisabled(!cancellable || cleanupStopBusy);
+}
+
+function resetStartingJobView(): void {
+  updateJobUI({
+    id: null,
+    state: "idle",
+    action: "",
+    label: "",
+    source: "ui",
+    message: "任务未启动",
+    log: "",
+    progress_step: 0,
+    progress_total: 0,
+  });
+}
+
+async function requestCleanupStart(
+  action: CleanupStartAction,
+  params: Record<string, unknown> = {},
+): Promise<void> {
+  if (cleanupStartBusy !== "") return;
+  if (cleanupStopBusy || cleanupRunningJob()) {
+    showToast("已有任务正在运行", "info", "请等待当前任务结束后再试。");
+    refreshCleanupJobControls();
+    return;
+  }
+  if (!requireSetup(action)) return;
+
+  // 同步置锁并立即绘制 loading / 弹窗 / disabled，再发后端请求。
+  cleanupStartBusy = action;
+  if (action === "scan_expired_reposts") {
+    setCandidates([]);
+    if (repostEvalStatus) repostEvalStatus.textContent = "智能评估进行中…";
+    if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行分批评估历史抽奖…";
+  }
+  refreshCleanupJobControls();
+  updateJobUI({
+    id: null,
+    state: "running",
+    action,
+    label: CLEANUP_ACTION_LABELS[action],
+    source: "ui",
+    message: CLEANUP_ACTION_STARTING[action],
+    progress_message: CLEANUP_ACTION_STARTING[action],
+    log: "",
+    progress_step: 0,
+    progress_total: 0,
+  });
+  await waitForNextFrame();
+  try {
+    await startJob(action, params);
+  } catch (error) {
+    notifyJobStartError(error, action, params);
+  } finally {
+    cleanupStartBusy = "";
+    const settledJob = state.currentJob || null;
+    if (!settledJob || settledJob.state === "idle") {
+      resetStartingJobView();
+    }
+    refreshCleanupJobControls();
+  }
+}
+
+async function requestCleanupStop(): Promise<void> {
+  if (cleanupStopBusy) return;
+  const job = cleanupCancellableJob();
+  if (!job) {
+    showToast("当前没有可停止的同步 / 评估任务", "info");
+    refreshCleanupJobControls();
+    return;
+  }
+  cleanupStopBusy = true;
+  refreshCleanupJobControls();
+  updateJobUI({ ...job, message: "正在停止…", progress_message: "正在停止…" });
+  await waitForNextFrame();
+  try {
+    await fetchJSON("/api/jobs/cancel", { method: "POST" });
+    showToast("停止请求已发送", "info", "任务将在当前步骤安全结束后停止，已完成结果会保留。");
+  } catch (error) {
+    const message = sanitizeUserText(error instanceof Error ? error.message : String(error));
+    if (message.includes("没有可取消") || message.includes("当前没有可取消")) {
+      showToast("当前任务已结束", "info");
+    } else {
+      showToast(message || "停止评估失败", "error");
+    }
+  } finally {
+    cleanupStopBusy = false;
+    refreshCleanupJobControls();
+  }
+}
+
 export function bindRepostCleanup(): void {
   if (bound) return;
   bound = true;
+  // 同步 / 评估按钮由本页自管（立即 loading、逻辑锁、即时反馈）；
+  // 标记 dataset.bound 避免全局 bindActionButtons 再绑一次造成重复提交。
+  const syncStartBtn = document.getElementById("repost-sync-btn");
+  const scanStartBtn = document.getElementById("repost-scan-btn");
+  if (syncStartBtn) syncStartBtn.dataset.bound = "true";
+  if (scanStartBtn) scanStartBtn.dataset.bound = "true";
   repostCandidatesBody?.addEventListener("change", handleCandidateChange);
   repostCandidatesBody?.addEventListener("click", (event) => {
     const target = event.target as Element | null;
@@ -917,6 +1281,17 @@ export function bindRepostCleanup(): void {
       }
     }
   });
+  repostHealthIssues?.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    const copyButton = target?.closest<HTMLButtonElement>("[data-repost-copy]");
+    if (!copyButton) return;
+    const value = String(copyButton.dataset.repostCopy || "").trim();
+    if (!value) return;
+    navigator.clipboard?.writeText(value).then(
+      () => showToast("已复制", "success", value),
+      () => showToast("复制失败", "error"),
+    );
+  });
   repostSelectPageBtn?.addEventListener("click", selectFilteredResults);
   repostClearSelectionBtn?.addEventListener("click", clearCandidateSelection);
   repostSearchInput?.addEventListener("input", () => {
@@ -934,15 +1309,14 @@ export function bindRepostCleanup(): void {
       notifyJobStartError(error, "delete_expired_reposts", {});
     });
   });
-  repostStopBtn?.addEventListener("click", async () => {
-    try {
-      await fetchJSON("/api/jobs/cancel", { method: "POST" });
-    } catch (error) {
-      showToast(
-        sanitizeUserText(error instanceof Error ? error.message : String(error)) || "停止评估失败",
-        "error",
-      );
-    }
+  repostStopBtn?.addEventListener("click", () => {
+    requestCleanupStop().catch(() => {});
+  });
+  document.getElementById("repost-sync-btn")?.addEventListener("click", () => {
+    requestCleanupStart("sync_repost_history").catch(() => {});
+  });
+  document.getElementById("repost-scan-btn")?.addEventListener("click", () => {
+    requestCleanupStart("scan_expired_reposts").catch(() => {});
   });
   repostCandidatePagination?.addEventListener("click", handlePaginationClick);
   repostHistoryPagination?.addEventListener("click", handlePaginationClick);
@@ -959,17 +1333,11 @@ export function bindRepostCleanup(): void {
       renderCandidates();
     });
   });
-  document.getElementById("repost-scan-btn")?.addEventListener("click", () => {
-    // 旧候选可能已过期；每次开始重新扫描即清空，只有本轮成功结果可重新出现。
-    setCandidates([]);
-    if (repostStopBtn instanceof HTMLButtonElement) repostStopBtn.disabled = false;
-    if (repostEvalStatus) repostEvalStatus.textContent = "智能评估进行中：正在本地评估…";
-    if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行分批评估历史抽奖…";
-  });
   window.addEventListener("binggo:section-activated", ((event: CustomEvent<{ sectionId?: string }>) => {
     if (event.detail?.sectionId !== "repost-cleanup") return;
     loadRepostHistory(historyPage).catch(() => {});
     loadPersistedCandidates().catch(() => {});
+    loadRepostHealth().catch(() => {});
   }) as EventListener);
   window.addEventListener("binggo:job-completed", ((event: CustomEvent<JobStatus>) => {
     handleRepostCleanupJobCompletion(event.detail).catch((error) => {
@@ -986,6 +1354,7 @@ export function bindRepostCleanup(): void {
       : "删除任务已提交，正在等待结果…";
   }) as EventListener);
   renderCandidates();
+  refreshCleanupJobControls();
 }
 
 // Exported for focused UI tests; production actions still flow through the normal Job API.

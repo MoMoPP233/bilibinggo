@@ -357,3 +357,67 @@ def test_v9_to_v10_backfills_risk_pause_columns(isolated_home) -> None:
             "SELECT sync_needed, maintenance_risk_paused FROM repost_sync_checkpoint"
         ).one()
         assert row == (0, 0)
+
+
+def test_v9_to_v10_chain_preserves_dirty_risk_tombstone_and_is_uid_scoped(
+    isolated_home,
+) -> None:
+    """显式 v9→v10 链式迁移：sync_needed / tombstone 保留，重复 initialize 不清空 risk pause。"""
+    with get_engine().begin() as conn:
+        conn.exec_driver_sql("DROP TABLE repost_sync_checkpoint")
+        conn.exec_driver_sql(
+            "CREATE TABLE repost_sync_checkpoint ("
+            "uid VARCHAR(64) NOT NULL PRIMARY KEY, "
+            "head_dynamic_id VARCHAR(32), head_published_at INTEGER, "
+            "full_scan_completed BOOLEAN NOT NULL, last_synced_at INTEGER, "
+            "sync_needed BOOLEAN NOT NULL DEFAULT 0, sync_needed_at INTEGER, "
+            "updated_at INTEGER NOT NULL, "
+            "CONSTRAINT ck_repost_sync_checkpoint_completed "
+            "CHECK (full_scan_completed IN (0,1)))"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO repost_sync_checkpoint(uid,full_scan_completed,sync_needed,"
+            "sync_needed_at,updated_at) VALUES ('123',1,1,50,50)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO repost_sync_checkpoint(uid,full_scan_completed,sync_needed,"
+            "updated_at) VALUES ('54321',1,0,60)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO repost_history(uid,repost_dynamic_id,original_dynamic_id,reposted_at,"
+            "source,delete_status,deleted_at,updated_at) "
+            "VALUES ('123','2000000000000000009','1000000000000000009',90,"
+            "'history_import','deleted',90,90)"
+        )
+        conn.exec_driver_sql("UPDATE schema_meta SET version=9 WHERE id=1")
+
+    schema.init_db()
+    schema.init_db()
+
+    with get_engine().connect() as conn:
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
+        row = conn.exec_driver_sql(
+            "SELECT sync_needed, sync_needed_at, maintenance_risk_paused "
+            "FROM repost_sync_checkpoint WHERE uid='123'"
+        ).one()
+        assert row == (1, 50, 0)
+        assert conn.exec_driver_sql(
+            "SELECT sync_needed FROM repost_sync_checkpoint WHERE uid='54321'"
+        ).scalar_one() == 0
+        # deleted tombstone 保留，不会被重置为 active。
+        assert conn.exec_driver_sql(
+            "SELECT delete_status FROM repost_history "
+            "WHERE uid='123' AND repost_dynamic_id='2000000000000000009'"
+        ).scalar_one() == "deleted"
+
+    # v10 上再 initialize：已经持久化的 risk pause 不能被清掉。
+    with get_engine().begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE repost_sync_checkpoint SET maintenance_risk_paused=1, "
+            "maintenance_risk_paused_at=99, maintenance_risk_reason='风控暂停' WHERE uid='123'"
+        )
+    schema.init_db()
+    with get_engine().connect() as conn:
+        assert conn.exec_driver_sql(
+            "SELECT maintenance_risk_paused FROM repost_sync_checkpoint WHERE uid='123'"
+        ).scalar_one() == 1
