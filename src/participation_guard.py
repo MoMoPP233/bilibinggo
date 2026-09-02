@@ -10,16 +10,22 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.dialects.sqlite import insert
-from sqlmodel import select
+from sqlmodel import Session, select
 
+from src.app_logging import get_logger
 from src.db.engine import db_path
-from src.db.models import ParticipationGuardRow
+from src.db.models import ParticipationGuardRow, RepostHistoryRow
 from src.db.session import session_scope
+
+logger = get_logger("guard")
 
 REPOST_STATUSES = frozenset({"pending", "confirmed", "unknown", "suspected"})
 BLOCKED_REPOST_STATUSES = frozenset({"pending", "unknown", "suspected"})
+TRUSTED_HISTORY_IDENTITY_SOURCES = frozenset(
+    {"space_feed", "legacy_space_feed", "remote_detail"}
+)
 
 
 @dataclass(frozen=True)
@@ -82,16 +88,34 @@ def record_pending(uid: str, dynamic_id: str) -> None:
 
 def confirm_repost(uid: str, dynamic_id: str) -> None:
     uid, dynamic_id = _key(uid, dynamic_id)
+    confirmed_at = int(time.time())
     with session_scope() as session:
-        session.execute(
+        result = session.execute(
             insert(ParticipationGuardRow)
-            .values(uid=uid, dynamic_id=dynamic_id, repost_status="confirmed", updated_at=int(time.time()))
+            .values(
+                uid=uid,
+                dynamic_id=dynamic_id,
+                repost_status="confirmed",
+                updated_at=confirmed_at,
+            )
             .on_conflict_do_update(
                 index_elements=["uid", "dynamic_id"],
-                set_={"repost_status": "confirmed", "updated_at": int(time.time())},
+                set_={"repost_status": "confirmed", "updated_at": confirmed_at},
                 where=ParticipationGuardRow.repost_status != "confirmed",
             )
         )
+        newly_confirmed = result.rowcount == 1
+    # 只有 confirmed 才标记“个人空间增量同步待执行”；pending/unknown/suspected 不标记。
+    # 已经是 confirmed 的幂等重复调用不是新的转发事件，不刷新 dirty 水位。
+    # 真实 Bilibili UID 均为数字；非数字 uid（测试/异常数据）不进入转发账本维护。
+    # 维护标记是 best-effort：任何失败都不能影响参与确认（guard 已先落库）。
+    try:
+        from src.repost_history import mark_sync_needed
+
+        if newly_confirmed and str(uid).isdigit():
+            mark_sync_needed(uid, occurred_at=confirmed_at)
+    except Exception:
+        logger.exception("标记转发历史待同步失败（不影响参与确认）")
 
 
 def mark_repost_unknown(uid: str, dynamic_id: str) -> None:
@@ -129,6 +153,107 @@ def load_blocked_guard_ids(uid: str) -> set[str]:
             record.dynamic_id for row in rows
             if (record := _record(row)).repost_status in BLOCKED_REPOST_STATUSES
         }
+
+
+def list_confirmed_guards(uid: str) -> list[ParticipationGuardRecord]:
+    """只读列出当前 UID 已 confirmed 的转发保护记录（含 confirmed 写入时间 updated_at）。"""
+    uid, _ = _key(uid, "listing")
+    with session_scope() as session:
+        rows = session.exec(
+            select(ParticipationGuardRow)
+            .where(
+                ParticipationGuardRow.uid == uid,
+                ParticipationGuardRow.repost_status == "confirmed",
+            )
+        ).all()
+        return [_record(row) for row in rows]
+
+
+def _trusted_history_original_ids(session: Session, uid: str) -> set[str]:
+    rows = session.exec(
+        select(RepostHistoryRow.original_dynamic_id)
+        .where(
+            RepostHistoryRow.uid == uid,
+            RepostHistoryRow.identity_ok.is_(True),
+            RepostHistoryRow.identity_source.in_(TRUSTED_HISTORY_IDENTITY_SOURCES),
+        )
+        .distinct()
+    ).all()
+    return {str(dynamic_id) for dynamic_id in rows}
+
+
+def list_confirmed_guards_needing_history_sync(
+    uid: str,
+) -> list[ParticipationGuardRecord]:
+    """只列出尚无可信本地 history 证明的 confirmed guard。"""
+    uid, _ = _key(uid, "listing")
+    with session_scope() as session:
+        proven_ids = _trusted_history_original_ids(session, uid)
+        rows = session.exec(
+            select(ParticipationGuardRow)
+            .where(
+                ParticipationGuardRow.uid == uid,
+                ParticipationGuardRow.repost_status == "confirmed",
+            )
+        ).all()
+        return [
+            _record(row) for row in rows
+            if row.dynamic_id not in proven_ids
+        ]
+
+
+def reconcile_uncertain_guards_from_history(
+    uid: str,
+    *,
+    reconciled_at: int | None = None,
+) -> dict[str, int]:
+    """用当前 UID 的可信转发账本单向确认 uncertain guard；全程纯本地。"""
+    uid, _ = _key(uid, "listing")
+    now = int(time.time()) if reconciled_at is None else int(reconciled_at)
+    if now <= 0:
+        raise ValueError("历史参与确认时间无效")
+    with session_scope() as session:
+        checked = int(
+            session.exec(
+                select(func.count())
+                .select_from(ParticipationGuardRow)
+                .where(
+                    ParticipationGuardRow.uid == uid,
+                    ParticipationGuardRow.repost_status.in_(BLOCKED_REPOST_STATUSES),
+                )
+            ).one()
+        )
+        resolved = 0
+        trusted_originals = (
+            select(RepostHistoryRow.original_dynamic_id)
+            .where(
+                RepostHistoryRow.uid == uid,
+                RepostHistoryRow.identity_ok.is_(True),
+                RepostHistoryRow.identity_source.in_(TRUSTED_HISTORY_IDENTITY_SOURCES),
+            )
+            .distinct()
+        )
+        result = session.execute(
+            update(ParticipationGuardRow)
+            .where(
+                ParticipationGuardRow.uid == uid,
+                ParticipationGuardRow.repost_status.in_(BLOCKED_REPOST_STATUSES),
+                ParticipationGuardRow.dynamic_id.in_(trusted_originals),
+            )
+            .values(repost_status="confirmed", updated_at=now)
+        )
+        resolved = int(result.rowcount or 0)
+        remaining = int(
+            session.exec(
+                select(func.count())
+                .select_from(ParticipationGuardRow)
+                .where(
+                    ParticipationGuardRow.uid == uid,
+                    ParticipationGuardRow.repost_status.in_(BLOCKED_REPOST_STATUSES),
+                )
+            ).one()
+        )
+    return {"checked": checked, "resolved": resolved, "remaining": remaining}
 
 
 @contextmanager

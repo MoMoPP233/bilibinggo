@@ -27,15 +27,36 @@ def _bind_resolve(runner: MagicMock, status_factory) -> None:
     runner.resolve_job_status.side_effect = resolve
 
 
-def test_allowed_actions_are_exactly_four() -> None:
+def test_allowed_actions_include_cleanup_maintain() -> None:
     assert ALLOWED_CLICK_ACTIONS == frozenset(
         {
             "refresh_all",
             "refresh_watch",
             "refresh_status",
             "participate_triple",
+            "cleanup_auto_maintain",
         }
     )
+
+
+def test_cleanup_maintain_defaults_off() -> None:
+    from web.auto_config import cleanup_maintain_enabled
+
+    assert cleanup_maintain_enabled() is False
+
+
+def test_cleanup_maintenance_paused_tick_never_starts_remote_job(monkeypatch) -> None:
+    runner = MagicMock()
+    scheduler = AutoScheduler(job_runner=runner)
+    monkeypatch.setattr(
+        "src.repost_cleanup.auto_maintenance_paused_state",
+        lambda: (True, "-352 风控暂停"),
+    )
+
+    scheduler._run_maintenance("2026-09-02-maintain")
+
+    runner.try_start.assert_not_called()
+    assert "2026-09-02-maintain" in scheduler._done_maintain
 
 
 def test_click_rejects_forbidden_action() -> None:

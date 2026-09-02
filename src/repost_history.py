@@ -68,6 +68,11 @@ class RepostSyncCheckpoint:
     full_scan_completed: bool
     last_synced_at: int | None
     updated_at: int
+    sync_needed: bool = False
+    sync_needed_at: int | None = None
+    maintenance_risk_paused: bool = False
+    maintenance_risk_paused_at: int | None = None
+    maintenance_risk_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +179,11 @@ def _checkpoint(row: RepostSyncCheckpointRow) -> RepostSyncCheckpoint:
         full_scan_completed=bool(row.full_scan_completed),
         last_synced_at=row.last_synced_at,
         updated_at=row.updated_at,
+        sync_needed=bool(row.sync_needed),
+        sync_needed_at=row.sync_needed_at,
+        maintenance_risk_paused=bool(row.maintenance_risk_paused),
+        maintenance_risk_paused_at=row.maintenance_risk_paused_at,
+        maintenance_risk_reason=row.maintenance_risk_reason,
     )
 
 
@@ -399,6 +409,146 @@ def save_checkpoint(
     if checkpoint is None:
         raise RuntimeError("转发历史扫描锚点保存结果无法确认")
     return checkpoint
+
+
+def mark_sync_needed(
+    uid: str,
+    *,
+    occurred_at: int | None = None,
+    at: int | None = None,
+) -> None:
+    """记录新的 confirmed repost，并推进可用于 CAS 的单调 dirty 水位。"""
+    scoped_uid = _uid(uid)
+    if occurred_at is not None and at is not None:
+        raise ValueError("转发确认时间不能重复指定")
+    event_time = occurred_at if occurred_at is not None else at
+    now = int(time.time()) if event_time is None else int(
+        _timestamp(event_time, label="转发确认时间")
+    )
+    with session_scope() as session:
+        row = session.get(RepostSyncCheckpointRow, scoped_uid)
+        if row is None:
+            session.add(
+                RepostSyncCheckpointRow(
+                    uid=scoped_uid,
+                    full_scan_completed=False,
+                    sync_needed=True,
+                    sync_needed_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            # 秒级 confirmed 可能同秒发生。水位至少递增 1，确保同步期间的真实
+            # 新事件一定改变 CAS token；它是单调事件水位，不承诺是精确展示时间。
+            previous = int(row.sync_needed_at or 0)
+            row.sync_needed = True
+            row.sync_needed_at = max(now, previous + 1)
+            row.updated_at = max(now, int(row.updated_at or 0))
+
+
+def clear_sync_needed_if_unchanged(
+    uid: str,
+    *,
+    expected_sync_needed_at: int | None,
+    at: int | None = None,
+) -> bool:
+    """仅当 dirty 水位仍等于同步开始快照时清除，避免吞掉并发新事件。"""
+    scoped_uid = _uid(uid)
+    now = int(time.time()) if at is None else int(_timestamp(at, label="同步完成时间"))
+    conditions = [
+        RepostSyncCheckpointRow.uid == scoped_uid,
+        RepostSyncCheckpointRow.sync_needed.is_(True),
+    ]
+    if expected_sync_needed_at is None:
+        conditions.append(RepostSyncCheckpointRow.sync_needed_at.is_(None))
+    else:
+        expected = int(_timestamp(expected_sync_needed_at, label="待同步水位"))
+        conditions.append(RepostSyncCheckpointRow.sync_needed_at == expected)
+    with session_scope() as session:
+        result = session.execute(
+            update(RepostSyncCheckpointRow)
+            .where(*conditions)
+            .values(sync_needed=False, sync_needed_at=None, updated_at=now)
+        )
+        return result.rowcount == 1
+
+
+def clear_sync_needed(uid: str, *, at: int | None = None) -> None:
+    """无条件清除标记，仅保留给已知不存在并发同步者的兼容场景。"""
+    scoped_uid = _uid(uid)
+    now = int(time.time()) if at is None else int(_timestamp(at, label="同步时间"))
+    with session_scope() as session:
+        row = session.get(RepostSyncCheckpointRow, scoped_uid)
+        if row is None:
+            session.add(
+                RepostSyncCheckpointRow(
+                    uid=scoped_uid,
+                    full_scan_completed=False,
+                    sync_needed=False,
+                    sync_needed_at=None,
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            row.sync_needed = False
+            row.sync_needed_at = None
+            row.last_synced_at = now
+            row.updated_at = now
+
+
+def pause_maintenance_risk(
+    uid: str,
+    reason: str,
+    *,
+    at: int | None = None,
+) -> None:
+    """持久化“自动维护因平台风控暂停”：只能由用户手动恢复。"""
+    scoped_uid = _uid(uid)
+    now = int(time.time()) if at is None else int(_timestamp(at, label="暂停时间"))
+    normalized_reason = _optional_text(reason, max_length=512)
+    with session_scope() as session:
+        row = session.get(RepostSyncCheckpointRow, scoped_uid)
+        if row is None:
+            session.add(
+                RepostSyncCheckpointRow(
+                    uid=scoped_uid,
+                    full_scan_completed=False,
+                    maintenance_risk_paused=True,
+                    maintenance_risk_paused_at=now,
+                    maintenance_risk_reason=normalized_reason,
+                    updated_at=now,
+                )
+            )
+        else:
+            row.maintenance_risk_paused = True
+            row.maintenance_risk_paused_at = now
+            row.maintenance_risk_reason = normalized_reason
+            row.updated_at = now
+
+
+def clear_maintenance_risk(uid: str, *, at: int | None = None) -> None:
+    """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
+    scoped_uid = _uid(uid)
+    now = int(time.time()) if at is None else int(_timestamp(at, label="恢复时间"))
+    with session_scope() as session:
+        row = session.get(RepostSyncCheckpointRow, scoped_uid)
+        if row is None:
+            session.add(
+                RepostSyncCheckpointRow(
+                    uid=scoped_uid,
+                    full_scan_completed=False,
+                    maintenance_risk_paused=False,
+                    maintenance_risk_paused_at=None,
+                    maintenance_risk_reason=None,
+                    updated_at=now,
+                )
+            )
+        else:
+            row.maintenance_risk_paused = False
+            row.maintenance_risk_paused_at = None
+            row.maintenance_risk_reason = None
+            row.updated_at = now
 
 
 def claim_delete_pending(

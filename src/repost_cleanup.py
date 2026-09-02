@@ -22,11 +22,17 @@ from src.data_paths import get_runtime_profile_id
 from src.db.engine import db_path
 from src.lottery_api import DYNAMIC_DETAIL_URL, LOTTERY_NOTICE_URL
 from src.lottery_classifier import is_charging_lottery_activity
-from src.participation_guard import get_guard
+from src.participation_guard import (
+    get_guard,
+    list_confirmed_guards_needing_history_sync,
+    reconcile_uncertain_guards_from_history,
+)
 from src.participation_store import get_participation
 from src.pipeline.classify_step import ClassifyOutcome, classify_for_cleanup
 from src.repost_history import (
     claim_delete_pending,
+    clear_maintenance_risk,
+    clear_sync_needed_if_unchanged,
     defer_repost,
     get_checkpoint,
     get_repost,
@@ -36,6 +42,7 @@ from src.repost_history import (
     list_reposts_by_originals,
     list_repost_assessments,
     mark_delete_result,
+    pause_maintenance_risk,
     remove_repost_assessment,
     restore_repost,
     save_checkpoint,
@@ -60,6 +67,7 @@ ELIGIBLE_BUSINESS_TYPES = {"互动抽奖": 1, "预约抽奖": 10}
 ASSESSMENT_BUDGET_PER_ROUND = 40
 MAX_IDENTITY_CHECKS_PER_ROUND = 20
 MAX_ASSESSMENTS_PER_JOB = 120
+AUTO_ASSESSMENT_BUDGET = 20
 MANUAL_REVIEW_DEFER_SECONDS = 30 * 24 * 60 * 60
 CONSECUTIVE_FAILURE_LIMIT = 3
 MAX_DELETE_BATCH = 20
@@ -169,8 +177,12 @@ def _require_verified_login(client: BilibiliClient) -> tuple[str, int]:
         payload = client.request_json(NAV_URL, retries=0)
     except (httpx.HTTPError, RuntimeError) as exc:
         raise RuntimeError(f"无法校验当前登录账号：{exc}") from exc
-    if not isinstance(payload, dict) or api_code(payload) != 0:
-        raise RuntimeError("无法校验当前登录账号：NAV 响应异常")
+    if not isinstance(payload, dict):
+        raise RuntimeError("无法校验当前登录账号：NAV 响应格式异常")
+    code = api_code(payload)
+    if code != 0:
+        message = str(payload.get("message") or payload.get("msg") or "未知错误")
+        raise RuntimeError(f"无法校验当前登录账号：NAV API error {code}: {message}")
     data = payload.get("data")
     if not isinstance(data, dict) or data.get("isLogin") is not True:
         raise RuntimeError("当前 Cookie 未登录，不能扫描或清理转发")
@@ -194,7 +206,16 @@ def sync_repost_history(
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
 ) -> dict[str, Any]:
     """人工增量同步当前账号的个人转发历史。"""
+    sync_started_at = int(time.time())
     _check_cancel(cancel_check)
+    _, local_uid = require_login()  # 只读当前 runtime Profile Cookie，先捕获 dirty 水位。
+    initial_checkpoint = get_checkpoint(str(local_uid))
+    initial_sync_needed = bool(getattr(initial_checkpoint, "sync_needed", False))
+    consumed_sync_needed_at = (
+        getattr(initial_checkpoint, "sync_needed_at", None)
+        if initial_sync_needed
+        else None
+    )
     with client_factory() as client:
         _, uid = _require_verified_login(client)
         checkpoint = get_checkpoint(str(uid))
@@ -306,8 +327,23 @@ def sync_repost_history(
                 full_scan_completed=bool(
                     getattr(checkpoint, "full_scan_completed", False) or not old_head
                 ),
-                last_synced_at=int(time.time()),
+                # 秒级时间无法区分“同步开始”和同秒 confirmed 的先后；把覆盖水位
+                # 保守地停在开始前 1 秒，最多多补同步一次，不能永久漏同步。
+                last_synced_at=max(1, sync_started_at - 1),
             )
+
+    guard_reconciliation = {"checked": 0, "resolved": 0, "remaining": 0}
+    if completed:
+        # history 已完整落库后才允许做纯本地、单向的 uncertain → confirmed。
+        # 不调用 confirm_repost，避免把已经在 history 中的旧转发重新标成待同步。
+        guard_reconciliation = reconcile_uncertain_guards_from_history(str(uid))
+
+    dirty_cleared = False
+    if completed and initial_sync_needed:
+        dirty_cleared = clear_sync_needed_if_unchanged(
+            str(uid),
+            expected_sync_needed_at=consumed_sync_needed_at,
+        )
 
     checkpoint_payload = None
     if saved_checkpoint is not None:
@@ -324,6 +360,10 @@ def sync_repost_history(
         "full_scan_completed": bool(
             getattr(saved_checkpoint, "full_scan_completed", completed)
         ),
+        "sync_started_at": sync_started_at,
+        "consumed_sync_needed_at": consumed_sync_needed_at,
+        "sync_needed_cleared": dirty_cleared,
+        "guard_reconciliation": guard_reconciliation,
         "checkpoint": checkpoint_payload,
     }
 
@@ -420,7 +460,12 @@ def _risk_code_from_message(message: object) -> int | None:
         ("-509", -509),
         ("429", 429),
         ("too many", 429),
+        ("risk-control", -352),
+        ("risk control", -352),
+        ("rate-limit", 429),
+        ("rate limit", 429),
         ("风控", -352),
+        ("限流", 429),
     ):
         if token in lowered:
             return code
@@ -960,6 +1005,282 @@ def scan_expired_reposts(
     }
 
 
+def maintenance_risk_paused(uid: str) -> bool:
+    checkpoint = get_checkpoint(uid)
+    return bool(getattr(checkpoint, "maintenance_risk_paused", False))
+
+
+def maintenance_risk_state(uid: str) -> dict[str, Any]:
+    checkpoint = get_checkpoint(uid)
+    return {
+        "risk_paused": bool(getattr(checkpoint, "maintenance_risk_paused", False)),
+        "risk_paused_at": getattr(checkpoint, "maintenance_risk_paused_at", None),
+        "risk_reason": getattr(checkpoint, "maintenance_risk_reason", None),
+    }
+
+
+def recover_auto_maintenance(uid: str) -> None:
+    """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
+    clear_maintenance_risk(uid)
+
+
+def auto_maintenance_paused_state() -> tuple[bool, str]:
+    """只读本地 Cookie + checkpoint 判断当前 runtime Profile 是否风控暂停（0 远程）。"""
+    try:
+        _, uid_int = require_login()
+    except RuntimeError:
+        return False, ""
+    checkpoint = get_checkpoint(str(uid_int))
+    if bool(getattr(checkpoint, "maintenance_risk_paused", False)):
+        return True, str(
+            getattr(checkpoint, "maintenance_risk_reason", "") or "平台风控暂停"
+        )
+    return False, ""
+
+
+def reconciliation_needs_sync(uid: str) -> bool:
+    """纯本地最终一致性检查：是否存在“已 confirmed 但可能未被增量同步覆盖”的转发。
+
+    判定依据（只读本地库，0 远程，不修改 guard / 不参与 / 不 repost）：
+    - participation_guard.confirmed 的 updated_at 即 confirmed 写入时刻（confirmed 为终态）。
+    - repost_sync_checkpoint.last_synced_at 为最近一次成功增量同步完成时间。
+    - 若存在 confirmed 且 confirmed_at >= last_synced_at 的 guard，则秒级先后关系不确定，
+      保守地补同步一次；同步使用“开始前 1 秒”作为覆盖水位，后续成功轮次会自然闭包。
+    - 一旦后续成功同步令 last_synced_at 严格越过 confirmed_at，之后不再判定为漏同步，
+      避免“已同步的 confirmed 导致每个维护周期都重扫个人空间”。
+    - sync_needed=true 时由主路径直接同步，本检查仅在 sync_needed=false 时兜底。
+    """
+    scoped_uid = str(uid).strip()
+    checkpoint = get_checkpoint(scoped_uid)
+    if bool(getattr(checkpoint, "sync_needed", False)):
+        return False
+    last_synced_at = int(getattr(checkpoint, "last_synced_at", None) or 0)
+    confirmed = list_confirmed_guards_needing_history_sync(scoped_uid)
+    if not confirmed:
+        return False
+    return any(int(record.updated_at) >= last_synced_at for record in confirmed)
+
+
+def auto_maintain(
+    *,
+    on_progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+    now_ts: int | None = None,
+    client_factory: Callable[[], BilibiliClient] = BilibiliClient,
+) -> dict[str, Any]:
+    """低频自动维护：只做增量同步 + 保守评估，绝不删除。
+
+    0 远程快速退出：风控暂停中 或 sync_needed=false 且无待评估 original。
+    明确平台风控（-352/429/限流）→ 持久化 maintenance_risk_paused，需人工恢复。
+    普通临时错误 → 仅结束本轮，下一正常维护周期允许再试。
+    """
+    current = int(now_ts if now_ts is not None else time.time())
+    _check_cancel(cancel_check)
+    _, uid_int = require_login()  # 只读本地 Cookie，不发网络请求。
+    uid = str(uid_int)
+    checkpoint = get_checkpoint(uid)
+    sync_needed = bool(getattr(checkpoint, "sync_needed", False))
+    if bool(getattr(checkpoint, "maintenance_risk_paused", False)):
+        # 风控暂停优先级最高：即使 reconciliation 发现漏标 confirmed，也必须 0 远程退出。
+        return {
+            "uid": uid,
+            "synced": False,
+            "evaluated_originals": 0,
+            "sync_needed": sync_needed,
+            "rate_limited": False,
+            "message": "自动维护因平台限制已暂停，请稍后手动恢复。",
+            "candidates": load_persisted_candidates(uid),
+        }
+    reposts = list_evaluable_reposts(uid)
+    assessments = list_repost_assessments(uid)
+    pending = {
+        record.original_dynamic_id
+        for record in reposts
+        if record.original_dynamic_id not in assessments
+        or getattr(assessments[record.original_dynamic_id], "assessment_status", "final")
+        == "retryable_unknown"
+    }
+    reconciliation_missing = reconciliation_needs_sync(uid)
+    if not sync_needed and not pending and not reconciliation_missing:
+        return {
+            "uid": uid,
+            "synced": False,
+            "evaluated_originals": 0,
+            "sync_needed": False,
+            "rate_limited": False,
+            "message": "无新数据，本轮维护 0 远程请求",
+            "candidates": load_persisted_candidates(uid),
+        }
+
+    breaker = _AssessmentBreaker()
+    profile_id = get_runtime_profile_id()
+    database_path = str(db_path().resolve())
+    synced = False
+    guard_reconciliation = {"checked": 0, "resolved": 0, "remaining": 0}
+    should_sync = sync_needed or reconciliation_missing
+    if should_sync:
+        try:
+            # 同步阶段完整拥有并关闭自己的 client；评估阶段绝不复用该实例。
+            sync_result = sync_repost_history(
+                on_progress=on_progress,
+                cancel_check=cancel_check,
+                client_factory=client_factory,
+            )
+            raw_reconciliation = sync_result.get("guard_reconciliation")
+            if isinstance(raw_reconciliation, Mapping):
+                guard_reconciliation = {
+                    "checked": int(raw_reconciliation.get("checked") or 0),
+                    "resolved": int(raw_reconciliation.get("resolved") or 0),
+                    "remaining": int(raw_reconciliation.get("remaining") or 0),
+                }
+        except (AssessmentRateLimited, RemoteStateUnknown, RuntimeError, ValueError) as exc:
+            risk = _risk_code_from_message(exc)
+            if risk is not None:
+                breaker.rate_limited = True
+                breaker.stopped = True
+                pause_maintenance_risk(
+                    uid,
+                    f"自动维护命中平台风控（{risk}）已暂停，需人工恢复",
+                )
+                breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
+            else:
+                breaker.stop_message = (
+                    f"自动增量同步失败，保持待同步，等待下一维护周期：{exc}"
+                )
+                breaker.stopped = True
+            return {
+                "uid": uid,
+                "synced": False,
+                "evaluated_originals": 0,
+                "sync_needed": bool(getattr(get_checkpoint(uid), "sync_needed", False)),
+                "rate_limited": breaker.rate_limited,
+                "message": breaker.stop_message,
+                "candidates": load_persisted_candidates(uid),
+            }
+        synced = True
+        assessments = list_repost_assessments(uid)
+        reposts = list_evaluable_reposts(uid)
+        pending = {
+            record.original_dynamic_id
+            for record in reposts
+            if record.original_dynamic_id not in assessments
+            or getattr(assessments[record.original_dynamic_id], "assessment_status", "final")
+            == "retryable_unknown"
+        }
+
+    activities_map = {
+        str(item.get("dynamic_id") or ""): item
+        for item in load_activities()
+        if isinstance(item, dict) and item.get("dynamic_id")
+    }
+    evaluated = 0
+    ordered = sorted(pending)
+    if ordered:
+        # 评估阶段使用全新的 client。首次 NAV 也纳入明确风控持久化暂停。
+        with client_factory() as client:
+            try:
+                _require_verified_login(client)
+            except RuntimeError as exc:
+                risk = _risk_code_from_message(exc)
+                if risk is None:
+                    raise
+                breaker.rate_limited = True
+                breaker.stopped = True
+                pause_maintenance_risk(
+                    uid,
+                    f"自动维护首次账号校验命中平台风控（{risk}）已暂停，需人工恢复",
+                )
+                breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
+
+            for original_id in ordered:
+                if evaluated >= AUTO_ASSESSMENT_BUDGET or breaker.stopped:
+                    break
+                _check_cancel(cancel_check)
+                if (
+                    get_runtime_profile_id() != profile_id
+                    or str(db_path().resolve()) != database_path
+                ):
+                    breaker.stop_message = "自动维护期间运行 Profile 已变化，已停止本轮维护"
+                    breaker.stopped = True
+                    break
+                try:
+                    assessment = _assess_original(
+                        client,
+                        original_id=original_id,
+                        uid=uid,
+                        now_ts=current,
+                        activities_map=activities_map,
+                    )
+                except AssessmentRateLimited as exc:
+                    breaker.rate_limited = True
+                    breaker.stopped = True
+                    pause_maintenance_risk(
+                        uid,
+                        f"自动维护命中平台风控已暂停，需人工恢复：{exc}",
+                    )
+                    breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
+                    break
+                except RemoteStateUnknown as exc:
+                    assessment = CandidateAssessment(
+                        "blocked", f"原动态状态无法可靠判断：{exc}",
+                        "remote_unknown", classification_source="public_classifier",
+                    )
+                except RuntimeError as exc:
+                    risk = _risk_code_from_message(exc)
+                    if risk is not None:
+                        breaker.rate_limited = True
+                        breaker.stopped = True
+                        pause_maintenance_risk(
+                            uid,
+                            f"自动维护命中平台风控（{risk}）已暂停，需人工恢复",
+                        )
+                        breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
+                        break
+                    raise
+                _persist_assessment(uid, original_id, assessment)
+                evaluated += 1
+                breaker.note_success()
+                if on_progress is not None:
+                    on_progress(
+                        evaluated,
+                        min(AUTO_ASSESSMENT_BUDGET, max(1, len(ordered))),
+                        f"自动维护：评估 {evaluated}/{AUTO_ASSESSMENT_BUDGET}",
+                        f"{original_id}：{assessment.level}",
+                    )
+
+    refreshed = list_repost_assessments(uid)
+    remaining = len(
+        {
+            record.original_dynamic_id
+            for record in list_evaluable_reposts(uid)
+            if record.original_dynamic_id not in refreshed
+            or getattr(refreshed[record.original_dynamic_id], "assessment_status", "final")
+            == "retryable_unknown"
+        }
+    )
+    if breaker.stop_message:
+        message = breaker.stop_message
+    elif remaining:
+        message = f"自动维护完成：增量同步 {'成功' if synced else '无需'}，本轮评估 {evaluated} 条，仍有 {remaining} 条待评估。"
+    else:
+        message = f"自动维护完成：增量同步 {'成功' if synced else '无需'}，本轮评估 {evaluated} 条。"
+    if guard_reconciliation["resolved"]:
+        message += (
+            f" 已根据本地转发历史自动确认 "
+            f"{guard_reconciliation['resolved']} 条历史参与记录。"
+        )
+    return {
+        "uid": uid,
+        "synced": synced,
+        "evaluated_originals": evaluated,
+        "sync_needed": bool(getattr(get_checkpoint(uid), "sync_needed", False)),
+        "rate_limited": breaker.rate_limited,
+        "message": message,
+        "guard_reconciliation": guard_reconciliation,
+        "candidates": load_persisted_candidates(uid),
+    }
+
+
 def _effective_candidate_state(
     repost: object,
     assessment: Any,
@@ -1397,6 +1718,7 @@ def delete_reposts(
 
 
 __all__ = [
+    "AUTO_ASSESSMENT_BUDGET",
     "CandidateAssessment",
     "DELETE_REPOST_URL",
     "EXPIRY_BUFFER_SECONDS",
@@ -1404,6 +1726,7 @@ __all__ = [
     "MAX_ASSESSMENTS_PER_JOB",
     "MAX_DELETE_BATCH",
     "RemoteStateUnknown",
+    "auto_maintain",
     "defer_candidate",
     "delete_reposts",
     "load_persisted_candidates",

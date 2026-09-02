@@ -191,6 +191,25 @@ describe("repost cleanup UI", () => {
     expect(document.querySelectorAll("[data-repost-select]")).toHaveLength(1);
   });
 
+  it("reports guards resolved from local history after a successful sync", async () => {
+    const module = await loadModule();
+
+    await module.handleRepostCleanupJobCompletion({
+      action: "sync_repost_history",
+      state: "success",
+      result: {
+        imported_count: 12,
+        guard_reconciliation: { checked: 300, resolved: 287, remaining: 13 },
+      },
+    });
+
+    expect(showToastMock).toHaveBeenCalledWith(
+      "转发历史同步完成",
+      "success",
+      "本次导入 12 条，已根据本地转发历史自动确认 287 条历史参与记录",
+    );
+  });
+
   it("does not retry when the delete-job request result is unknown", async () => {
     fetchJSONMock.mockRejectedValue(new TypeError("Failed to fetch"));
     const module = await loadModule();

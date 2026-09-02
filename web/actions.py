@@ -861,6 +861,29 @@ def run_action(
         imported = int(result.get("imported_count") or result.get("imported") or 0)
         discovered = int(result.get("found_reposts") or result.get("discovered") or 0)
         message = f"转发历史同步完成：发现 {discovered} 条，本次新增 {imported} 条"
+        reconciliation = result.get("guard_reconciliation")
+        resolved = (
+            int(reconciliation.get("resolved") or 0)
+            if isinstance(reconciliation, dict)
+            else 0
+        )
+        if resolved:
+            message += f"；已根据本地转发历史自动确认 {resolved} 条历史参与记录"
+        progress(step=1, total=1, message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+
+    if action == "cleanup_auto_maintain":
+        from src.repost_cleanup import auto_maintain
+
+        if params:
+            raise ValueError("自动维护不接受额外参数")
+        progress(step=0, total=1, message="正在执行清理数据自动维护…")
+        result = auto_maintain(
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        message = str(result.get("message") or "自动维护完成")
         progress(step=1, total=1, message=message, log_append=message)
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 

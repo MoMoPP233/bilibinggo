@@ -17,7 +17,7 @@ def _downgrade_fixture_to_v3() -> None:
         conn.exec_driver_sql("UPDATE schema_meta SET version=3 WHERE id=1")
 
 
-def test_v3_to_v8_is_pure_add_and_idempotent(isolated_home) -> None:
+def test_v3_to_v10_is_pure_add_and_idempotent(isolated_home) -> None:
     with get_engine().begin() as conn:
         conn.exec_driver_sql(
             "INSERT INTO participation_guard(uid,dynamic_id,repost_status,updated_at) "
@@ -33,7 +33,7 @@ def test_v3_to_v8_is_pure_add_and_idempotent(isolated_home) -> None:
     schema.init_db()
 
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
         assert conn.exec_driver_sql(
             "SELECT uid,dynamic_id,repost_status,updated_at FROM participation_guard"
         ).one() == ("123", "100", "confirmed", 10)
@@ -50,7 +50,7 @@ def test_v3_to_v8_is_pure_add_and_idempotent(isolated_home) -> None:
         ).scalar_one() == 0
 
 
-def test_v3_to_v8_interruption_rolls_back_and_can_retry(isolated_home, monkeypatch) -> None:
+def test_v3_to_v10_interruption_rolls_back_and_can_retry(isolated_home, monkeypatch) -> None:
     _downgrade_fixture_to_v3()
     migrate = schema.migrate_v3_to_v4
 
@@ -74,15 +74,15 @@ def test_v3_to_v8_interruption_rolls_back_and_can_retry(isolated_home, monkeypat
     schema.init_db()
     schema.init_db()
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
 
 
-def test_concurrent_v3_to_v8_initialization_is_serialized(isolated_home) -> None:
+def test_concurrent_v3_to_v10_initialization_is_serialized(isolated_home) -> None:
     _downgrade_fixture_to_v3()
     with ThreadPoolExecutor(max_workers=2) as executor:
         list(executor.map(lambda _: schema.init_db(), range(2)))
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
         assert conn.exec_driver_sql("SELECT count(*) FROM repost_history").scalar_one() == 0
 
 
@@ -96,7 +96,7 @@ def test_missing_repost_table_fails_closed(isolated_home, table) -> None:
     with pytest.raises(RuntimeError, match=table):
         schema.init_db()
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
         assert conn.exec_driver_sql(
             f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
         ).first() is None
@@ -149,7 +149,7 @@ def test_v4_database_constraints_reject_invalid_rows(isolated_home, statement) -
             conn.exec_driver_sql(statement)
 
 
-def test_v5_to_v8_backfills_trusted_identity_and_safe_levels(isolated_home) -> None:
+def test_v5_to_v10_backfills_trusted_identity_and_safe_levels(isolated_home) -> None:
     with get_engine().begin() as conn:
         conn.exec_driver_sql("DROP TABLE repost_assessment")
         conn.exec_driver_sql("DROP TABLE repost_history")
@@ -214,7 +214,7 @@ def test_v5_to_v8_backfills_trusted_identity_and_safe_levels(isolated_home) -> N
     schema.init_db()
 
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
         identity = conn.exec_driver_sql(
             "SELECT identity_source, identity_ok, identity_checked_at FROM repost_history"
         ).one()
@@ -225,7 +225,7 @@ def test_v5_to_v8_backfills_trusted_identity_and_safe_levels(isolated_home) -> N
         assert assessment == ("safe", "legacy", "v1_safe")
 
 
-def test_v6_to_v8_backfills_assessment_lifecycle_final(isolated_home) -> None:
+def test_v6_to_v10_backfills_assessment_lifecycle_final(isolated_home) -> None:
     with get_engine().begin() as conn:
         conn.exec_driver_sql("DROP TABLE repost_assessment")
         conn.exec_driver_sql(
@@ -250,7 +250,7 @@ def test_v6_to_v8_backfills_assessment_lifecycle_final(isolated_home) -> None:
     schema.init_db()
 
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
         status = conn.exec_driver_sql(
             "SELECT assessment_status FROM repost_assessment"
         ).scalar_one()
@@ -283,7 +283,7 @@ def test_v7_to_v8_backfills_defer_columns_and_reliable_time(isolated_home) -> No
     schema.init_db()
 
     with get_engine().connect() as conn:
-        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 8
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
         reliable = conn.exec_driver_sql(
             "SELECT lottery_time_reliable FROM repost_assessment"
         ).scalar_one()
@@ -297,3 +297,63 @@ def test_v7_to_v8_backfills_defer_columns_and_reliable_time(isolated_home) -> No
             "cleanup_deferred_at",
             "cleanup_deferred_until",
         } <= columns
+
+
+def test_v8_to_v10_backfills_sync_needed_flag(isolated_home) -> None:
+    with get_engine().begin() as conn:
+        conn.exec_driver_sql("DROP TABLE repost_sync_checkpoint")
+        conn.exec_driver_sql(
+            "CREATE TABLE repost_sync_checkpoint ("
+            "uid VARCHAR(64) NOT NULL PRIMARY KEY, "
+            "head_dynamic_id VARCHAR(32), head_published_at INTEGER, "
+            "full_scan_completed BOOLEAN NOT NULL, last_synced_at INTEGER, "
+            "updated_at INTEGER NOT NULL, "
+            "CONSTRAINT ck_repost_sync_checkpoint_completed "
+            "CHECK (full_scan_completed IN (0,1)))"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO repost_sync_checkpoint(uid,head_dynamic_id,head_published_at,"
+            "full_scan_completed,last_synced_at,updated_at) "
+            "VALUES ('123','3000000000000000001',1000,1,1100,1100)"
+        )
+        conn.exec_driver_sql("UPDATE schema_meta SET version=8 WHERE id=1")
+
+    schema.init_db()
+    schema.init_db()
+
+    with get_engine().connect() as conn:
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
+        row = conn.exec_driver_sql(
+            "SELECT head_dynamic_id, full_scan_completed, sync_needed FROM repost_sync_checkpoint"
+        ).one()
+        assert row == ("3000000000000000001", 1, 0)
+
+
+def test_v9_to_v10_backfills_risk_pause_columns(isolated_home) -> None:
+    with get_engine().begin() as conn:
+        conn.exec_driver_sql("DROP TABLE repost_sync_checkpoint")
+        conn.exec_driver_sql(
+            "CREATE TABLE repost_sync_checkpoint ("
+            "uid VARCHAR(64) NOT NULL PRIMARY KEY, "
+            "head_dynamic_id VARCHAR(32), head_published_at INTEGER, "
+            "full_scan_completed BOOLEAN NOT NULL, last_synced_at INTEGER, "
+            "sync_needed BOOLEAN NOT NULL DEFAULT 0, sync_needed_at INTEGER, "
+            "updated_at INTEGER NOT NULL, "
+            "CONSTRAINT ck_repost_sync_checkpoint_completed "
+            "CHECK (full_scan_completed IN (0,1)))"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO repost_sync_checkpoint(uid,full_scan_completed,sync_needed,updated_at) "
+            "VALUES ('123',1,0,100)"
+        )
+        conn.exec_driver_sql("UPDATE schema_meta SET version=9 WHERE id=1")
+
+    schema.init_db()
+    schema.init_db()
+
+    with get_engine().connect() as conn:
+        assert conn.exec_driver_sql("SELECT version FROM schema_meta").scalar_one() == 10
+        row = conn.exec_driver_sql(
+            "SELECT sync_needed, maintenance_risk_paused FROM repost_sync_checkpoint"
+        ).one()
+        assert row == (0, 0)

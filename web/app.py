@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Query
+from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -125,6 +125,7 @@ _JOB_REQUIRES_LOGIN = frozenset(
         "refresh_source",
         "refresh_status",
         "refresh_watch",
+        "cleanup_auto_maintain",
         "scan_expired_reposts",
         "sync_repost_history",
     }
@@ -697,6 +698,45 @@ def api_auto_start() -> dict[str, Any]:
 def api_auto_stop() -> dict[str, Any]:
     """只停止定时点击调度器，不会取消抽奖端正在运行的任务。"""
     return auto_scheduler.stop(reason="用户在监视面板停止")
+
+
+@app.get("/api/auto/cleanup-maintain", tags=["stable"])
+def api_auto_cleanup_maintain_status() -> dict[str, Any]:
+    from src.repost_cleanup import maintenance_risk_state
+    from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, cleanup_maintain_enabled
+
+    uid = _require_runtime_bilibili_uid()
+    return {
+        "ok": True,
+        "enabled": cleanup_maintain_enabled(),
+        "interval_hours": CLEANUP_MAINTAIN_INTERVAL_HOURS,
+        **maintenance_risk_state(uid),
+    }
+
+
+@app.post("/api/auto/cleanup-maintain", tags=["stable"])
+async def api_auto_cleanup_maintain_toggle(request: Request) -> dict[str, Any]:
+    from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, set_cleanup_maintain_enabled
+
+    body = await request.json() or {}
+    enabled = bool(body.get("enabled", True))
+    return {
+        "ok": True,
+        "enabled": set_cleanup_maintain_enabled(enabled),
+        "interval_hours": CLEANUP_MAINTAIN_INTERVAL_HOURS,
+    }
+
+
+@app.post("/api/auto/cleanup-maintain/recover", tags=["stable"])
+def api_auto_cleanup_maintain_recover() -> dict[str, Any]:
+    """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
+    from src.repost_cleanup import maintenance_risk_state, recover_auto_maintenance
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再恢复自动维护")
+    uid = _require_runtime_bilibili_uid()
+    recover_auto_maintenance(uid)
+    return {"ok": True, "uid": uid, **maintenance_risk_state(uid)}
 
 
 def _build_settings_payload() -> dict[str, Any]:

@@ -14,10 +14,12 @@ from src.restart_control import restart_control
 from web.auto_config import (
     ACTION_LABELS,
     ALLOWED_CLICK_ACTIONS,
+    CLEANUP_MAINTAIN_INTERVAL_HOURS,
     JOB_POLL_INTERVAL_SEC,
     JOB_POLL_TIMEOUT_SEC,
     REFRESH_HOURS,
     TRIPLE_MINUTES,
+    cleanup_maintain_enabled,
 )
 from web.event_hub import event_hub
 from web.job_runner import JobRunner, runner
@@ -114,6 +116,7 @@ class AutoScheduler:
         self._status = SchedulerStatus(refresh_pipeline=_idle_pipeline())
         self._done_refresh: set[str] = set()
         self._done_triple: set[str] = set()
+        self._done_maintain: set[str] = set()
         self._snapshot_timer: threading.Timer | None = None
         self._last_snapshot_mono = 0.0
         self._snapshot_pending = False
@@ -328,6 +331,16 @@ class AutoScheduler:
                         self._run_refresh_batch(key)
                         continue
 
+                if (
+                    cleanup_maintain_enabled()
+                    and now.minute == 0
+                    and now.hour % CLEANUP_MAINTAIN_INTERVAL_HOURS == 0
+                ):
+                    key = f"maint-{now:%Y-%m-%d-%H}"
+                    if key not in self._done_maintain:
+                        self._run_maintenance(key)
+                        continue
+
                 if now.hour not in REFRESH_HOURS and now.minute in TRIPLE_MINUTES:
                     key = f"{now:%Y-%m-%d-%H-%M}"
                     if key not in self._done_triple:
@@ -403,6 +416,36 @@ class AutoScheduler:
             self._log("info", f"三连参与已跳过：{exc}")
             self._done_triple.add(key)
             self._set_phase("等待下一刻度", f"已跳过：{exc}")
+
+    def _run_maintenance(self, key: str) -> None:
+        self._set_pipeline(active=False)
+        self._set_phase("清理维护", f"自动维护刻度 {key}")
+        from src.repost_cleanup import auto_maintenance_paused_state
+
+        paused, pause_reason = auto_maintenance_paused_state()
+        if paused:
+            self._log("warn", f"自动维护因平台限制已暂停，请稍后手动恢复。{pause_reason}")
+            self._done_maintain.add(key)
+            with self._lock:
+                self._status.message = "自动维护因平台限制已暂停，请稍后手动恢复。"
+            self._set_phase("等待下一刻度", "自动维护因平台限制已暂停，请稍后手动恢复。")
+            return
+        self._log("info", f"清理数据自动维护刻度 {key}")
+        try:
+            self._click_and_wait("cleanup_auto_maintain")
+            self._done_maintain.add(key)
+            with self._lock:
+                self._status.message = "自动维护完成"
+            self._set_phase("等待下一刻度", "自动维护完成")
+        except CollisionError:
+            raise
+        except Exception as exc:
+            if _is_hard_failure(exc):
+                self._fatal(str(exc))
+                return
+            self._log("warn", f"自动维护跳过：{exc}")
+            self._done_maintain.add(key)
+            self._set_phase("等待下一刻度", f"自动维护已跳过：{exc}")
 
     def _click_and_wait(self, action: str, *, pipeline_index: int | None = None) -> dict[str, Any]:
         if action not in ALLOWED_CLICK_ACTIONS:

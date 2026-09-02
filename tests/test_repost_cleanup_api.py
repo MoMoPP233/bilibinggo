@@ -238,3 +238,60 @@ def test_restore_endpoint_is_local_only_and_returns_summary() -> None:
 
     assert response.status_code == 200
     restore_mock.assert_called_once_with("123", REPOST_ID)
+
+
+def test_cleanup_maintain_status_includes_risk_state() -> None:
+    with patch("web.app._require_runtime_bilibili_uid", return_value="123"), patch(
+        "src.repost_cleanup.maintenance_risk_state",
+        return_value={"risk_paused": True, "risk_paused_at": 1, "risk_reason": "风控暂停"},
+    ):
+        response = client.get("/api/auto/cleanup-maintain")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["risk_paused"] is True
+    assert payload["enabled"] is False
+
+
+def test_cleanup_maintain_toggle_parses_json_and_enables_without_remote() -> None:
+    with patch(
+        "web.auto_config.set_cleanup_maintain_enabled", return_value=True
+    ) as set_enabled, patch(
+        "src.bilibili_client.BilibiliClient", side_effect=AssertionError("不得联网")
+    ):
+        response = client.post("/api/auto/cleanup-maintain", json={"enabled": True})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["enabled"] is True
+    set_enabled.assert_called_once_with(True)
+
+
+def test_cleanup_maintain_toggle_parses_json_and_disables_without_remote() -> None:
+    with patch(
+        "web.auto_config.set_cleanup_maintain_enabled", return_value=False
+    ) as set_enabled, patch(
+        "src.bilibili_client.BilibiliClient", side_effect=AssertionError("不得联网")
+    ):
+        response = client.post("/api/auto/cleanup-maintain", json={"enabled": False})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["enabled"] is False
+    set_enabled.assert_called_once_with(False)
+
+
+def test_cleanup_maintain_recover_is_local_only() -> None:
+    with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(
+        "web.app._require_runtime_bilibili_uid", return_value="123"
+    ), patch(
+        "src.repost_cleanup.recover_auto_maintenance"
+    ) as recover_mock, patch(
+        "src.repost_cleanup.maintenance_risk_state",
+        return_value={"risk_paused": False, "risk_paused_at": None, "risk_reason": None},
+    ):
+        response = client.post("/api/auto/cleanup-maintain/recover")
+
+    assert response.status_code == 200
+    assert response.json()["risk_paused"] is False
+    recover_mock.assert_called_once_with("123")

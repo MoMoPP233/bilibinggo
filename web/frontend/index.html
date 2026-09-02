@@ -157,6 +157,17 @@
           </div>
           <div class="auto-dock-pipeline" id="auto-dock-pipeline"></div>
         </div>
+        <div class="auto-dock-summary-row auto-maintain-row">
+          <span class="auto-dock-meta-label">清理数据自动维护</span>
+          <label class="auto-toggle">
+            <input type="checkbox" id="auto-cleanup-maintain" />
+            <span class="auto-toggle-track" aria-hidden="true"></span>
+          </label>
+        </div>
+        <div class="auto-maintain-paused" id="auto-maintain-paused" hidden>
+          <p class="auto-maintain-paused-text">自动维护因平台限制已暂停，请稍后手动恢复。</p>
+          <button type="button" class="btn btn-secondary btn-compact btn-pill" id="auto-maintain-recover">恢复自动维护</button>
+        </div>
         <div class="auto-dock-actions">
           <button type="button" class="btn btn-primary btn-pill auto-dock-action-btn" id="auto-dock-start">启动调度</button>
           <button type="button" class="btn btn-primary btn-pill auto-dock-action-btn" id="auto-dock-stop" hidden>停止调度</button>

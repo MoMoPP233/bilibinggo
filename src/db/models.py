@@ -155,6 +155,14 @@ class RepostSyncCheckpointRow(SQLModel, table=True):
     head_published_at: Optional[int] = None
     full_scan_completed: bool = False
     last_synced_at: Optional[int] = None
+    sync_needed: bool = False
+    sync_needed_at: Optional[int] = None
+    maintenance_risk_paused: bool = False
+    maintenance_risk_paused_at: Optional[int] = None
+    maintenance_risk_reason: Optional[str] = Field(
+        default=None,
+        sa_column=Column(Text),
+    )
     updated_at: int = 0
 
 

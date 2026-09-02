@@ -253,8 +253,42 @@ export function stopAutoPolling() {
 export async function fetchAutoStatus() {
   const status = await fetchJSON("/api/auto/status");
   renderAutoDock(status);
+  try {
+    const maintain = await fetchJSON("/api/auto/cleanup-maintain");
+    const toggle = document.getElementById("auto-cleanup-maintain") as HTMLInputElement | null;
+    if (toggle) toggle.checked = Boolean(maintain?.enabled);
+    const paused = document.getElementById("auto-maintain-paused");
+    if (paused) paused.hidden = !Boolean(maintain?.risk_paused);
+  } catch {
+    // 开关状态读取失败不阻塞自动面板。
+  }
   return status;
 }
+
+document.getElementById("auto-maintain-recover")?.addEventListener("click", async () => {
+  try {
+    await fetchJSON("/api/auto/cleanup-maintain/recover", { method: "POST" });
+    showToast("自动维护已恢复", "success", "将在下一正常调度周期继续，不会立即联网。");
+    const paused = document.getElementById("auto-maintain-paused");
+    if (paused) paused.hidden = true;
+  } catch (error) {
+    showToast(String(error?.message || error) || "恢复自动维护失败", "error");
+  }
+});
+
+document.getElementById("auto-cleanup-maintain")?.addEventListener("change", async (event) => {
+  const enabled = Boolean((event.target as HTMLInputElement).checked);
+  try {
+    await fetchJSON("/api/auto/cleanup-maintain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    showToast(enabled ? "自动维护已开启" : "自动维护已关闭", "success");
+  } catch (error) {
+    showToast(String(error?.message || error) || "自动维护设置失败", "error");
+  }
+});
 
 export async function startAutoScheduler() {
   await fetchJSON("/api/auto/start", { method: "POST" });

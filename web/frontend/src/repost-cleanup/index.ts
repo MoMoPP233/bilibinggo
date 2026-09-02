@@ -795,7 +795,12 @@ export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<
   if (job.action === "sync_repost_history") {
     if (job.state === "success") {
       const result = (job.result || {}) as Record<string, unknown>;
-      showToast("转发历史同步完成", "success", `本次导入 ${Number(result.imported_count) || 0} 条`);
+      const reconciliation = (result.guard_reconciliation || {}) as Record<string, unknown>;
+      const resolved = Number(reconciliation.resolved) || 0;
+      const resolvedText = resolved > 0
+        ? `，已根据本地转发历史自动确认 ${resolved} 条历史参与记录`
+        : "";
+      showToast("转发历史同步完成", "success", `本次导入 ${Number(result.imported_count) || 0} 条${resolvedText}`);
       await loadRepostHistory(1).catch(() => {});
     }
     return;

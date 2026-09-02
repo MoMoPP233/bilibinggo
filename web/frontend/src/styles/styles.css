@@ -6338,6 +6338,71 @@ body.modal-open {
   color: var(--accent);
 }
 
+.auto-maintain-row {
+  align-items: center;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 4px;
+}
+
+.auto-toggle {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.auto-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.auto-toggle-track {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  border-radius: var(--radius-pill);
+  background: var(--border-soft);
+  transition: background 0.2s ease;
+}
+
+.auto-toggle-track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: transform 0.2s ease;
+}
+
+.auto-toggle input:checked + .auto-toggle-track {
+  background: var(--primary);
+}
+
+.auto-toggle input:checked + .auto-toggle-track::after {
+  transform: translateX(16px);
+}
+
+.auto-maintain-paused {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 4px 0 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger-soft);
+  border-radius: 10px;
+  background: var(--danger-soft);
+}
+
+.auto-maintain-paused-text {
+  color: var(--danger-alt);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .auto-dock-job-value[data-tone="error"] {
   color: var(--danger);
 }
