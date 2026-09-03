@@ -71,6 +71,35 @@ function statusIcon(status) {
   }
 }
 
+function scanMeta(entry) {
+  const status = String(entry?.status || "waiting");
+  if (status !== "success" && status !== "risk") return [];
+  const discovered = Number(entry?.discovered_count) || 0;
+  if (entry?.updated === false && entry?.pipeline_skipped) {
+    return [`本轮源返回 ${discovered}`, "未进入候选处理"];
+  }
+  const duplicateOrInvalid = (Number(entry?.duplicate_link_count) || 0)
+    + (Number(entry?.invalid_link_count) || 0);
+  const safeSkipped = (Number(entry?.non_lottery_count) || 0)
+    + (Number(entry?.other_skipped_count) || 0);
+  const meta = [
+    `发现 ${discovered}`,
+    `已有 ${Number(entry?.existing_count) || 0}`,
+  ];
+  if (duplicateOrInvalid > 0) meta.push(`重复/无效 ${duplicateOrInvalid}`);
+  meta.push(
+    `新候选 ${Number(entry?.candidate_count ?? entry?.new_link_count) || 0}`,
+    `过期 ${Number(entry?.expired_skipped_count) || 0}`,
+    `非抽奖/其他 ${safeSkipped}`,
+    `失败 ${Number(entry?.processing_failed_count) || 0}`,
+  );
+  if (Number(entry?.persist_skipped_count) > 0) {
+    meta.push(`写入时已有 ${Number(entry.persist_skipped_count)}`);
+  }
+  meta.push(`新增 ${Number(entry?.persisted_count) || 0}`);
+  return meta;
+}
+
 function renderLanes(payload) {
   const { lanes } = getElements();
   if (!lanes) return;
@@ -82,12 +111,7 @@ function renderLanes(payload) {
       const name = sanitizeUserText(entry?.name) || String(entry?.source_id || "");
       const key = escapeHtml(String(entry?.source_id || ""));
       const message = sanitizeUserText(entry?.message || "") || "";
-      const meta = [];
-      if (status === "success" && Number(entry?.persisted_count) > 0) {
-        meta.push(`导入 ${entry.persisted_count} 条`);
-      } else if (status === "success" && Number(entry?.new_link_count) > 0) {
-        meta.push(`新链接 ${entry.new_link_count} 条`);
-      }
+      const meta = scanMeta(entry);
       const metaText = meta.length ? ` · ${meta.join(" · ")}` : "";
       return `
         <div class="update-all-lane" data-status="${escapeHtml(status)}">
@@ -115,6 +139,10 @@ function renderPanel(payload) {
       text = `正在串行更新 ${active?.source_id || ""}（${active?.name || ""}） ${runningCurrent}/${total}`;
     } else {
       text = `正在串行更新数据源 ${runningCurrent}/${total}`;
+    }
+    const totals = payload?.totals || null;
+    if (totals && Number(totals?.finished_sources) > 0) {
+      text += `；累计发现 ${Number(totals?.discovered_count) || 0}，过期 ${Number(totals?.expired_skipped_count) || 0}，新增 ${Number(totals?.persisted_count) || 0}`;
     }
   } else {
     text = "正在启动全部数据源更新…";

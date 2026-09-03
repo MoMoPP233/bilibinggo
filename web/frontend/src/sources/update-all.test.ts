@@ -110,6 +110,7 @@ describe("update all datasources UI", () => {
           phase: "running",
           current_index: 0,
           total: 7,
+          totals: { finished_sources: 1, discovered_count: 120, expired_skipped_count: 25, persisted_count: 10 },
           sources: [
             { source_id: "DS-1", name: "哔哩抽奖小助理", status: "running", phase: "importing", message: "正在导入", updated: false, new_link_count: 0, persisted_count: 0 },
             { source_id: "DS-2", name: "番茄薯条喵", status: "waiting", phase: "waiting", message: "等待", updated: false, new_link_count: 0, persisted_count: 0 },
@@ -122,6 +123,7 @@ describe("update all datasources UI", () => {
     expect(lanes).toContain("DS-1");
     expect(lanes).toContain("哔哩抽奖小助理");
     expect(lanes).toContain("DS-2");
+    expect(document.getElementById("update-all-summary")?.textContent).toContain("累计发现 120");
 
     const done = {
       action: "update_all_datasources",
@@ -134,7 +136,33 @@ describe("update all datasources UI", () => {
           persisted_count: 12,
           summary: "全部数据源更新完成：成功 7 个，失败 0 个",
           sources: [
-            { source_id: "DS-1", name: "哔哩抽奖小助理", status: "success", phase: "success", message: "完成", updated: true, new_link_count: 2, persisted_count: 12 },
+            {
+              source_id: "DS-1",
+              name: "哔哩抽奖小助理",
+              status: "success",
+              phase: "success",
+              message: "完成",
+              updated: true,
+              discovered_count: 120,
+              existing_count: 80,
+              duplicate_link_count: 2,
+              invalid_link_count: 1,
+              candidate_count: 37,
+              non_lottery_count: 4,
+              other_skipped_count: 1,
+              processing_failed_count: 2,
+              expired_skipped_count: 18,
+              persisted_count: 12,
+            },
+            {
+              source_id: "DS-2",
+              name: "番茄薯条喵",
+              status: "not_run",
+              phase: "not_run",
+              message: "未执行",
+              discovered_count: 0,
+              persisted_count: 0,
+            },
           ],
         },
       },
@@ -142,6 +170,16 @@ describe("update all datasources UI", () => {
     window.dispatchEvent(new CustomEvent("binggo:job-completed", { detail: done }));
     expect(document.getElementById("update-all-summary")?.textContent).toContain("全部数据源更新完成");
     const doneLanes = document.getElementById("update-all-lanes")?.innerHTML || "";
-    expect(doneLanes).toContain("导入 12 条");
+    expect(doneLanes).toContain("发现 120");
+    expect(doneLanes).toContain("已有 80");
+    expect(doneLanes).toContain("重复/无效 3");
+    expect(doneLanes).toContain("新候选 37");
+    expect(doneLanes).toContain("过期 18");
+    expect(doneLanes).toContain("非抽奖/其他 5");
+    expect(doneLanes).toContain("失败 2");
+    expect(doneLanes).toContain("新增 12");
+    const notRun = document.querySelector('[data-status="not_run"]')?.textContent || "";
+    expect(notRun).toContain("未执行");
+    expect(notRun).not.toContain("发现 0");
   });
 });

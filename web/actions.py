@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
@@ -277,16 +277,24 @@ def _capture_output(func: Callable[..., Any], *args: Any, **kwargs: Any) -> tupl
 
 def _pipeline_log_lines(result: PipelineResult) -> list[str]:
     if result.pipeline_skipped:
-        return [f"【流水线】{result.message}"]
+        return [
+            f"【本轮扫描】发现 {result.raw_link_count} 条，数据库已有 "
+            f"{result.existing_count} 条，批内重复 {result.duplicate_link_count} 条，"
+            f"无效链接 {result.invalid_link_count} 条，新候选 {result.new_link_count} 条",
+            f"【流水线】{result.message}",
+        ]
     skip_detail = ""
     if result.skip_reasons:
         parts = [f"{reason} {count}" for reason, count in result.skip_reasons.items()]
         skip_detail = f"，跳过 {result.skipped_count} 条（{' / '.join(parts)}）"
     return [
-        f"【新链接流水线】候选 {result.new_link_count} 条，"
-        f"分类通过 {result.classified_count} 条，"
+        f"【本轮扫描】发现 {result.raw_link_count} 条，数据库已有 "
+        f"{result.existing_count} 条，批内重复 {result.duplicate_link_count} 条，"
+        f"无效链接 {result.invalid_link_count} 条，新候选 {result.new_link_count} 条",
+        f"【新链接流水线】分类通过 {result.classified_count} 条，"
         f"详情 {result.enriched_count} 条，"
-        f"入库 {result.persisted_count} 条{skip_detail}"
+        f"过期过滤 {result.expired_skipped_count} 条，"
+        f"实际新增 {result.persisted_count} 条{skip_detail}"
     ]
 
 
@@ -427,21 +435,93 @@ def _ds_phase_from_message(message: str) -> str | None:
     return None
 
 
+_SOURCE_SCAN_COUNT_KEYS = (
+    "discovered_count",
+    "invalid_link_count",
+    "duplicate_link_count",
+    "existing_count",
+    "candidate_count",
+    "non_lottery_count",
+    "other_skipped_count",
+    "processing_failed_count",
+    "expired_skipped_count",
+    "persist_skipped_count",
+    "persisted_count",
+)
+
+
 def _source_payload_counts(payload: dict[str, Any]) -> dict[str, Any]:
-    """从单源 refresh_source 的返回值里可靠读取可统计计数（无法统计则 0）。"""
+    """从单源返回值读取本轮严格计数；不使用活动总库存，也不做额外查询。"""
     result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
     pipeline = result.get("pipeline") if isinstance(result.get("pipeline"), dict) else {}
     source = result.get("source") if isinstance(result.get("source"), dict) else {}
+    discovered = int(
+        source.get(
+            "link_count",
+            pipeline.get("discovered_count", pipeline.get("raw_link_count", 0)),
+        )
+        or 0
+    )
+    candidate = int(
+        pipeline.get("candidate_count", pipeline.get("new_link_count", 0)) or 0
+    )
     return {
         "updated": bool(source.get("updated")),
-        "new_link_count": int(
-            result.get("new_link_count", pipeline.get("new_link_count", 0)) or 0
+        "pipeline_skipped": bool(
+            result.get("pipeline_skipped", pipeline.get("pipeline_skipped", False))
         ),
+        "discovered_count": discovered,
+        "invalid_link_count": int(pipeline.get("invalid_link_count", 0) or 0),
+        "duplicate_link_count": int(pipeline.get("duplicate_link_count", 0) or 0),
+        "existing_count": int(pipeline.get("existing_count", 0) or 0),
+        "candidate_count": candidate,
+        # 向后兼容旧前端/测试字段；语义与 candidate_count 相同。
+        "new_link_count": candidate,
+        "non_lottery_count": int(pipeline.get("non_lottery_count", 0) or 0),
+        "other_skipped_count": int(pipeline.get("other_skipped_count", 0) or 0),
+        "processing_failed_count": int(pipeline.get("failed_count", 0) or 0),
         "persisted_count": int(
             result.get("persisted_count", pipeline.get("persisted_count", 0)) or 0
         ),
-        "pipeline_skipped": bool(result.get("pipeline_skipped")),
+        "expired_skipped_count": int(
+            result.get("expired_skipped_count", pipeline.get("expired_skipped_count", 0))
+            or 0
+        ),
+        "persist_skipped_count": int(pipeline.get("persist_skipped_count", 0) or 0),
     }
+
+
+def _format_source_scan_counts(counts: Mapping[str, Any]) -> str:
+    if not bool(counts.get("updated")):
+        return (
+            f"本轮源返回 {int(counts.get('discovered_count') or 0)} 条链接，"
+            "容器未变更，未进入候选处理"
+        )
+    duplicate_or_invalid = int(counts.get("duplicate_link_count") or 0) + int(
+        counts.get("invalid_link_count") or 0
+    )
+    safe_skipped = int(counts.get("non_lottery_count") or 0) + int(
+        counts.get("other_skipped_count") or 0
+    )
+    parts = [
+        f"本轮发现 {int(counts.get('discovered_count') or 0)} 条",
+        f"数据库已有 {int(counts.get('existing_count') or 0)} 条",
+    ]
+    if duplicate_or_invalid:
+        parts.append(f"重复/无效 {duplicate_or_invalid} 条")
+    parts.extend(
+        [
+            f"新候选 {int(counts.get('candidate_count') or 0)} 条",
+            f"过期过滤 {int(counts.get('expired_skipped_count') or 0)} 条",
+            f"非抽奖/其他跳过 {safe_skipped} 条",
+            f"处理失败 {int(counts.get('processing_failed_count') or 0)} 条",
+        ]
+    )
+    persist_skipped = int(counts.get("persist_skipped_count") or 0)
+    if persist_skipped:
+        parts.append(f"写入时已存在 {persist_skipped} 条")
+    parts.append(f"实际新增 {int(counts.get('persisted_count') or 0)} 条")
+    return "，".join(parts)
 
 
 def _run_source_refresh(
@@ -452,6 +532,7 @@ def _run_source_refresh(
     progress: ProgressCallback,
     cancel_event: threading.Event | None,
     pass_ds3_source_progress: bool = True,
+    scan_started_at: int | None = None,
 ) -> dict[str, Any]:
     """复用现有单数据源「抓取→分类→详情→入库→检查点落库」完整链路。
 
@@ -499,9 +580,13 @@ def _run_source_refresh(
         )
         logger.info("%s 无新专栏，跳过流水线", source_id)
         set_last_pipeline_persisted(action="refresh_source", persisted_count=0)
+        skipped_counts = {
+            "updated": False,
+            "discovered_count": int(payload["link_count"] or 0),
+        }
         return {
             "ok": True,
-            "message": f"{source_id} 检查完成：无新专栏，已跳过流水线",
+            "message": f"{source_id} 检查完成：{_format_source_scan_counts(skipped_counts)}",
             "result": {
                 "source_id": source_id,
                 "source": {
@@ -511,6 +596,8 @@ def _run_source_refresh(
                     "saved": payload["saved"],
                 },
                 "pipeline_skipped": True,
+                "discovered_count": int(payload["link_count"] or 0),
+                "candidate_count": 0,
                 "new_link_count": 0,
                 "persisted_count": 0,
             },
@@ -529,6 +616,7 @@ def _run_source_refresh(
                 ds_count=1,
                 span_tracker=pipeline_spans,
             ),
+            scan_started_at=scan_started_at,
         )
     except Exception as exc:
         pipeline_error = type(exc).__name__
@@ -547,17 +635,10 @@ def _run_source_refresh(
         log_append=log_lines[-1] if log_lines else "",
     )
 
-    summary_parts = [
-        f"{source_id} 有新专栏",
-        f"新链接 {pipeline_result.new_link_count} 条",
-        f"新入库 {pipeline_result.persisted_count} 条",
-    ]
-    if pipeline_result.skip_reasons:
-        summary_parts.append(f"跳过 {pipeline_result.skipped_count} 条")
-
     logger.info(
-        "%s 更新完成：新链接 %s，入库 %s",
+        "%s 更新完成：发现 %s，新候选 %s，实际新增 %s",
         source_id,
+        pipeline_result.raw_link_count,
         pipeline_result.new_link_count,
         pipeline_result.persisted_count,
     )
@@ -566,19 +647,21 @@ def _run_source_refresh(
         persisted_count=pipeline_result.persisted_count,
     )
 
+    result_payload = {
+        "source_id": source_id,
+        "source": {
+            "source_id": payload["source_id"],
+            "updated": payload["updated"],
+            "link_count": payload["link_count"],
+            "saved": payload["saved"],
+        },
+        "pipeline": pipeline_result.to_dict(),
+    }
+    counts = _source_payload_counts({"result": result_payload})
     return {
         "ok": True,
-        "message": f"{source_id} 更新完成：" + "，".join(summary_parts),
-        "result": {
-            "source_id": source_id,
-            "source": {
-                "source_id": payload["source_id"],
-                "updated": payload["updated"],
-                "link_count": payload["link_count"],
-                "saved": payload["saved"],
-            },
-            "pipeline": pipeline_result.to_dict(),
-        },
+        "message": f"{source_id} 更新完成：{_format_source_scan_counts(counts)}",
+        "result": result_payload,
         "log": sanitize_log("\n".join(log_lines).strip()),
     }
 
@@ -604,6 +687,8 @@ def _update_all_datasources(
             "result": {"update_all": {"phase": "done", "total": 0, "sources": []}},
             "log": "没有可更新的数据源",
         }
+    # 整个一键任务（DS1→DS7）只取一次固定扫描基准时间，避免标准漂移。
+    scan_started_at = int(time.time())
 
     states: list[dict[str, Any]] = [
         {
@@ -614,8 +699,19 @@ def _update_all_datasources(
             "message": "等待",
             "error": None,
             "updated": False,
+            "pipeline_skipped": False,
+            "discovered_count": 0,
+            "invalid_link_count": 0,
+            "duplicate_link_count": 0,
+            "existing_count": 0,
+            "candidate_count": 0,
             "new_link_count": 0,
+            "non_lottery_count": 0,
+            "other_skipped_count": 0,
+            "processing_failed_count": 0,
             "persisted_count": 0,
+            "expired_skipped_count": 0,
+            "persist_skipped_count": 0,
         }
         for source_id, _, _ in DS_HANDLERS
     ]
@@ -632,12 +728,40 @@ def _update_all_datasources(
                     "message",
                     "error",
                     "updated",
+                    "pipeline_skipped",
+                    "discovered_count",
+                    "invalid_link_count",
+                    "duplicate_link_count",
+                    "existing_count",
+                    "candidate_count",
                     "new_link_count",
+                    "non_lottery_count",
+                    "other_skipped_count",
+                    "processing_failed_count",
                     "persisted_count",
+                    "expired_skipped_count",
+                    "persist_skipped_count",
                 )
             }
             for entry in states
         ]
+
+    def aggregate_counts() -> dict[str, int]:
+        totals = {
+            key: sum(int(entry.get(key) or 0) for entry in states)
+            for key in _SOURCE_SCAN_COUNT_KEYS
+        }
+        totals["safe_skipped_count"] = (
+            totals["non_lottery_count"] + totals["other_skipped_count"]
+        )
+        totals["duplicate_or_invalid_count"] = (
+            totals["duplicate_link_count"] + totals["invalid_link_count"]
+        )
+        totals["finished_sources"] = sum(
+            entry["status"] in {"success", "failed", "risk", "stopped"}
+            for entry in states
+        )
+        return totals
 
     def emit(phase: str, current_index: int | None, *, log_append: str | None = None) -> None:
         progress(
@@ -650,6 +774,7 @@ def _update_all_datasources(
                     "phase": phase,
                     "current_index": current_index,
                     "total": total,
+                    "totals": aggregate_counts(),
                     "sources": state_snapshot(),
                 }
             },
@@ -665,7 +790,13 @@ def _update_all_datasources(
             return f"准备更新 {total} 个数据源…"
         running_text = running[-1]
         if running_text["status"] == "success":
-            return f"已更新 {running_text['source_id']}…"
+            totals = aggregate_counts()
+            return (
+                f"已更新 {running_text['source_id']}：累计发现 "
+                f"{totals['discovered_count']} 条，过期过滤 "
+                f"{totals['expired_skipped_count']} 条，实际新增 "
+                f"{totals['persisted_count']} 条"
+            )
         if running_text["status"] in {"failed", "risk", "stopped"}:
             return f"{running_text['source_id']}：{running_text['message']}"
         return f"正在更新 {running_text['source_id']}（{running_text['name']}）…"
@@ -726,6 +857,7 @@ def _update_all_datasources(
                 save_result_func,
                 progress=make_source_progress(index, source_id),
                 cancel_event=cancel_event,
+                scan_started_at=scan_started_at,
             )
         except Exception as exc:
             message = str(exc) or type(exc).__name__
@@ -758,6 +890,13 @@ def _update_all_datasources(
         if log_chunk:
             log_lines.append(str(log_chunk))
 
+        counts = _source_payload_counts(payload)
+        states[index]["updated"] = counts["updated"]
+        states[index]["pipeline_skipped"] = counts["pipeline_skipped"]
+        for key in _SOURCE_SCAN_COUNT_KEYS:
+            states[index][key] = counts[key]
+        states[index]["new_link_count"] = counts["candidate_count"]
+
         if states[index].get("_risk_seen"):
             # DS-3 等在源内命中 -352 后仍会保留本源结果返回；按整体策略，
             # 不再继续后续数据源（已经成功的结果保留，不自动重试）。
@@ -773,17 +912,15 @@ def _update_all_datasources(
             emit("done", index, log_append=f"【一键更新】{source_id} 触发风控停止")
             break
 
-        counts = _source_payload_counts(payload)
         states[index]["status"] = "success"
         states[index]["phase"] = "success"
-        states[index]["updated"] = counts["updated"]
-        states[index]["new_link_count"] = counts["new_link_count"]
-        states[index]["persisted_count"] = counts["persisted_count"]
         states[index]["message"] = str(payload.get("message") or "完成")
         success_count += 1
         log_lines.append(f"【一键更新】{source_id} 完成：{states[index]['message']}")
         emit("running", index, log_append=f"【一键更新】{source_id} 完成")
 
+    totals = aggregate_counts()
+    total_scan_text = _format_source_scan_counts({"updated": True, **totals})
     if cancelled_stop or risk_stopped:
         # 已结束或未执行的源统一标记，不允许并发/自动补跑。
         start = stopped_index if stopped_index is not None else total
@@ -799,7 +936,12 @@ def _update_all_datasources(
     else:
         summary_text = (
             f"全部数据源更新完成：成功 {success_count} 个，失败 {failed_count} 个，"
-            f"共新增/入库 {sum(entry['persisted_count'] for entry in states)} 条"
+            f"{total_scan_text}"
+        )
+
+    if cancelled_stop or risk_stopped:
+        summary_text += (
+            f"；已完成部分：{total_scan_text}；其余标记为未执行"
         )
 
     log_lines.append(summary_text)
@@ -817,7 +959,9 @@ def _update_all_datasources(
                 "risk_stopped": risk_stopped,
                 "success_count": success_count,
                 "failed_count": failed_count,
-                "persisted_count": sum(entry["persisted_count"] for entry in states),
+                "persisted_count": totals["persisted_count"],
+                "expired_skipped_count": totals["expired_skipped_count"],
+                "totals": totals,
                 "summary": summary_text,
                 "sources": state_snapshot(),
             }
@@ -1054,6 +1198,8 @@ def run_action(
         if not handler:
             raise ValueError(f"未知数据源：{source_id}")
         check_update, save_result = handler
+        # 单源 Job 启动时记录一次固定扫描基准时间，整轮 DS3 使用同一个时间。
+        scan_started_at = int(time.time())
         return _run_source_refresh(
             source_id,
             check_update,
@@ -1061,6 +1207,7 @@ def run_action(
             progress=progress,
             cancel_event=cancel_event,
             pass_ds3_source_progress=on_progress is not None,
+            scan_started_at=scan_started_at,
         )
 
     if action == "update_all_datasources":

@@ -97,7 +97,7 @@ def test_refresh_source_retains_partial_warning_after_success(monkeypatch, with_
                 assert pipeline_calls == []
         return _result()
 
-    def run_pipeline(results, *, on_progress):
+    def run_pipeline(results, *, on_progress, **kwargs):
         pipeline_calls.append("called")
         assert len(results) == 1
         return _pipeline_result()
@@ -133,7 +133,7 @@ def test_parallel_refresh_all_forwards_ds3_progress_and_preserves_final_log(monk
     def ds2_check(*, force):
         return _result("DS-2", updated=False)
 
-    def run_pipeline(results, *, on_progress):
+    def run_pipeline(results, *, on_progress, **kwargs):
         pipeline_calls.append("called")
         assert [result.source_id for result in results] == ["DS-2", "DS-3"]
         return _pipeline_result()

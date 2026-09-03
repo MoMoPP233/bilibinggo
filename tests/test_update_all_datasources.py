@@ -104,7 +104,7 @@ def test_import_of_previous_source_finishes_before_next_starts(
         events.append("check:DS-2")
         return _check_result("DS-2", updated=True)
 
-    def fake_pipeline(ds_results, *, workers=4, on_progress=None) -> PipelineResult:
+    def fake_pipeline(ds_results, *, workers=4, on_progress=None, **kwargs) -> PipelineResult:
         source_id = ds_results[0].source_id
         events.append(f"pipeline:{source_id}")
         if source_id == "DS-1":
@@ -184,7 +184,7 @@ def test_platform_risk_stops_remaining_sources(
 
 
 def test_cancel_keeps_finished_sources_and_marks_rest_not_run(
-    isolated_home: Path,
+    isolated_home: Path, monkeypatch,
 ) -> None:
     cancel_event = threading.Event()
     sequence: list[str] = []
@@ -194,8 +194,35 @@ def test_cancel_keeps_finished_sources_and_marks_rest_not_run(
         cancel_event.set()
         return _check_result("DS-2", updated=False)
 
+    def check_first(*, force=False) -> CheckResult:
+        sequence.append("check:DS-1")
+        result = _check_result("DS-1", updated=True)
+        result.activity_links = [
+            f"https://www.bilibili.com/opus/{1_000_000_000_000_000_500 + index}"
+            for index in range(4)
+        ]
+        return result
+
+    monkeypatch.setattr(
+        actions,
+        "run_refresh_all_pipeline",
+        lambda *args, **kwargs: PipelineResult(
+            ok=True,
+            pipeline_skipped=False,
+            raw_link_count=4,
+            new_link_count=2,
+            classified_count=2,
+            skipped_count=0,
+            enriched_count=2,
+            persisted_count=1,
+            existing_count=2,
+            expired_skipped_count=1,
+            message="ok",
+        ),
+    )
+
     handlers = [
-        ("DS-1", _make_record_check(sequence, "DS-1"), _save_result),
+        ("DS-1", check_first, _save_result),
         ("DS-2", check_second, _save_result),
         ("DS-3", lambda *, force=False: (_ for _ in ()).throw(AssertionError("不应执行 DS-3")), _save_result),
     ]
@@ -219,6 +246,10 @@ def test_cancel_keeps_finished_sources_and_marks_rest_not_run(
     assert by_id["DS-2"]["status"] == "stopped"
     assert by_id["DS-3"]["status"] == "not_run"
     assert sequence == ["check:DS-1", "check:DS-2"]
+    assert result["totals"]["discovered_count"] == 4
+    assert result["totals"]["existing_count"] == 2
+    assert result["totals"]["expired_skipped_count"] == 1
+    assert result["totals"]["persisted_count"] == 1
 
 
 def test_update_all_rejects_extra_params(isolated_home: Path) -> None:
@@ -236,7 +267,7 @@ def test_update_all_result_reports_aggregate_persisted(isolated_home: Path, monk
     monkeypatch.setattr(
         actions,
         "run_refresh_all_pipeline",
-        lambda ds_results, *, workers=4, on_progress=None: PipelineResult(
+        lambda ds_results, *, workers=4, on_progress=None, **kwargs: PipelineResult(
             ok=True, pipeline_skipped=False, raw_link_count=1, new_link_count=1,
             classified_count=1, skipped_count=0, enriched_count=1,
             persisted_count=5, message="新入库 5 条",
@@ -248,3 +279,118 @@ def test_update_all_result_reports_aggregate_persisted(isolated_home: Path, monk
     result = payload["result"]["update_all"]
     assert result["persisted_count"] == 35  # 7 * 5
     assert result["success_count"] == 7
+
+
+def test_update_all_keeps_per_source_scan_stats_and_sums_only_completed_sources(
+    isolated_home: Path, monkeypatch,
+) -> None:
+    sequence: list[str] = []
+
+    def check_ds1(*, force=False, **kwargs) -> CheckResult:
+        sequence.append("check:DS-1")
+        result = _check_result("DS-1", updated=True)
+        result.activity_links = [
+            f"https://www.bilibili.com/opus/{1_000_000_000_000_000_000 + index}"
+            for index in range(10)
+        ]
+        return result
+
+    def check_ds2(*, force=False, **kwargs) -> CheckResult:
+        sequence.append("check:DS-2")
+        raise RuntimeError("API error -352: 风控")
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("风控后不得执行后续数据源")
+
+    monkeypatch.setattr(
+        actions,
+        "run_refresh_all_pipeline",
+        lambda *args, **kwargs: PipelineResult(
+            ok=True,
+            pipeline_skipped=False,
+            raw_link_count=10,
+            new_link_count=6,
+            classified_count=5,
+            skipped_count=3,
+            enriched_count=3,
+            persisted_count=2,
+            invalid_link_count=1,
+            duplicate_link_count=1,
+            existing_count=2,
+            non_lottery_count=1,
+            other_skipped_count=1,
+            failed_count=1,
+            expired_skipped_count=1,
+            message="ok",
+        ),
+    )
+    handlers = [
+        ("DS-1", check_ds1, _save_result),
+        ("DS-2", check_ds2, _save_result),
+        ("DS-3", should_not_run, _save_result),
+    ]
+
+    payload = _run_all(handlers)
+
+    result = payload["result"]["update_all"]
+    by_id = {item["source_id"]: item for item in result["sources"]}
+    assert by_id["DS-1"]["discovered_count"] == 10
+    assert by_id["DS-1"]["existing_count"] == 2
+    assert by_id["DS-1"]["candidate_count"] == 6
+    assert by_id["DS-1"]["expired_skipped_count"] == 1
+    assert by_id["DS-1"]["persisted_count"] == 2
+    assert by_id["DS-2"]["status"] == "risk"
+    assert by_id["DS-3"]["status"] == "not_run"
+    assert result["totals"]["discovered_count"] == 10
+    assert result["totals"]["candidate_count"] == 6
+    assert result["totals"]["persisted_count"] == 2
+    assert "已完成部分：本轮发现 10 条" in result["summary"]
+
+
+def test_single_source_completion_message_contains_full_scan_summary(
+    isolated_home: Path, monkeypatch,
+) -> None:
+    source_id = "DS-1"
+    check_result = _check_result(source_id, updated=True)
+    check_result.activity_links = [
+        f"https://www.bilibili.com/opus/{1_000_000_000_000_000_100 + index}"
+        for index in range(8)
+    ]
+    monkeypatch.setattr(
+        actions,
+        "run_refresh_all_pipeline",
+        lambda *args, **kwargs: PipelineResult(
+            ok=True,
+            pipeline_skipped=False,
+            raw_link_count=8,
+            new_link_count=4,
+            classified_count=3,
+            skipped_count=1,
+            enriched_count=3,
+            persisted_count=1,
+            duplicate_link_count=1,
+            existing_count=3,
+            non_lottery_count=1,
+            expired_skipped_count=1,
+            persist_skipped_count=1,
+            message="ok",
+        ),
+    )
+    monkeypatch.setattr(actions, "commit_source_checkpoint", lambda result: None)
+    monkeypatch.setattr(actions, "invalidate_activity_cache", lambda: None)
+    monkeypatch.setattr(actions, "set_last_pipeline_persisted", lambda **kwargs: None)
+    monkeypatch.setattr(
+        actions,
+        "DS_HANDLER_BY_ID",
+        {source_id: (lambda **kwargs: check_result, _save_result)},
+    )
+
+    payload = actions.run_action("refresh_source", {"source_id": source_id})
+
+    assert "本轮发现 8 条" in payload["message"]
+    assert "数据库已有 3 条" in payload["message"]
+    assert "新候选 4 条" in payload["message"]
+    assert "过期过滤 1 条" in payload["message"]
+    assert "非抽奖/其他跳过 1 条" in payload["message"]
+    assert "写入时已存在 1 条" in payload["message"]
+    assert "实际新增 1 条" in payload["message"]

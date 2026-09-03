@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from src.activity_store import append_activities, known_activity_ids
 from src.bilibili_client import BilibiliClient
@@ -34,23 +34,116 @@ class PipelineResult:
     enriched_count: int
     persisted_count: int
     skip_reasons: dict[str, int] = field(default_factory=dict)
+    invalid_link_count: int = 0
+    duplicate_link_count: int = 0
+    existing_count: int = 0
+    non_lottery_count: int = 0
+    other_skipped_count: int = 0
+    failed_count: int = 0
+    persist_skipped_count: int = 0
+    expired_skipped_count: int = 0
     message: str = ""
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        # 面向 Job/UI 使用更不易混淆的名称，同时保留原字段向后兼容。
+        payload["discovered_count"] = self.raw_link_count
+        payload["candidate_count"] = self.new_link_count
+        return payload
+
+    @property
+    def discovered_count(self) -> int:
+        return self.raw_link_count
+
+    @property
+    def candidate_count(self) -> int:
+        return self.new_link_count
 
 
-def _dedupe_new_dynamic_ids(raw_urls: list[str]) -> list[str]:
+@dataclass(frozen=True)
+class _DedupeResult:
+    dynamic_ids: list[str]
+    invalid_link_count: int
+    duplicate_link_count: int
+    existing_count: int
+
+
+_FAILED_SKIP_REASONS = frozenset({"链接失效", "正文不可读取", ENRICH_SKIP_REASON})
+
+
+def _skip_breakdown(skip_reasons: Mapping[str, int]) -> tuple[int, int, int]:
+    non_lottery = int(skip_reasons.get("非抽奖活动", 0) or 0)
+    failed = sum(int(skip_reasons.get(reason, 0) or 0) for reason in _FAILED_SKIP_REASONS)
+    total = sum(int(count or 0) for count in skip_reasons.values())
+    other = max(0, total - non_lottery - failed)
+    return non_lottery, other, failed
+
+
+def is_expired_before_scan(activity: Mapping[str, Any], scan_started_at: int | None) -> bool:
+    """判断活动是否「可靠地」在本次扫描开始前已经结束。
+
+    保守策略（宁可多保留，不可误过滤）：
+    - 只有官方互动/预约抽奖且 business_type > 0（即有官方 lottery_notice 支撑）才可能被过滤；
+    - 开奖时间必须来自官方结构化 notice，而不是 inferred / LLM / 文本推算；
+    - 只有严格满足 reliable_end_time < scan_started_at 才返回 True；
+    - reliable_end_time == scan_started_at 或无法证明时返回 False（保留）。
+    """
+    if not scan_started_at:
+        return False
+    try:
+        started_at = int(scan_started_at)
+    except (TypeError, ValueError):
+        return False
+    if started_at <= 0:
+        return False
+    lottery_type = str(activity.get("lottery_type") or "")
+    if lottery_type not in ("互动抽奖", "预约抽奖"):
+        return False
+    try:
+        business_type = int(activity.get("business_type") or 0)
+    except (TypeError, ValueError):
+        business_type = 0
+    if business_type <= 0:
+        return False
+    conditions = activity.get("conditions") or {}
+    if conditions.get("lottery_time_inferred") is True:
+        return False
+    try:
+        reliable_end_time = int(activity.get("lottery_time") or 0)
+    except (TypeError, ValueError):
+        reliable_end_time = 0
+    if reliable_end_time <= 0:
+        return False
+    return reliable_end_time < started_at
+
+
+def _dedupe_new_dynamic_ids(raw_urls: list[str]) -> _DedupeResult:
+    """一次本地遍历完成标准化/批内去重/数据库已有过滤，并保留严格计数。"""
     known = known_activity_ids()
     seen: set[str] = set()
     ordered: list[str] = []
+    invalid_link_count = 0
+    duplicate_link_count = 0
+    existing_count = 0
     for raw_url in raw_urls:
         dynamic_id = normalize_activity_id(str(raw_url))
-        if not dynamic_id or dynamic_id in known or dynamic_id in seen:
+        if not dynamic_id:
+            invalid_link_count += 1
+            continue
+        if dynamic_id in seen:
+            duplicate_link_count += 1
             continue
         seen.add(dynamic_id)
+        if dynamic_id in known:
+            existing_count += 1
+            continue
         ordered.append(dynamic_id)
-    return ordered
+    return _DedupeResult(
+        dynamic_ids=ordered,
+        invalid_link_count=invalid_link_count,
+        duplicate_link_count=duplicate_link_count,
+        existing_count=existing_count,
+    )
 
 
 def _collect_updated_links(ds_results: list[CheckResult]) -> list[str]:
@@ -67,9 +160,15 @@ def run_new_links_pipeline(
     *,
     workers: int = 4,
     on_progress: ProgressCallback | None = None,
+    scan_started_at: int | None = None,
 ) -> PipelineResult:
-    """Step 2～5：仅处理新链接（内存流转，末步落库）。"""
-    dynamic_ids = _dedupe_new_dynamic_ids(raw_urls)
+    """Step 2～5：仅处理新链接（内存流转，末步落库）。
+
+    scan_started_at 不为 None 时，会在入库前过滤「可可靠证明在扫描开始前已结束」的官方活动。
+    0 额外 Bilibili 请求：只复用本流水线已抓取的 official lottery_notice 结构化时间。
+    """
+    dedupe = _dedupe_new_dynamic_ids(raw_urls)
+    dynamic_ids = dedupe.dynamic_ids
 
     if not dynamic_ids:
         return PipelineResult(
@@ -81,6 +180,9 @@ def run_new_links_pipeline(
             skipped_count=0,
             enriched_count=0,
             persisted_count=0,
+            invalid_link_count=dedupe.invalid_link_count,
+            duplicate_link_count=dedupe.duplicate_link_count,
+            existing_count=dedupe.existing_count,
             message="无新链接，流水线结束",
         )
 
@@ -142,6 +244,9 @@ def run_new_links_pipeline(
     worker_count = max(1, min(workers, len(tasks) if tasks else 1))
 
     if not tasks:
+        non_lottery_count, other_skipped_count, failed_count = _skip_breakdown(
+            skip_reasons
+        )
         return PipelineResult(
             ok=True,
             pipeline_skipped=False,
@@ -152,6 +257,12 @@ def run_new_links_pipeline(
             enriched_count=0,
             persisted_count=0,
             skip_reasons=skip_reasons,
+            invalid_link_count=dedupe.invalid_link_count,
+            duplicate_link_count=dedupe.duplicate_link_count,
+            existing_count=dedupe.existing_count,
+            non_lottery_count=non_lottery_count,
+            other_skipped_count=other_skipped_count,
+            failed_count=failed_count,
             message="新链接均已跳过（非抽奖/充电/失效）",
         )
 
@@ -238,7 +349,16 @@ def run_new_links_pipeline(
     if on_progress and enriched_rows:
         on_progress(0, len(enriched_rows), "正在写入活动库…")
 
-    persisted = append_activities(enriched_rows)
+    expired_skipped_count = 0
+    rows_to_persist: list[dict] = []
+    for row in enriched_rows:
+        if is_expired_before_scan(row, scan_started_at):
+            expired_skipped_count += 1
+            continue
+        rows_to_persist.append(row)
+
+    persisted = append_activities(rows_to_persist)
+    persist_skipped_count = max(0, len(rows_to_persist) - persisted)
 
     if on_progress and enriched_rows:
         on_progress(
@@ -246,6 +366,11 @@ def run_new_links_pipeline(
             max(1, len(enriched_rows)),
             f"入库完成，新增 {persisted} 条活动",
         )
+
+    message = f"新入库 {persisted} 条活动"
+    if expired_skipped_count:
+        message += f"，已跳过 {expired_skipped_count} 条在扫描开始前已结束的抽奖"
+    non_lottery_count, other_skipped_count, failed_count = _skip_breakdown(skip_reasons)
 
     return PipelineResult(
         ok=True,
@@ -257,7 +382,15 @@ def run_new_links_pipeline(
         enriched_count=len(enriched_rows),
         persisted_count=persisted,
         skip_reasons=skip_reasons,
-        message=f"新入库 {persisted} 条活动",
+        invalid_link_count=dedupe.invalid_link_count,
+        duplicate_link_count=dedupe.duplicate_link_count,
+        existing_count=dedupe.existing_count,
+        non_lottery_count=non_lottery_count,
+        other_skipped_count=other_skipped_count,
+        failed_count=failed_count,
+        persist_skipped_count=persist_skipped_count,
+        expired_skipped_count=expired_skipped_count,
+        message=message,
     )
 
 
@@ -266,8 +399,12 @@ def run_refresh_all_pipeline(
     *,
     workers: int = 4,
     on_progress: ProgressCallback | None = None,
+    scan_started_at: int | None = None,
 ) -> PipelineResult:
-    """完整 refresh_all：Step 1 结果 → Step 2～5。"""
+    """完整 refresh_all：Step 1 结果 → Step 2～5。
+
+    scan_started_at 为整轮扫描的固定基准时间；透传给新链接流水线做保守过滤。
+    """
     if not any(result.updated for result in ds_results):
         return PipelineResult(
             ok=True,
@@ -282,4 +419,9 @@ def run_refresh_all_pipeline(
         )
 
     raw_links = _collect_updated_links(ds_results)
-    return run_new_links_pipeline(raw_links, workers=workers, on_progress=on_progress)
+    return run_new_links_pipeline(
+        raw_links,
+        workers=workers,
+        on_progress=on_progress,
+        scan_started_at=scan_started_at,
+    )
