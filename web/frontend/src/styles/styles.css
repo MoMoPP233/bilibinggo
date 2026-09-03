@@ -5761,6 +5761,14 @@ body.modal-open {
   color: var(--foreground);
 }
 
+.log-dock-chevron {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.25em;
+  font-size: 14px;
+  line-height: 1;
+}
+
 .log-dock.open .log-dock-toggle,
 .log-dock.is-running .log-dock-toggle {
   background: var(--accent-soft);
@@ -5837,6 +5845,7 @@ body.modal-open {
   border: 1px solid var(--border-soft);
   box-shadow: var(--shadow-md), var(--surface-highlight);
   backdrop-filter: blur(8px);
+  cursor: pointer;
   transform-origin: bottom right;
   opacity: 0;
   visibility: hidden;
@@ -5885,34 +5894,51 @@ body.modal-open {
 }
 
 .log-dock-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
   gap: 12px;
   margin-bottom: 10px;
 }
 
-.log-dock-head-copy {
-  min-width: 0;
-  flex: 1;
-}
-
-.log-dock-title-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .log-dock-title {
+  justify-self: start;
+  min-width: 0;
   margin: 0;
   font-family: var(--font-display);
   font-size: 18px;
 }
 
+.log-dock-chevron-button {
+  display: inline-grid;
+  place-items: center;
+  justify-self: center;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--foreground);
+  cursor: pointer;
+  line-height: 1;
+  transition: opacity var(--motion-fast) var(--motion-ease);
+}
+
+.log-dock-chevron-button:hover {
+  opacity: 0.6;
+}
+
+.log-dock-chevron-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 38%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 .log-dock-status {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
+  justify-self: end;
+  width: max-content;
   padding: 2px 8px;
   border-radius: var(--radius-pill);
   font-size: 11px;
@@ -5920,6 +5946,7 @@ body.modal-open {
   background: var(--surface-soft);
   color: var(--foreground-muted);
   border: 1px solid var(--border-soft);
+  white-space: nowrap;
 }
 
 .log-dock-status.is-running {
@@ -5941,15 +5968,12 @@ body.modal-open {
 }
 
 .log-dock-message {
-  margin: 6px 0 0;
+  grid-column: 1 / -1;
+  min-width: 0;
+  margin: 0;
   font-size: 13px;
   color: var(--foreground-muted);
   line-height: 1.45;
-}
-
-.log-dock-collapse {
-  min-width: 64px;
-  flex-shrink: 0;
 }
 
 .log-dock-body {
@@ -6002,6 +6026,35 @@ body.modal-open {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@media (max-width: 520px) {
+  .log-dock {
+    right: 12px;
+    bottom: 12px;
+  }
+
+  .log-dock-panel {
+    width: min(92vw, 420px);
+  }
+
+  .log-dock-head {
+    grid-template-columns: minmax(72px, 1fr) auto minmax(72px, 1fr);
+    gap: 8px;
+  }
+
+  .log-dock-panel {
+    padding: 12px;
+  }
+
+  .log-dock-title {
+    font-size: 16px;
+  }
+
+  .log-dock-status {
+    padding-inline: 6px;
+    font-size: 10px;
   }
 }
 

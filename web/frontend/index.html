@@ -182,7 +182,7 @@
   </div>
 
   <div class="log-dock is-idle" id="log-dock" data-tone="idle">
-    <button type="button" class="log-dock-toggle" id="log-dock-toggle" aria-expanded="false">
+    <button type="button" class="log-dock-toggle" id="log-dock-toggle" aria-expanded="false" aria-label="打开任务日志">
       <span class="log-dock-icon" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>
       </span>
@@ -191,14 +191,12 @@
     </button>
     <div class="log-dock-panel" id="log-dock-panel" aria-hidden="true">
       <div class="log-dock-head">
-        <div class="log-dock-head-copy">
-          <div class="log-dock-title-row">
-            <p class="log-dock-title">任务日志</p>
-            <span class="log-dock-status is-idle" id="log-dock-status">空闲</span>
-          </div>
-          <p class="log-dock-message" id="job-message">暂无任务</p>
-        </div>
-        <button type="button" class="btn btn-ghost btn-compact btn-pill log-dock-collapse" id="log-dock-collapse" aria-label="收起">收起</button>
+        <p class="log-dock-title">任务日志</p>
+        <button type="button" class="log-dock-chevron-button" id="log-dock-panel-toggle" aria-label="展开任务日志" aria-expanded="false">
+          <span class="log-dock-chevron" aria-hidden="true"></span>
+        </button>
+        <span class="log-dock-status is-idle" id="log-dock-status">空闲</span>
+        <p class="log-dock-message" id="job-message">暂无任务</p>
       </div>
       <div class="log-dock-body" id="log-dock-body">
         <pre class="log-box" id="job-log"></pre>

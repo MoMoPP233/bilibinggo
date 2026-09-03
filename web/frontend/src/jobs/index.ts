@@ -18,6 +18,7 @@ import { escapeHtml, sanitizeUserText, truncateText } from "../utils/text";
 import { loadWatchUsers } from "../watch/index";
 
 let qrcodeLastFocus = null;
+let lastLogDockJobState = "idle";
 
 export function isRefreshPipelineAction(action) {
   return action === "refresh_all" || action === "refresh_source";
@@ -397,7 +398,17 @@ export function syncLogDockTone(job) {
   let tone = "idle";
   if (jobState === "running") tone = "running";
   else if (jobState === "success") tone = "success";
-  else if (jobState === "error") tone = "error";
+  else if (jobState === "error" || jobState === "interrupted") tone = "error";
+
+  const labels = {
+    idle: "空闲",
+    running: "运行中",
+    success: "已完成",
+    error: "失败",
+    cancelled: "已取消",
+    interrupted: "已中断",
+  };
+  const statusLabel = labels[jobState] || labels[tone] || "空闲";
 
   logDock.dataset.tone = tone;
   logDock.classList.toggle("is-idle", tone === "idle");
@@ -407,11 +418,11 @@ export function syncLogDockTone(job) {
 
   const statusEl = document.getElementById("log-dock-status");
   if (statusEl) {
-    const labels = { idle: "空闲", running: "运行中", success: "已完成", error: "失败" };
-    statusEl.textContent = labels[tone] || "空闲";
+    statusEl.textContent = statusLabel;
     statusEl.className = `log-dock-status is-${tone}`;
   }
   if (logDockBadge) {
+    // 原始圆形日志入口只在运行中显示“运行中”角标；收起状态不展示整段状态文字。
     logDockBadge.hidden = tone !== "running";
     logDockBadge.textContent = "运行中";
   }
@@ -441,6 +452,11 @@ export function setLogDockOpen(open) {
   logDockPanel.setAttribute("aria-hidden", String(!open));
   logDockToggle.hidden = open;
   logDockToggle.setAttribute("aria-expanded", String(open));
+  const panelToggle = document.getElementById("log-dock-panel-toggle");
+  panelToggle?.setAttribute("aria-expanded", String(open));
+  panelToggle?.setAttribute("aria-label", open ? "收起任务日志" : "展开任务日志");
+  const panelChevron = panelToggle?.querySelector(".log-dock-chevron");
+  if (panelChevron) panelChevron.textContent = open ? "▼" : "";
   logDock?.classList.toggle("open", open);
   if (open) {
     if (!prefersReducedMotion()) {
@@ -1156,9 +1172,18 @@ export function updateJobUI(job) {
   jobMessage.textContent = sanitizeUserText(job.message) || "暂无任务";
   jobLog.textContent = sanitizeUserText(job.log) || "";
   syncLogDockTone(job);
-  if (job.state === "running") {
+  const jobState = String(job?.state || "idle");
+  const wasRunning = lastLogDockJobState === "running";
+  lastLogDockJobState = jobState;
+  if (jobState === "running") {
     toggleLogDock(true);
     scrollJobLogToBottom({ showHint: true });
+  } else if (
+    wasRunning
+    && ["success", "error", "cancelled", "interrupted"].includes(jobState)
+  ) {
+    // 只在运行态首次进入终态时自动收起；日志内容保留，之后可再次手动展开。
+    toggleLogDock(false);
   } else if (state.logDockOpen) {
     scrollJobLogToBottom({ showHint: false });
   }

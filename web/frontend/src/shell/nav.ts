@@ -2,7 +2,7 @@
 /* eslint-disable */
 /** Migrated from web/static/app.js — logic preserved. */
 
-import { logDockToggle, qrcodeModal } from "../dom";
+import { logDockPanel, logDockToggle, qrcodeModal } from "../dom";
 import { hideQrcodeModal, toggleLogDock, trapQrcodeFocus } from "../jobs/index";
 import { playActivitiesEnter, playOverviewEnter, playSourcesEnter, prefersReducedMotion } from "../utils/motion";
 import { loadWatchUsers } from "../watch/index";
@@ -83,7 +83,22 @@ export function bindNavigation() {
     document.getElementById("sidebar")?.classList.toggle("open");
   });
   logDockToggle?.addEventListener("click", () => toggleLogDock(true));
-  document.getElementById("log-dock-collapse")?.addEventListener("click", () => toggleLogDock(false));
+  // 展开态的整张日志卡可点击收起；三角按钮与内部交互控件不冒泡误折叠。
+  const logDockInteractiveSelector =
+    "a, button, input, select, textarea, [data-copy], pre, .log-box, .log-dock-pin-hint";
+  document
+    .getElementById("log-dock-panel-toggle")
+    ?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleLogDock();
+    });
+  logDockPanel?.addEventListener("click", (event) => {
+    const target = event.target as Element | null;
+    if (target && typeof target.closest === "function") {
+      if (target.closest(logDockInteractiveSelector)) return;
+    }
+    toggleLogDock(false);
+  });
   document.getElementById("qrcode-close")?.addEventListener("click", () => hideQrcodeModal(true));
   document.getElementById("qrcode-backdrop")?.addEventListener("click", () => hideQrcodeModal(true));
   document.addEventListener("keydown", (event) => {
