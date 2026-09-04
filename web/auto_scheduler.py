@@ -16,12 +16,14 @@ from web.auto_config import (
     ALLOWED_CLICK_ACTIONS,
     AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
     CLEANUP_MAINTAIN_INTERVAL_HOURS,
+    FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
+    FOLLOWING_FEED_SCAN_HOUR_OFFSET,
+    FOLLOWING_FEED_SCAN_MINUTE,
     JOB_POLL_INTERVAL_SEC,
     JOB_POLL_TIMEOUT_SEC,
     MIN_REMOTE_STAGE_GAP_SECONDS,
     REFRESH_HOURS,
     TRIPLE_MINUTES,
-    cleanup_maintain_enabled,
 )
 from web.auto_remote_state import (
     clear_expired_risk_pause,
@@ -104,6 +106,7 @@ class SchedulerStatus:
             "server_now": self.server_now,
             "server_now_unix": self.server_now_unix,
             "logs": list(self.logs),
+            "next_task": next_auto_task(),
             "schedule": {
                 "refresh_hours": sorted(REFRESH_HOURS),
                 "triple_minutes": sorted(TRIPLE_MINUTES),
@@ -126,6 +129,7 @@ class AutoScheduler:
         self._done_refresh: set[str] = set()
         self._done_triple: set[str] = set()
         self._done_maintain: set[str] = set()
+        self._done_following: set[str] = set()
         self._snapshot_timer: threading.Timer | None = None
         self._last_snapshot_mono = 0.0
         self._snapshot_pending = False
@@ -400,14 +404,22 @@ class AutoScheduler:
                         self._run_refresh_batch(key)
                         continue
 
-                if (
-                    cleanup_maintain_enabled()
-                    and now.minute == 0
-                    and now.hour % CLEANUP_MAINTAIN_INTERVAL_HOURS == 0
-                ):
+                # 清理数据自动维护：Scheduler 启动即自动拥有每 2 小时维护资格
+                # （无需用户单独开关；旧 enabled 配置不影响统一 Scheduler）。
+                if now.minute == 0 and now.hour % CLEANUP_MAINTAIN_INTERVAL_HOURS == 0:
                     key = f"maint-{now:%Y-%m-%d-%H}"
                     if key not in self._done_maintain:
                         self._run_maintenance(key)
+                        continue
+
+                if (
+                    now.minute == FOLLOWING_FEED_SCAN_MINUTE
+                    and now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL
+                    == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+                ):
+                    key = f"following-{now:%Y-%m-%d-%H}"
+                    if key not in self._done_following:
+                        self._run_following_scan(key)
                         continue
 
                 if now.hour not in REFRESH_HOURS and now.minute in TRIPLE_MINUTES:
@@ -485,6 +497,34 @@ class AutoScheduler:
             self._done_refresh.add(key)
             self._set_pipeline(active=False)
             self._set_phase("等待下一刻度", f"刷新批次异常已跳过：{exc}")
+
+    def _run_following_scan(self, key: str) -> None:
+        if not self._remote_stage_allowed():
+            self._done_following.add(key)
+            return
+        self._set_pipeline(active=False)
+        self._set_phase("关注动态补漏", f"关注动态补漏 {key}")
+        self._log("info", f"关注动态补漏刻度 {key}")
+        try:
+            self._click_and_wait("following_feed_scan")
+            self._done_following.add(key)
+            with self._lock:
+                self._status.message = "关注动态补漏完成"
+            self._mark_remote_stage_finished()
+            self._set_phase("等待下一刻度", "关注动态补漏完成")
+        except CollisionError:
+            self._log("warn", "关注动态补漏发现已有任务在运行，本轮跳过。")
+            self._done_following.add(key)
+        except Exception as exc:
+            if matches_platform_risk(exc):
+                self._pause_all_auto_remote("following_feed_scan", str(exc) or type(exc).__name__)
+            elif _is_hard_failure(exc):
+                self._fatal(str(exc))
+                return
+            else:
+                self._log("warn", f"关注动态补漏跳过：{exc}")
+            self._done_following.add(key)
+            self._set_phase("等待下一刻度", f"关注动态补漏已跳过：{exc}")
 
     def _run_triple_slot(self, key: str) -> None:
         if not self._remote_stage_allowed():
@@ -706,6 +746,66 @@ def _is_hard_failure(exc: BaseException) -> bool:
 
 def _now_iso() -> str:
     return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]]:
+    """按 AutoScheduler 真实 cadence 计算最近各候选任务的下一到期时刻。
+
+    优先级 = 顺序（与 _loop 判定顺序一致）：刷新批次 → 清理维护 → 关注补漏 → 自动参与。
+    """
+    candidates: list[tuple[str, str, datetime]] = []
+    for day_offset in range(0, 2):
+        base_day = (now + timedelta(days=day_offset)).replace(second=0, microsecond=0)
+
+        for hour in sorted(REFRESH_HOURS):
+            cand = base_day.replace(hour=hour, minute=0)
+            if cand > now:
+                candidates.append(("refresh", "刷新批次", cand))
+
+        for hour in range(0, 24, CLEANUP_MAINTAIN_INTERVAL_HOURS):
+            cand = base_day.replace(hour=hour, minute=0)
+            if cand > now:
+                candidates.append(("cleanup", "清理维护", cand))
+
+        for hour in range(0, 24):
+            if hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL != FOLLOWING_FEED_SCAN_HOUR_OFFSET:
+                continue
+            cand = base_day.replace(hour=hour, minute=FOLLOWING_FEED_SCAN_MINUTE)
+            if cand > now:
+                candidates.append(("following", "关注补漏", cand))
+
+        for hour in range(0, 24):
+            if hour in REFRESH_HOURS:
+                continue
+            for minute in sorted(TRIPLE_MINUTES):
+                cand = base_day.replace(hour=hour, minute=minute)
+                if cand > now:
+                    candidates.append(("participate", "自动参与", cand))
+        if candidates:
+            break
+    return candidates
+
+
+def next_auto_task(now: datetime | None = None) -> dict[str, Any]:
+    """返回下一项自动任务（人话分钟数；纯本地，不改任何调度状态）。"""
+    current = now or datetime.now(CN_TZ)
+    candidates = _next_occurrence_candidates(current)
+    if not candidates:
+        return {"label": "", "action": "", "minutes": None, "at_unix": None}
+    # 按到期时间排序；同分保持循环判定顺序（刷新→清理→关注→参与）。
+    candidates.sort(key=lambda item: (item[2], _AUTO_TASK_ORDER.get(item[0], 99)))
+    action, label, due = candidates[0]
+    seconds = max(0, int((due - current).total_seconds()))
+    minutes = (seconds + 59) // 60
+    return {
+        "label": label,
+        "action": action,
+        "minutes": minutes,
+        "at_unix": int(due.timestamp()),
+    }
+
+
+_AUTO_TASK_ORDER = {"refresh": 0, "cleanup": 1, "following": 2, "participate": 3}
 
 
 def _next_slot(now: datetime) -> dict[str, Any]:

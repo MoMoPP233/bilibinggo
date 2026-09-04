@@ -139,35 +139,20 @@
           <strong class="auto-dock-countdown" id="auto-dock-countdown">—</strong>
           <p class="auto-dock-hero-hint" id="auto-dock-hint">—</p>
         </div>
-        <div class="auto-dock-summary">
-          <div class="auto-dock-summary-row">
-            <span class="auto-dock-meta-label">调度</span>
-            <strong class="auto-dock-job-value" id="auto-dock-scheduler">—</strong>
-          </div>
-          <div class="auto-dock-summary-divider" aria-hidden="true"></div>
-          <div class="auto-dock-summary-row">
-            <span class="auto-dock-meta-label">抽奖任务</span>
-            <strong class="auto-dock-job-value" id="auto-dock-job">—</strong>
-          </div>
-        </div>
         <div class="auto-dock-pipeline-block">
           <div class="auto-dock-pipeline-head">
             <span class="auto-dock-meta-label">刷新批次</span>
-            <span class="auto-dock-pipeline-note">整点串行执行</span>
+            <span class="auto-dock-pipeline-note">整点串行执行：1 链接 → 2 动态 → 3 状态</span>
           </div>
           <div class="auto-dock-pipeline" id="auto-dock-pipeline"></div>
         </div>
-        <div class="auto-dock-summary-row auto-maintain-row">
-          <span class="auto-dock-meta-label">清理数据自动维护</span>
-          <label class="auto-toggle">
-            <input type="checkbox" id="auto-cleanup-maintain" />
-            <span class="auto-toggle-track" aria-hidden="true"></span>
-          </label>
+        <div class="auto-schedule-list">
+          <p class="caption auto-dock-schedule-note">自动参与：按既定三连时间执行</p>
+          <p class="caption auto-dock-schedule-note">清理维护：每 2 小时自动执行</p>
+          <p class="caption auto-dock-schedule-note">关注补漏：每 6 小时自动执行</p>
+          <p class="caption auto-dock-schedule-note" id="auto-next-task">—</p>
         </div>
-        <div class="auto-maintain-paused" id="auto-maintain-paused" hidden>
-          <p class="auto-maintain-paused-text">自动维护因平台限制已暂停，请稍后手动恢复。</p>
-          <button type="button" class="btn btn-secondary btn-compact btn-pill" id="auto-maintain-recover">恢复自动维护</button>
-        </div>
+        <p class="caption auto-following-info" id="auto-following-info" hidden></p>
         <div class="auto-dock-actions">
           <button type="button" class="btn btn-primary btn-pill auto-dock-action-btn" id="auto-dock-start">启动调度</button>
           <button type="button" class="btn btn-primary btn-pill auto-dock-action-btn" id="auto-dock-stop" hidden>停止调度</button>

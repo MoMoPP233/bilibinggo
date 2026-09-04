@@ -1215,6 +1215,36 @@ def run_action(
             raise ValueError("一键更新全部数据源不接受额外参数")
         return _update_all_datasources(progress=progress, cancel_event=cancel_event)
 
+    if action == "following_feed_scan":
+        if params:
+            raise ValueError("关注动态补漏不接受额外参数")
+        from src.following_feed import scan_following_feed
+
+        def on_feed_progress(done: int, total: int, message: str) -> None:
+            _raise_if_cancelled(cancel_event)
+            progress(
+                step=1,
+                total=1,
+                message=str(message or "关注动态扫描中…"),
+                log_append=str(message or "关注动态扫描中…"),
+            )
+
+        progress(step=0, total=1, message="开始关注动态补漏扫描…")
+        try:
+            result = scan_following_feed(on_progress=on_feed_progress)
+        except Exception as exc:
+            from web.auto_remote_state import matches_platform_risk as _risk
+            from web.auto_remote_state import record_auto_remote_risk
+
+            if _risk(str(exc)):
+                record_auto_remote_risk(
+                    trigger_stage="following_feed_scan", reason=str(exc)
+                )
+            raise
+        message = str(result.get("message") or "关注动态补漏完成")
+        progress(step=1, total=1, message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+
     if action == "refresh_watch":
         log_lines: list[str] = []
         progress(step=0, total=REFRESH_WATCH_TOTAL, message="准备扫描监控用户动态…")

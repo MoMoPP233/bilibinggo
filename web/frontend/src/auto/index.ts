@@ -11,6 +11,8 @@ import { formatAutoCountdown } from "../utils/format";
 import { prefersReducedMotion } from "../utils/motion";
 import { sanitizeUserText, escapeHtml } from "../utils/text";
 
+let schedulerOpSeq = 0;
+
 export function setAutoDockOpen(open) {
   state.autoDockOpen = open;
   if (!autoDockPanel || !autoDockToggle) return;
@@ -115,6 +117,27 @@ export function updateAutoCollapsedMeta(status) {
   autoDockToggleMeta.textContent = "";
 }
 
+function fmtNextTaskWhen(minutes) {
+  const m = Math.max(0, Number(minutes) || 0);
+  if (m < 1) return "不到1分钟后执行";
+  if (m < 60) return `${m}分钟后执行`;
+  const hours = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest ? `${hours}小时${rest}分钟后执行` : `${hours}小时后执行`;
+}
+
+function renderNextAutoTask(status) {
+  const el = document.getElementById("auto-next-task");
+  if (!el) return;
+  const task = status?.next_task;
+  if (!task || !Number.isFinite(Number(task.minutes))) {
+    el.textContent = "—";
+    return;
+  }
+  const label = sanitizeUserText(task.label || task.action || "自动任务");
+  el.textContent = `${fmtNextTaskWhen(task.minutes)}：${label}`;
+}
+
 export function renderAutoDock(status) {
   if (!status) return;
   state.autoScheduler = status;
@@ -164,6 +187,7 @@ export function renderAutoDock(status) {
   tickAutoCountdown();
   renderAutoPipeline(status.refresh_pipeline);
   updateAutoCollapsedMeta(status);
+  renderNextAutoTask(status);
 
   const running = schedulerState === "running";
   const fatal = schedulerState === "fatal";
@@ -250,65 +274,87 @@ export function stopAutoPolling() {
   }
 }
 
-export async function fetchAutoStatus() {
+export async function fetchAutoStatus(opToken) {
   const status = await fetchJSON("/api/auto/status");
+  if (opToken !== undefined && opToken !== schedulerOpSeq) return status;
   renderAutoDock(status);
-  try {
-    const maintain = await fetchJSON("/api/auto/cleanup-maintain");
-    const toggle = document.getElementById("auto-cleanup-maintain") as HTMLInputElement | null;
-    if (toggle) toggle.checked = Boolean(maintain?.enabled);
-    const paused = document.getElementById("auto-maintain-paused");
-    if (paused) paused.hidden = !Boolean(maintain?.risk_paused);
-  } catch {
-    // 开关状态读取失败不阻塞自动面板。
+  if (opToken !== undefined) {
+    // 带 token 的调用是 start/stop 后台刷新：过期则整体跳过。
+    return status;
   }
+  await refreshFollowingInfo();
   return status;
 }
 
-document.getElementById("auto-maintain-recover")?.addEventListener("click", async () => {
-  try {
-    await fetchJSON("/api/auto/cleanup-maintain/recover", { method: "POST" });
-    showToast("自动维护已恢复", "success", "将在下一正常调度周期继续，不会立即联网。");
-    const paused = document.getElementById("auto-maintain-paused");
-    if (paused) paused.hidden = true;
-  } catch (error) {
-    showToast(String(error?.message || error) || "恢复自动维护失败", "error");
-  }
-});
+function fmtFollowingHM(value) {
+  if (!value) return "";
+  const date = new Date(Number(value) * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 
-document.getElementById("auto-cleanup-maintain")?.addEventListener("change", async (event) => {
-  const enabled = Boolean((event.target as HTMLInputElement).checked);
-  try {
-    await fetchJSON("/api/auto/cleanup-maintain", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    showToast(enabled ? "自动维护已开启" : "自动维护已关闭", "success");
-  } catch (error) {
-    showToast(String(error?.message || error) || "自动维护设置失败", "error");
+function renderFollowingInfo(data) {
+  const info = document.getElementById("auto-following-info");
+  if (!info) return;
+  const status = String(data?.last_status || "waiting");
+  const parts = [];
+  if (status === "failed") {
+    parts.push("关注补漏：上次扫描失败");
+    if (String(data?.last_error || "")) {
+      parts.push(`原因：${sanitizeUserText(String(data.last_error))}`);
+    }
+  } else if (data?.last_scan_at) {
+    parts.push(`关注补漏：上次 ${fmtFollowingHM(data.last_scan_at)}`);
+  } else {
+    parts.push("关注补漏：尚未扫描");
   }
-});
+  if (data?.next_scan_at) {
+    parts.push(`下次 ${fmtFollowingHM(data.next_scan_at)}`);
+  }
+  if (parts.length) {
+    info.hidden = false;
+    info.textContent = parts.join(" · ");
+  } else {
+    info.hidden = true;
+    info.textContent = "";
+  }
+}
+
+export async function refreshFollowingInfo() {
+  try {
+    const data = await fetchJSON("/api/auto/following-feed");
+    renderFollowingInfo(data);
+  } catch {
+    // 读取失败不阻塞自动面板。
+  }
+}
 
 export async function startAutoScheduler() {
-  await fetchJSON("/api/auto/start", { method: "POST" });
-  await fetchAutoStatus();
-  ensureAutoPolling();
-  showToast("定时调度已启动", "success");
+  const token = ++schedulerOpSeq;
+  const status = await fetchJSON("/api/auto/start", { method: "POST" });
+  if (token !== schedulerOpSeq) return;
+  renderAutoDock(status);
+  ensureAutoCountdown();
+  fetchAutoStatus(token).catch(() => {});
+  showToast("调度已启动", "success", "自动远程任务由程序统一按时间执行。");
 }
 
 export async function stopAutoScheduler() {
   const ok = await openAppConfirm({
-    eyebrow: "定时点击",
+    eyebrow: "定时调度",
     title: "确定停止调度？",
-    desc: "停止调度只会停下定时点击监视器，不会取消正在运行的抽奖任务。",
+    desc: "停止调度只会停止安排新的自动任务；正在执行的任务会自然结束，不会被强制取消。",
     confirmLabel: "停止调度",
     cancelLabel: "继续运行",
   });
   if (!ok) return;
-  await fetchJSON("/api/auto/stop", { method: "POST" });
-  await fetchAutoStatus();
-  showToast("定时调度已停止", "info");
+  const token = ++schedulerOpSeq;
+  const status = await fetchJSON("/api/auto/stop", { method: "POST" });
+  if (token !== schedulerOpSeq) return;
+  renderAutoDock(status);
+  fetchAutoStatus(token).catch(() => {});
+  showToast("调度已停止", "info", "正在执行的任务会安全结束，之后不再安排新的自动任务。");
 }
 
 export function bindAutoDock() {

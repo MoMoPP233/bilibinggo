@@ -126,6 +126,7 @@ _JOB_REQUIRES_LOGIN = frozenset(
         "refresh_status",
         "refresh_watch",
         "update_all_datasources",
+        "following_feed_scan",
         "cleanup_auto_maintain",
         "scan_expired_reposts",
         "sync_repost_history",
@@ -139,6 +140,7 @@ _JOB_REQUIRES_LLM = frozenset(
         "refresh_source",
         "refresh_watch",
         "update_all_datasources",
+        "following_feed_scan",
     }
 )
 
@@ -601,6 +603,8 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
     if request.action == "update_all_datasources" and params:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
+    if request.action == "following_feed_scan" and params:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
     if request.action == "scan_expired_reposts" and not set(params) <= {"force_original_ids"}:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作只接受 force_original_ids 参数")
     if request.action == "refresh_source":
@@ -728,6 +732,20 @@ def api_auto_start() -> dict[str, Any]:
 def api_auto_stop() -> dict[str, Any]:
     """只停止定时点击调度器，不会取消抽奖端正在运行的任务。"""
     return auto_scheduler.stop(reason="用户在监视面板停止")
+
+
+@app.get("/api/auto/following-feed", tags=["stable"])
+def api_auto_following_feed_status() -> dict[str, Any]:
+    """读取关注动态补漏最近状态与下次自动扫描时间（本地 0 远程，纯只读）。
+
+    统一 Scheduler 决定执行时机：本接口无开关、无触发副作用。
+    """
+    from src.following_feed import following_feed_summary
+
+    account = get_account_profile()
+    require_login(account, message="请先扫码登录后再查看关注动态补漏")
+    uid = _require_runtime_bilibili_uid()
+    return {"ok": True, "uid": uid, **following_feed_summary()}
 
 
 @app.get("/api/auto/cleanup-maintain", tags=["stable"])

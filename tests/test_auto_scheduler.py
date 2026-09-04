@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from web.auto_config import ALLOWED_CLICK_ACTIONS
-from web.auto_scheduler import AutoScheduler, CollisionError, _is_hard_failure, _next_slot, _probe_job
+from web.auto_scheduler import AutoScheduler, CollisionError, _is_hard_failure, _next_slot, _probe_job, next_auto_task
 from web.job_runner import JobRunner, JobStatus
 
 
@@ -35,6 +35,7 @@ def test_allowed_actions_include_cleanup_maintain() -> None:
             "refresh_status",
             "participate_triple",
             "cleanup_auto_maintain",
+            "following_feed_scan",
         }
     )
 
@@ -250,3 +251,30 @@ def test_next_slot_triple_minute() -> None:
     assert slot["minute"] == 55
     assert slot["action"] == "participate_triple"
     assert slot["action_label"] == "三连参与"
+def _cn(dt):
+    from datetime import datetime
+    return datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, tzinfo=timezone(timedelta(hours=8)))
+
+
+def test_next_auto_task_refresh_priority_on_tie() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 5, 56)))
+    assert task["label"] == "刷新批次"
+    assert task["minutes"] == 4
+
+
+def test_next_auto_task_following_at_1258() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 12, 58)))
+    assert task["label"] == "关注补漏"
+    assert task["minutes"] == 5
+
+
+def test_next_auto_task_participate_shortly() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 2, 2)))
+    assert task["label"] == "自动参与"
+    assert task["minutes"] == 3
+
+
+def test_next_auto_task_cleanup_after_refresh_hour() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 10)))
+    assert task["label"] == "清理维护"
+    assert task["minutes"] == 50

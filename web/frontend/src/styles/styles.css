@@ -6431,29 +6431,11 @@ body.modal-open {
 }
 
 .auto-toggle input:checked + .auto-toggle-track {
-  background: var(--primary);
+  background: var(--success);
 }
 
 .auto-toggle input:checked + .auto-toggle-track::after {
   transform: translateX(16px);
-}
-
-.auto-maintain-paused {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 4px 0 2px;
-  padding: 8px 10px;
-  border: 1px solid var(--danger-soft);
-  border-radius: 10px;
-  background: var(--danger-soft);
-}
-
-.auto-maintain-paused-text {
-  color: var(--danger-alt);
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .auto-dock-job-value[data-tone="error"] {
@@ -6489,6 +6471,8 @@ body.modal-open {
 .auto-dock-pipeline-note {
   font-size: 9px;
   color: var(--foreground-muted);
+  text-align: right;
+  line-height: 1.4;
 }
 
 .auto-dock-pipeline {
@@ -8096,4 +8080,27 @@ body.job-running .main-shell .topbar {
   .update-all-lane-message {
     grid-column: 1 / -1;
   }
+}
+
+.auto-schedule-list {
+  display: grid;
+  gap: 2px;
+  margin: 6px 0 0;
+}
+
+.auto-schedule-list .auto-dock-schedule-note {
+  margin: 0;
+}
+
+.auto-dock-schedule-note {
+  color: var(--foreground-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.auto-following-info {
+  margin: 2px 0 0;
+  color: var(--foreground-muted);
+  font-size: 11px;
+  line-height: 1.4;
 }

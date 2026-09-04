@@ -13,6 +13,7 @@ ALLOWED_CLICK_ACTIONS = frozenset(
         "refresh_status",
         "participate_triple",
         "cleanup_auto_maintain",
+        "following_feed_scan",
     }
 )
 
@@ -22,6 +23,7 @@ ACTION_LABELS = {
     "refresh_status": "刷新任务状态",
     "participate_triple": "三连参与",
     "cleanup_auto_maintain": "清理数据自动维护",
+    "following_feed_scan": "关注动态补漏扫描",
 }
 
 _CLEANUP_MAINTAIN_ENABLED = False
@@ -45,3 +47,9 @@ MIN_REMOTE_STAGE_GAP_SECONDS = 60
 
 # 明确风控后的自动远程固定冷却（6 小时）。用户不可配置；冷却只恢复调度资格。
 AUTO_REMOTE_RISK_COOLDOWN_SECONDS = 6 * 60 * 60
+
+# 关注动态补漏 cadence：每 6 小时一次，落在 hour%6==1 的 :03（01:03/07:03/13:03/19:03），
+# 避开公共刷新整点(:00)、cleanup 偶数整点，且 :03 不在 TRIPLE_MINUTES 内。
+FOLLOWING_FEED_SCAN_HOUR_INTERVAL = 6
+FOLLOWING_FEED_SCAN_HOUR_OFFSET = 1
+FOLLOWING_FEED_SCAN_MINUTE = 3

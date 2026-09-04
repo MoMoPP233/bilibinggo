@@ -12,6 +12,7 @@ ALLOWED_JOB_ACTIONS = frozenset(
         "refresh_watch",
         "refresh_status",
         "update_all_datasources",
+        "following_feed_scan",
         "participate",
         "participate_triple",
         "cleanup_auto_maintain",

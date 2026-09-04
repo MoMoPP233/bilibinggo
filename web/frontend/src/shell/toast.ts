@@ -38,12 +38,12 @@ export function showToast(message, type = "info", detail = "", actions = []) {
     <div class="toast-progress" aria-hidden="true"></div>`;
   const duration =
     actions.length > 0
-      ? Math.max(type === "error" ? 8000 : 4200, 10000)
+      ? Math.max(type === "error" ? 7000 : 3200, 10000)
       : type === "error"
-        ? 8000
+        ? 7000
         : type === "running"
-          ? 2400
-          : 4200;
+          ? 1400
+          : 3200;
   const progress = toast.querySelector(".toast-progress");
   if (progress) progress.style.animationDuration = `${duration}ms`;
   toast.querySelector(".toast-close")?.addEventListener("click", () => toast.remove());
