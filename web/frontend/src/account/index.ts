@@ -4,7 +4,7 @@
 
 import { state } from "../state";
 import { fetchJSON } from "../api/client";
-import { shouldPreserveLoggedInSnapshot } from "./account-preserve";
+import { isTransientAccountOffline, shouldPreserveLoggedInSnapshot } from "./account-preserve";
 import { LLM_REQUIRED_ACTIONS, LOGIN_REQUIRED_ACTIONS, ONBOARDING_STEPS, ONBOARDING_STORAGE_KEY, accountHero, onboardingFootNote, onboardingPanel, onboardingPrimaryBtn, onboardingProgressFill, onboardingProgressLabel, onboardingSkipBtn, onboardingStepsEl, sidebarAccountCard, sidebarLoginBtn, sidebarLogoutBtn } from "../dom";
 import { loadSettings } from "../settings/index";
 import { closeAppConfirm, openAppConfirm } from "../shell/confirm";
@@ -14,6 +14,25 @@ import { formatAccountStat } from "../utils/format";
 import { prefersReducedMotion } from "../utils/motion";
 import { escapeHtml, sanitizeUserText } from "../utils/text";
 import { renderWatchUsersPanel, updateWatchUserFormState } from "../watch/index";
+
+let accountRequestSeq = 0;
+
+function buildUnconfirmedAccount(message) {
+  return {
+    logged_in: false,
+    expired: false,
+    unconfirmed: true,
+    message: String(message || "登录状态暂时无法确认"),
+    uname: "",
+    face: "",
+    mid: null,
+    following: null,
+    dynamic_count: null,
+    unread_messages: null,
+    unread_at: null,
+    extras_loading: false,
+  };
+}
 
 export function isLoggedIn() {
   return Boolean(state.account?.logged_in && !state.account?.expired);
@@ -342,6 +361,39 @@ export function renderAccountViews(account) {
   if (sidebarLoginBtn) sidebarLoginBtn.hidden = loggedIn;
   if (sidebarLogoutBtn) sidebarLogoutBtn.hidden = !loggedIn;
 
+  if (account.unconfirmed) {
+    if (sidebarLoginBtn) sidebarLoginBtn.hidden = false;
+    if (sidebarLogoutBtn) sidebarLogoutBtn.hidden = true;
+    const unknownHtml = `
+      <div class="account-empty">
+        ${renderAccountAvatarWrap(account, { large: true })}
+        <div>
+          <h3>登录状态暂时无法确认</h3>
+          <p>${escapeHtml(account.message || "登录状态暂时无法确认，稍后会再次自动检查。")}</p>
+          ${renderSetupChecklist()}
+          <span class="account-status warn">不会清除本地 Cookie；可稍后重试或直接扫码登录。</span>
+        </div>
+      </div>`;
+    if (accountHero) {
+      accountHero.classList.remove("is-ready", "is-warn", "is-offline");
+      accountHero.classList.add("is-warn");
+      accountHero.innerHTML = unknownHtml;
+    }
+    if (sidebarAccountCard) {
+      sidebarAccountCard.innerHTML = `
+        <div class="sidebar-account-mini is-warn" title="${escapeHtml(account.message || "登录状态未确认")}">
+          ${renderAccountAvatarWrap(account)}
+          <div class="sidebar-account-text sidebar-fade">
+            <p class="sidebar-account-name">状态未确认</p>
+            <p class="sidebar-account-sub">登录状态暂时无法确认</p>
+          </div>
+        </div>`;
+    }
+    updateWatchUserFormState();
+    renderOnboardingPanel();
+    return;
+  }
+
   if (!loggedIn) {
     const networkError = Boolean(account.network_error);
     const cookieSaved = Boolean(account.cookie_saved);
@@ -446,34 +498,54 @@ export function renderAccountViews(account) {
 }
 
 export async function loadAccount() {
+  const token = ++accountRequestSeq;
+  let account;
   try {
-    const account = await fetchJSON("/api/account", { timeoutMs: 12000 });
-    if (shouldPreserveLoggedInSnapshot(state.account, account)) {
-      // 平台瞬时不可达（风控 / 网络抖动）时，保留最近一次成功登录显示，
-      // 避免把“已登录”误切成“未登录 / 网络异常”，也不需要用户按 F5 恢复。
+    account = await fetchJSON("/api/account", { timeoutMs: 12000 });
+  } catch (error) {
+    if (token !== accountRequestSeq) {
+      // 旧请求晚返回：不覆盖更新后的登录状态。
+      return state.account || buildUnconfirmedAccount("登录状态暂时无法确认");
+    }
+    if (hasLoggedInSnapshot()) {
+      // 临时刷新失败：保留上次明确登录的展示，绝不清空。
+      renderAccountViews(state.account);
+      showToast("暂时无法确认登录状态，已保留上次状态", "info");
+      return state.account;
+    }
+    const message =
+      sanitizeUserText(error?.message || error) || "登录状态暂时无法确认";
+    const unknown = buildUnconfirmedAccount(message);
+    renderAccountViews(unknown);
+    return unknown;
+  }
+
+  if (token !== accountRequestSeq) {
+    // 旧请求晚返回：不覆盖更新后的登录状态。
+    return state.account || account;
+  }
+
+  if (isTransientAccountOffline(account)) {
+    // 平台瞬时不可达 / 风控：不把“暂时无法确认”当成登出。
+    if (hasLoggedInSnapshot()) {
       renderAccountViews(state.account);
       return state.account;
     }
-    renderAccountViews(account);
-    return account;
-  } catch (error) {
-    const message = sanitizeUserText(error.message || error) || "账号信息加载失败，请稍后重试";
-    const account = {
-      logged_in: false,
-      expired: true,
-      message,
-      uname: "",
-      face: "",
-      mid: null,
-      following: null,
-      dynamic_count: null,
-      unread_messages: null,
-      unread_at: null,
-      extras_loading: false,
-    };
+    account.unconfirmed = true;
+    account.message = "登录状态暂时无法确认，稍后会再次自动检查。";
     renderAccountViews(account);
     return account;
   }
+
+  if (shouldPreserveLoggedInSnapshot(state.account, account)) {
+    // 双保险：仅当后端给出明确的“非已登录且非可靠登出”语义时才保留旧快照。
+    renderAccountViews(state.account);
+    return state.account;
+  }
+
+  // 明确已登录，或后端可靠确认未登录（-101/登出/无 Cookie）：照常更新。
+  renderAccountViews(account);
+  return account;
 }
 
 export async function loadAccountExtras() {
