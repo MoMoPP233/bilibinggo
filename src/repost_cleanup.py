@@ -1041,6 +1041,39 @@ def auto_maintenance_paused_state() -> tuple[bool, str]:
     return False, ""
 
 
+def auto_clear_expired_maintenance_risk(
+    *,
+    cooldown_seconds: int,
+    now_ts: int | None = None,
+) -> bool:
+    """cleanup 风控冷却到期后本地自动恢复调度资格（0 远程，不立即执行维护）。
+
+    只针对自动 cleanup maintenance 的风控暂停字段（maintenance_risk_paused /
+    _at / _reason），以 maintenance_risk_paused_at + cooldown_seconds 判定。
+    不清除任何其它人工/删除安全状态。
+    """
+    try:
+        _, uid_int = require_login()
+    except RuntimeError:
+        return False
+    uid = str(uid_int)
+    checkpoint = get_checkpoint(uid)
+    if not bool(getattr(checkpoint, "maintenance_risk_paused", False)):
+        return False
+    paused_at = getattr(checkpoint, "maintenance_risk_paused_at", None)
+    try:
+        paused_at_int = int(paused_at)
+    except (TypeError, ValueError):
+        return False
+    if paused_at_int <= 0:
+        return False
+    now = int(time.time()) if now_ts is None else int(now_ts)
+    if now < paused_at_int + int(cooldown_seconds):
+        return False
+    clear_maintenance_risk(uid)
+    return True
+
+
 def reconciliation_needs_sync(uid: str) -> bool:
     """纯本地最终一致性检查：是否存在“已 confirmed 但可能未被增量同步覆盖”的转发。
 

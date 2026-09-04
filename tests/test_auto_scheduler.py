@@ -109,7 +109,7 @@ def test_wait_until_terminal_never_calls_cancel() -> None:
     runner.try_start.assert_called_once_with("refresh_status", {}, source="auto")
 
 
-def test_collision_in_refresh_batch_propagates() -> None:
+def test_collision_in_refresh_batch_skips_without_fatal_or_cancel() -> None:
     runner = MagicMock()
     runner.is_running.return_value = True
     runner.get_status.return_value.to_dict.return_value = {
@@ -118,9 +118,11 @@ def test_collision_in_refresh_batch_propagates() -> None:
         "message": "busy",
     }
     scheduler = AutoScheduler(job_runner=runner)
-    with pytest.raises(CollisionError):
-        scheduler._run_refresh_batch("2026-07-17-3")
+    scheduler._run_refresh_batch("2026-07-17-3")
+    assert "2026-07-17-3" in scheduler._done_refresh
+    runner.try_start.assert_not_called()
     runner.cancel.assert_not_called()
+    assert scheduler._status.state != "fatal"
 
 
 def test_probe_only_reads_runner_status() -> None:

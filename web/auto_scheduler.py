@@ -14,12 +14,21 @@ from src.restart_control import restart_control
 from web.auto_config import (
     ACTION_LABELS,
     ALLOWED_CLICK_ACTIONS,
+    AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
     CLEANUP_MAINTAIN_INTERVAL_HOURS,
     JOB_POLL_INTERVAL_SEC,
     JOB_POLL_TIMEOUT_SEC,
+    MIN_REMOTE_STAGE_GAP_SECONDS,
     REFRESH_HOURS,
     TRIPLE_MINUTES,
     cleanup_maintain_enabled,
+)
+from web.auto_remote_state import (
+    clear_expired_risk_pause,
+    is_risk_paused,
+    matches_platform_risk,
+    record_auto_remote_risk,
+    risk_pause_state,
 )
 from web.event_hub import event_hub
 from web.job_runner import JobRunner, runner
@@ -120,6 +129,8 @@ class AutoScheduler:
         self._snapshot_timer: threading.Timer | None = None
         self._last_snapshot_mono = 0.0
         self._snapshot_pending = False
+        # 上一次“自动远程大任务”结束的单调时间；用于不同大任务之间 60s 错峰。
+        self._last_remote_stage_finished_mono = 0.0
 
     def get_status(self) -> dict[str, Any]:
         now = datetime.now(CN_TZ)
@@ -220,6 +231,64 @@ class AutoScheduler:
             )
         if changed:
             self._schedule_auto_snapshot(force=False)
+
+    def _pause_all_auto_remote(self, stage_label: str, message: object) -> None:
+        state = record_auto_remote_risk(
+            trigger_stage=stage_label, reason=str(message or "")
+        )
+        until = state.get("paused_until")
+        until_text = (
+            datetime.fromtimestamp(int(until), CN_TZ).strftime("%H:%M")
+            if until
+            else "稍后"
+        )
+        hours = AUTO_REMOTE_RISK_COOLDOWN_SECONDS // 3600
+        self._log(
+            "error",
+            f"检测到平台风控，自动远程任务进入 {hours} 小时冷却（至 {until_text}）：{message}",
+        )
+        self._set_phase(
+            "等待下一刻度",
+            f"自动远程任务已因平台风控进入 {hours} 小时冷却，冷却结束后等下一次正常调度。",
+        )
+
+    def _remote_stage_allowed(self) -> bool:
+        """返回当前是否允许启动下一个自动远程大任务（0 远程只读判断）。
+
+        仅在风控冷却期内禁止新的自动远程任务；冷却到期后本地清除，
+        只恢复“等待下一次正常调度”的资格，绝不主动探测或补跑。
+        """
+        if is_risk_paused():
+            state = risk_pause_state()
+            reason = state.get("reason") or state.get("code") or "平台风控"
+            until = state.get("paused_until")
+            until_text = (
+                datetime.fromtimestamp(int(until), CN_TZ).strftime("%H:%M")
+                if until
+                else ""
+            )
+            self._log(
+                "warn",
+                f"自动远程任务风控冷却中（{state.get('trigger_stage') or '未知'}）："
+                f"{reason}，至 {until_text}。本轮跳过且不联网。",
+            )
+            return False
+        clear_expired_risk_pause()
+        now_mono = time.monotonic()
+        if (
+            self._last_remote_stage_finished_mono > 0
+            and now_mono - self._last_remote_stage_finished_mono
+            < MIN_REMOTE_STAGE_GAP_SECONDS
+        ):
+            self._log(
+                "info",
+                "上一个自动远程大任务刚结束，尚未达到最小错峰间隔，本轮跳过。",
+            )
+            return False
+        return True
+
+    def _mark_remote_stage_finished(self) -> None:
+        self._last_remote_stage_finished_mono = time.monotonic()
 
     def _publish_auto_log(self, entry: LogEntry) -> None:
         try:
@@ -357,6 +426,10 @@ class AutoScheduler:
             self._fatal(f"未预期错误：{friendly_error(exc)}")
 
     def _run_refresh_batch(self, key: str) -> None:
+        if not self._remote_stage_allowed():
+            # 全局暂停或 60s 错峰期内：本轮整批跳过，不致命、不补跑。
+            self._done_refresh.add(key)
+            return
         self._set_phase("刷新批次", f"开始刷新批次 {key}")
         self._log("info", f"刷新批次开始 {key}：一键更新 → 监控动态 → 刷新状态")
         self._set_pipeline(active=True, step_index=0, waiting=False)
@@ -370,29 +443,53 @@ class AutoScheduler:
                 try:
                     self._click_and_wait(action, pipeline_index=index)
                 except CollisionError:
-                    raise
+                    # 已有 Job 在运行：本轮直接跳过，不 fatal、不补跑。
+                    self._log(
+                        "warn",
+                        f"「{ACTION_LABELS.get(action, action)}」发现已有任务在运行，本轮跳过。",
+                    )
+                    self._done_refresh.add(key)
+                    self._set_pipeline(active=False)
+                    return
                 except Exception as exc:
+                    if matches_platform_risk(exc):
+                        self._pause_all_auto_remote(
+                            f"refresh:{action}", str(exc) or type(exc).__name__
+                        )
+                        self._done_refresh.add(key)
+                        self._set_pipeline(active=False)
+                        return
                     if _is_hard_failure(exc):
                         raise
                     self._log("warn", f"「{ACTION_LABELS.get(action, action)}」业务结束：{exc}，继续下一项")
             self._done_refresh.add(key)
             with self._lock:
                 self._status.refresh_batch_key = key
+            self._mark_remote_stage_finished()
             self._log("info", f"刷新批次完成 {key}")
             self._set_pipeline(active=False)
             self._set_phase("等待下一刻度", "刷新批次已完成")
         except CollisionError:
-            raise
+            # 兜底：任何时刻发现撞车都以“跳过本轮”处理，不致命。
+            self._log("warn", f"刷新批次检测到任务撞车，本轮已跳过：{key}")
+            self._done_refresh.add(key)
+            self._set_pipeline(active=False)
         except Exception as exc:
-            if _is_hard_failure(exc):
+            if matches_platform_risk(exc):
+                self._pause_all_auto_remote("refresh_batch", str(exc) or type(exc).__name__)
+            elif _is_hard_failure(exc):
                 self._fatal(str(exc))
                 return
-            self._log("error", f"刷新批次中断 {key}：{exc}")
+            else:
+                self._log("error", f"刷新批次中断 {key}：{exc}")
             self._done_refresh.add(key)
             self._set_pipeline(active=False)
             self._set_phase("等待下一刻度", f"刷新批次异常已跳过：{exc}")
 
     def _run_triple_slot(self, key: str) -> None:
+        if not self._remote_stage_allowed():
+            self._done_triple.add(key)
+            return
         self._set_pipeline(active=False)
         self._set_phase("三连参与", f"触发三连参与 {key}")
         self._log("info", f"三连参与刻度 {key}")
@@ -401,6 +498,7 @@ class AutoScheduler:
             self._done_triple.add(key)
             with self._lock:
                 self._status.triple_slot_key = key
+            self._mark_remote_stage_finished()
             if outcome and outcome.get("skipped"):
                 msg = str(outcome.get("message") or "当前没有可参与活动，已跳过")
                 self._log("info", f"三连参与已跳过：{msg}")
@@ -408,42 +506,75 @@ class AutoScheduler:
             else:
                 self._set_phase("等待下一刻度", "三连参与已完成")
         except CollisionError:
-            raise
+            self._log("warn", "三连参与发现已有任务在运行，本轮跳过。")
+            self._done_triple.add(key)
         except Exception as exc:
-            if _is_hard_failure(exc):
+            if matches_platform_risk(exc):
+                self._pause_all_auto_remote("participate_triple", str(exc) or type(exc).__name__)
+            elif _is_hard_failure(exc):
                 self._fatal(str(exc))
                 return
-            self._log("info", f"三连参与已跳过：{exc}")
+            else:
+                self._log("info", f"三连参与已跳过：{exc}")
             self._done_triple.add(key)
             self._set_phase("等待下一刻度", f"已跳过：{exc}")
 
     def _run_maintenance(self, key: str) -> None:
+        if not self._remote_stage_allowed():
+            self._done_maintain.add(key)
+            return
         self._set_pipeline(active=False)
         self._set_phase("清理维护", f"自动维护刻度 {key}")
         from src.repost_cleanup import auto_maintenance_paused_state
 
         paused, pause_reason = auto_maintenance_paused_state()
         if paused:
-            self._log("warn", f"自动维护因平台限制已暂停，请稍后手动恢复。{pause_reason}")
-            self._done_maintain.add(key)
-            with self._lock:
-                self._status.message = "自动维护因平台限制已暂停，请稍后手动恢复。"
-            self._set_phase("等待下一刻度", "自动维护因平台限制已暂停，请稍后手动恢复。")
-            return
+            from src.repost_cleanup import auto_clear_expired_maintenance_risk
+
+            cleared = auto_clear_expired_maintenance_risk(
+                cooldown_seconds=AUTO_REMOTE_RISK_COOLDOWN_SECONDS
+            )
+            if not cleared:
+                self._log(
+                    "warn",
+                    f"自动维护风控冷却中，本轮跳过且不联网：{pause_reason}",
+                )
+                self._done_maintain.add(key)
+                with self._lock:
+                    self._status.message = "自动维护风控冷却中，冷却结束后等下一次正常调度。"
+                self._set_phase(
+                    "等待下一刻度",
+                    "自动维护风控冷却中，冷却结束后等下一次正常调度。",
+                )
+                return
+            self._log(
+                "info",
+                "自动维护风控冷却已到期，已本地恢复调度资格（不立即联网）。",
+            )
         self._log("info", f"清理数据自动维护刻度 {key}")
         try:
             self._click_and_wait("cleanup_auto_maintain")
             self._done_maintain.add(key)
             with self._lock:
                 self._status.message = "自动维护完成"
+            self._mark_remote_stage_finished()
             self._set_phase("等待下一刻度", "自动维护完成")
+            # cleanup 若在运行中命中风控，会把自己 maintenance_risk_paused 置 ON；
+            # 此处把同一风险同时提升为“全局自动远程暂停”。
+            newly_paused, new_reason = auto_maintenance_paused_state()
+            if newly_paused:
+                self._pause_all_auto_remote("cleanup_auto_maintain", new_reason or "cleanup 风控暂停")
         except CollisionError:
-            raise
+            self._log("warn", "自动维护发现已有任务在运行，本轮跳过。")
+            self._done_maintain.add(key)
         except Exception as exc:
-            if _is_hard_failure(exc):
+            if matches_platform_risk(exc):
+                self._pause_all_auto_remote("cleanup_auto_maintain", str(exc) or type(exc).__name__)
+            elif _is_hard_failure(exc):
                 self._fatal(str(exc))
                 return
-            self._log("warn", f"自动维护跳过：{exc}")
+            else:
+                self._log("warn", f"自动维护跳过：{exc}")
             self._done_maintain.add(key)
             self._set_phase("等待下一刻度", f"自动维护已跳过：{exc}")
 

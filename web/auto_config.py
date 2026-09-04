@@ -38,3 +38,10 @@ def set_cleanup_maintain_enabled(enabled: bool) -> bool:
 
 JOB_POLL_INTERVAL_SEC = 2.0
 JOB_POLL_TIMEOUT_SEC = 6 * 60 * 60
+
+# 不同“自动远程大任务”之间的最小间隔（如刷新批次→cleanup/自动参与）。
+# 同一刷新批次内部的 refresh_all → refresh_watch → refresh_status 不受影响。
+MIN_REMOTE_STAGE_GAP_SECONDS = 60
+
+# 明确风控后的自动远程固定冷却（6 小时）。用户不可配置；冷却只恢复调度资格。
+AUTO_REMOTE_RISK_COOLDOWN_SECONDS = 6 * 60 * 60
