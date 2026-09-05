@@ -53,24 +53,6 @@ function showPanel() {
   if (lanes) lanes.innerHTML = '<p class="caption">等待任务开始…</p>';
 }
 
-function statusIcon(status) {
-  switch (String(status || "waiting")) {
-    case "success":
-      return "✓";
-    case "failed":
-      return "✕";
-    case "risk":
-      return "!";
-    case "running":
-      return "●";
-    case "not_run":
-    case "stopped":
-      return "—";
-    default:
-      return "○";
-  }
-}
-
 function scanMeta(entry) {
   const status = String(entry?.status || "waiting");
   if (status !== "success" && status !== "risk") return [];

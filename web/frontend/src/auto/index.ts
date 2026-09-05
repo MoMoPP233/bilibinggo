@@ -103,11 +103,23 @@ export function renderAutoPipeline(pipeline) {
     .join("");
 }
 
+function nextTaskOf(status) {
+  const task = status?.next_task;
+  if (!task || !Number.isFinite(Number(task.minutes))) return null;
+  return task;
+}
+
+function nextTaskUnix(status) {
+  const task = nextTaskOf(status);
+  const unix = Number(task?.at_unix);
+  return Number.isFinite(unix) ? unix : null;
+}
+
 export function updateAutoCollapsedMeta(status) {
   if (!autoDockToggleMeta) return;
   const schedulerState = String(status?.state || "idle");
   if (schedulerState === "running") {
-    const countdown = formatAutoCountdown(status?.next_slot?.at_unix);
+    const countdown = formatAutoCountdown(nextTaskUnix(status));
     autoDockToggleMeta.hidden = false;
     autoDockToggleMeta.textContent = countdown === "—" ? "…" : countdown;
     return;
@@ -129,8 +141,8 @@ function fmtNextTaskWhen(minutes) {
 function renderNextAutoTask(status) {
   const el = document.getElementById("auto-next-task");
   if (!el) return;
-  const task = status?.next_task;
-  if (!task || !Number.isFinite(Number(task.minutes))) {
+  const task = nextTaskOf(status);
+  if (!task) {
     el.textContent = "—";
     return;
   }
@@ -149,7 +161,11 @@ export function renderAutoDock(status) {
   const stateLabel = sanitizeUserText(status.state_label || status.message || "尚未启动");
   const message = sanitizeUserText(status.message || "");
   const phase = sanitizeUserText(status.current_phase || "—");
-  const hint = sanitizeUserText(status.next_hint || status.next_slot?.hint || "—");
+  const task = nextTaskOf(status);
+  // 单一“下一自动任务”概念：优先 next_task（覆盖刷新/清理/关注/参与全套 cadence）。
+  const hint = task
+    ? `下次${sanitizeUserText(task.label || "自动任务")}`
+    : sanitizeUserText(status.next_hint || "—");
 
   if (autoDockStatus) {
     // 头部只保留短状态，长进度细节交给「调度 / 抽奖任务」行
@@ -167,7 +183,7 @@ export function renderAutoDock(status) {
   }
   const hero = document.querySelector(".auto-dock-hero");
   const pipelineBlock = document.querySelector(".auto-dock-pipeline-block");
-  const countdownSec = getAutoCountdownSeconds(status.next_slot?.at_unix);
+  const countdownSec = getAutoCountdownSeconds(nextTaskUnix(status));
   const urgent = schedulerState === "running" && countdownSec !== null && countdownSec > 0 && countdownSec < 60;
   if (hero) {
     hero.classList.toggle("is-live", schedulerState === "running");
@@ -234,7 +250,7 @@ export function renderAutoDock(status) {
 export function tickAutoCountdown() {
   const status = state.autoScheduler;
   if (!autoDockCountdown) return;
-  const targetUnix = status?.next_slot?.at_unix;
+  const targetUnix = nextTaskUnix(status);
   autoDockCountdown.textContent = formatAutoCountdown(targetUnix);
   const countdownSec = getAutoCountdownSeconds(targetUnix);
   const running = String(status?.state || "") === "running";

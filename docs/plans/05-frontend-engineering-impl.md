@@ -149,7 +149,6 @@ web/static/
     index.html
     assets/*
   favicon.svg                    # 可继续放在 static 根，由 FastAPI 提供
-  backup_pre_frontend/           # 切换时归档旧 index.html/app.js/styles.css（可选）
 
 web/app.py                       # 改为托管 dist（§8）
 ```
@@ -330,7 +329,7 @@ python scripts/run_dashboard.py
 1. 建 `web/frontend` 工程；复制 HTML/CSS；搭通 `dev` + proxy。  
 2. 分域把 `app.js` 迁成 TS，直到 `npm run build` 成功且手测通过。  
 3. 改 `web/app.py` 托管 `static/dist`（§8）。  
-4. 将旧 `web/static/index.html`、`app.js`、`styles.css` **移到** `web/static/backup_pre_frontend/`（或 `data/backup/...`），**运行路径不再读取**。  
+4. 旧 web/static/index.html、pp.js、styles.css 在迁移期间曾归档；该历史归档已随代码/UI 收敛 V5 移除，运行路径不再读取。
 5. 保留 `web/static/favicon.svg`（及 dist 未包含的静态小资源）的服务方式。  
 6. 更新打包脚本（§9）；跑一次 windows build 或至少 `npm run build` + 本地 dashboard。  
 7. 文档：`README` / packaging README 注明需 Node 20 才能从源码构建前端。
@@ -512,6 +511,5 @@ if (-not (Test-Path (Join-Path $Root "web\static\dist\index.html"))) {
 |----|------|
 | 拍板 | ✅ 全部按建议 + 设计零改动 |
 | 本实现规范 | ✅ 成文 |
-| P1–P5 编码 | ✅ 已落地（`web/frontend` → `web/static/dist`；旧资源见 `web/static/backup_pre_frontend/`） |
 
 全部验收后回写路线图 §5。

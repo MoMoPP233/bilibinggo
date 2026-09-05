@@ -26,7 +26,12 @@ export type ApiError = Error & ApiErrorFields;
 
 export interface AutoStatus {
   state?: string;
-  next_slot?: number | null;
+  next_task?: {
+    label?: string;
+    action?: string;
+    minutes?: number | null;
+    at_unix?: number | null;
+  } | null;
   server_now?: number | null;
   logs?: Array<Record<string, unknown>>;
   pipeline?: unknown;

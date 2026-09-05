@@ -203,7 +203,7 @@ class AutoScheduler:
                     daemon=True,
                 )
                 self._thread.start()
-        self._log("info", "调度器已启动（仅点击 4 个按钮，不干涉抽奖程序其它功能）")
+        self._log("info", "调度器已启动（按计划投递自动任务：刷新 / 参与 / 清理维护 / 关注补漏）")
         self._schedule_auto_snapshot(force=True)
         return self.get_status()
 
