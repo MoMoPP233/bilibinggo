@@ -57,6 +57,18 @@ def test_watch_users_crud(isolated_home: Path, monkeypatch: pytest.MonkeyPatch) 
     candidates_path = isolated_home / "config" / "missing_candidates.json"
     monkeypatch.setattr("src.watch_users.WATCH_USERS_PATH", watch_path)
     monkeypatch.setattr("src.watch_users.CANDIDATES_PATH", candidates_path)
+
+    class _NoopClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        "src.watch_users.BilibiliClient",
+        lambda *a, **k: _NoopClient(),
+    )
     monkeypatch.setattr(
         "src.watch_users.resolve_watch_user_name",
         lambda _client, mid: f"用户{mid}",

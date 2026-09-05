@@ -34,6 +34,19 @@ def test_enrich_forward_skips_when_parse_not_lottery(monkeypatch) -> None:
 
 
 def test_pipeline_continues_when_enrich_skipped(monkeypatch) -> None:
+
+    class _NoopClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+
+    monkeypatch.setattr(
+        "src.pipeline.refresh_all_pipeline.BilibiliClient",
+        lambda *a, **k: _NoopClient(),
+    )
     saved: list[dict] = []
 
     def fake_classify(client, dynamic_id):
@@ -96,6 +109,19 @@ def test_pipeline_continues_when_enrich_skipped(monkeypatch) -> None:
 
 
 def test_pipeline_passes_classify_content_to_enrich(monkeypatch) -> None:
+
+    class _NoopClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+
+    monkeypatch.setattr(
+        "src.pipeline.refresh_all_pipeline.BilibiliClient",
+        lambda *a, **k: _NoopClient(),
+    )
     captured: dict[str, str | None] = {}
 
     def fake_classify(client, dynamic_id):
@@ -150,6 +176,19 @@ def test_pipeline_passes_classify_content_to_enrich(monkeypatch) -> None:
 
 
 def test_pipeline_continues_on_legacy_not_lottery_runtime_error(monkeypatch) -> None:
+
+    class _NoopClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+
+    monkeypatch.setattr(
+        "src.pipeline.refresh_all_pipeline.BilibiliClient",
+        lambda *a, **k: _NoopClient(),
+    )
     saved: list[dict] = []
 
     def fake_classify(client, dynamic_id):

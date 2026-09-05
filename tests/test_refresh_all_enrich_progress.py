@@ -4,6 +4,19 @@ from src.pipeline.refresh_all_pipeline import run_new_links_pipeline
 
 
 def test_enrich_progress_updates_every_item(monkeypatch) -> None:
+
+    class _NoopClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+
+    monkeypatch.setattr(
+        "src.pipeline.refresh_all_pipeline.BilibiliClient",
+        lambda *a, **k: _NoopClient(),
+    )
     events: list[tuple[int, int, str]] = []
 
     def fake_classify(client, dynamic_id):

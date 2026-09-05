@@ -7,6 +7,25 @@ from pathlib import Path
 
 import pytest
 
+# 尽早导入并安装外部网络 guard：pytest_configure 在收集任何测试模块之前执行，
+# 且本文件顶层导入发生在插件加载期，可覆盖“模块 import 期间触网”的场景。
+ROOT_FOR_CONFTEST = Path(__file__).resolve().parents[1]
+if str(ROOT_FOR_CONFTEST) not in sys.path:
+    sys.path.insert(0, str(ROOT_FOR_CONFTEST))
+
+from tests.offline_guard import install_offline_guard, restore_proxy_env  # noqa: E402
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """最早 pytest hook：默认禁止测试访问外部网络（fail-closed）。"""
+    install_offline_guard()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """会话结束恢复本进程内被移除的代理环境变量（不影响系统/用户环境）。"""
+    restore_proxy_env()
+
+
 # app_paths is imported while pytest collects test modules. Give that import a
 # process-private root so collection can never touch developer data or open the
 # first-run directory chooser.
