@@ -76,6 +76,19 @@ function sameJobAsCurrent(payload) {
   return Number(current.id) === Number(payload.id);
 }
 
+/**
+ * terminal snapshot 是否应当补一次完整 completion。
+ *
+ * 只有“页面此前已经知道该 Job 正在运行”才算断线期间完成（reconnect recovery）；
+ * 首次页面基线里出现的历史终态只做展示，绝不重放 toast/结果/后台刷新。
+ */
+export function terminalSnapshotShouldComplete(job, currentJob) {
+  if (!isJobTerminalState(job?.state)) return false;
+  if (!currentJob || currentJob?.id == null || job?.id == null) return false;
+  if (Number(currentJob.id) !== Number(job.id)) return false;
+  return currentJob.state === "running";
+}
+
 export function handleSseMessage(eventName, payload) {
   markSseActive();
   if (eventName === "heartbeat") return;
@@ -88,15 +101,10 @@ export function handleSseMessage(eventName, payload) {
       return;
     }
     if (isJobTerminalState(job.state)) {
-      // 断线/重连期间完成的任务：terminal snapshot 首次确认 → 完整 finishJobOnce。
-      // 页面加载时 bootstrap 已通过 loadSummary 展示过的同一 terminal 视为已知，不重复完成。
-      const current = state.currentJob;
-      const alreadyKnown =
-        current?.id != null
-        && job?.id != null
-        && Number(current.id) === Number(job.id)
-        && current.state === job.state;
-      if (!alreadyKnown) {
+      // 历史终态基线 vs 断线期间完成：
+      // - 页面从不知道它在 running → 只展示（绝不重放 completion/toast）；
+      // - 页面正 tracking 该 running Job → reconnect snapshot terminal 必须完整 finishJobOnce。
+      if (terminalSnapshotShouldComplete(job, state.currentJob)) {
         void finishJobOnce(job);
       } else {
         state.currentJob = job;
@@ -177,7 +185,8 @@ export function handleSseMessage(eventName, payload) {
   }
 }
 
-export function startRealtime() {
+export function startRealtime(options = {}) {
+  void options;
   if (typeof EventSource === "undefined") {
     fallbackToPolling("no-eventsource");
     return;
