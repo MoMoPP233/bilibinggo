@@ -37,22 +37,10 @@ _FILE_NAME = "following_feed_state.json"
 
 
 def matches_platform_risk(message: object) -> bool:
-    lowered = str(message or "").lower()
-    for marker in (
-        "-352",
-        "-509",
-        "429",
-        "too many",
-        "rate-limit",
-        "rate limit",
-        "risk-control",
-        "risk control",
-        "风控",
-        "限流",
-    ):
-        if marker in lowered:
-            return True
-    return False
+    """兼容包装：统一走 src.platform_risk 结构化判定，绝不扫描业务正文。"""
+    from src.platform_risk import matches_platform_risk as _risk
+
+    return _risk(message)
 
 
 def _state_path() -> Path:
@@ -191,10 +179,15 @@ def scan_following_feed(
             retries=0,
         )
 
-    if matches_platform_risk(payload):
-        raise RuntimeError(f"关注动态 Feed 平台风控：{payload}")
+    # 平台风控只会以「结构化返回码」或「客户端异常信封」出现，正文绝不参与判定。
     if not isinstance(payload, dict):
         raise RuntimeError("关注动态 Feed 响应格式异常")
+    code = payload.get("code")
+    if code is not None and code != 0:
+        message = str(payload.get("message") or payload.get("msg") or "")
+        if code in (-352, -509):
+            raise RuntimeError(f"API error {code}: {message}")
+        raise RuntimeError(f"关注动态 Feed 响应异常（code={code}：{message}）")
 
     def fail(message: str) -> dict[str, Any]:
         now = int(time.time())

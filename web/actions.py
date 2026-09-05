@@ -1230,17 +1230,11 @@ def run_action(
             )
 
         progress(step=0, total=1, message="开始关注动态补漏扫描…")
-        try:
-            result = scan_following_feed(on_progress=on_feed_progress)
-        except Exception as exc:
-            from web.auto_remote_state import matches_platform_risk as _risk
-            from web.auto_remote_state import record_auto_remote_risk
-
-            if _risk(str(exc)):
-                record_auto_remote_risk(
-                    trigger_stage="following_feed_scan", reason=str(exc)
-                )
-            raise
+        result = scan_following_feed(on_progress=on_feed_progress)
+        # 结构解析失败（普通失败，非风控）：必须体现为 Job 失败，不能 success。
+        # 明确风控以异常向上抛：由 JobRunner（auto）统一记录 global cooldown。
+        if str(result.get("status") or "") == "failed":
+            raise RuntimeError(str(result.get("message") or "关注动态补漏扫描失败"))
         message = str(result.get("message") or "关注动态补漏完成")
         progress(step=1, total=1, message=message, log_append=message)
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}

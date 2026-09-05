@@ -119,7 +119,7 @@ def test_risk_raises_and_checkpoint_not_advanced(state_path: Path, monkeypatch) 
 
 def test_risk_body_is_not_empty_feed(state_path: Path) -> None:
     client = _FakeClient(payload=_payload(items=[], code=-352))
-    with pytest.raises(RuntimeError, match="风控"):
+    with pytest.raises(RuntimeError, match="-352"):
         ff.scan_following_feed(client_factory=lambda: client)
 
 

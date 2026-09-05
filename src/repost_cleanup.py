@@ -383,8 +383,21 @@ def _fetch_dynamic_item_strict(
             retries=0,
         )
     except (httpx.HTTPError, RuntimeError) as exc:
+        # 明确平台风控原样保留（不得转成 notice_unreadable/manual_review）。
+        risk = _risk_code_from_message(exc)
+        if risk is not None:
+            raise AssessmentRateLimited(
+                f"原动态读取触发平台限制（{risk}）：{exc}"
+            ) from exc
         raise RemoteStateUnknown(f"动态详情读取失败：{exc}") from exc
-    if not isinstance(payload, dict) or api_code(payload) != 0:
+    if not isinstance(payload, dict):
+        raise RemoteStateUnknown("动态详情响应异常")
+    code = payload.get("code")
+    if code in (-352, -509, 429):
+        raise AssessmentRateLimited(
+            f"原动态读取触发平台限制（{code}）：{payload.get('message') or ''}"
+        )
+    if api_code(payload) != 0:
         raise RemoteStateUnknown("动态详情响应异常")
     data = payload.get("data")
     item = data.get("item") if isinstance(data, dict) else None
@@ -411,8 +424,21 @@ def _fetch_notice_strict(
             retries=0,
         )
     except (httpx.HTTPError, RuntimeError) as exc:
+        # 明确平台风控必须原样保留（不得转成普通 notice_unreadable/manual_review）。
+        risk = _risk_code_from_message(exc)
+        if risk is not None:
+            raise AssessmentRateLimited(
+                f"抽奖结果读取触发平台限制（{risk}）：{exc}"
+            ) from exc
         raise RemoteStateUnknown(f"抽奖结果读取失败：{exc}") from exc
-    if not isinstance(payload, dict) or api_code(payload) != 0:
+    if not isinstance(payload, dict):
+        raise RemoteStateUnknown("lottery_notice 响应异常")
+    code = payload.get("code")
+    if code in (-352, -509, 429):
+        raise AssessmentRateLimited(
+            f"抽奖结果读取触发平台限制（{code}）：{payload.get('message') or ''}"
+        )
+    if api_code(payload) != 0:
         raise RemoteStateUnknown("lottery_notice 响应异常")
     notice = payload.get("data")
     if not isinstance(notice, dict) or not _strict_positive_int(notice.get("lottery_id")):
@@ -457,22 +483,12 @@ def _complete_winner_uids(notice: Mapping[str, Any]) -> set[str] | None:
 
 
 def _risk_code_from_message(message: object) -> int | None:
-    lowered = str(message or "").lower()
-    for token, code in (
-        ("-352", -352),
-        ("-509", -509),
-        ("429", 429),
-        ("too many", 429),
-        ("risk-control", -352),
-        ("risk control", -352),
-        ("rate-limit", 429),
-        ("rate limit", 429),
-        ("风控", -352),
-        ("限流", 429),
-    ):
-        if token in lowered:
-            return code
-    return None
+    """结构化风控码判定（统一 src.platform_risk 规则），不扫描正文文本。"""
+    from src.platform_risk import risk_code_of
+
+    if isinstance(message, int):
+        return message if message in (-352, -509) else None
+    return risk_code_of(message)
 
 
 class _AssessmentBreaker:
@@ -1882,6 +1898,30 @@ def delete_reposts(
         total = len(requested)
         _progress(on_progress, 0, total, f"准备逐条验证并删除 {total} 条转发…")
 
+        def _record_global_risk_if_unified(risk_code: int | None, exc: object) -> None:
+            """统一风险出口：明确平台风控写入 global auto remote 6h cooldown。
+
+            只对 src.platform_risk 统一认定的码（-352/-509/429）记录；
+            -799 等既有删除安全语义照旧停止批次但不进 global cooldown。
+            记录失败只降级为日志，绝不阻断删除流程本身。
+            """
+            if risk_code not in (-352, -509, 429):
+                return
+            try:
+                from web.auto_remote_state import record_auto_remote_risk
+
+                record_auto_remote_risk(
+                    trigger_stage="delete_reposts",
+                    reason=str(exc or "") or "",
+                    code=str(risk_code),
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("repost_cleanup").exception(
+                    "记录删除任务平台风控冷却失败 code=%s", risk_code
+                )
+
         for index, repost_id in enumerate(requested, 1):
             _check_cancel(cancel_check)
             original_id = ""
@@ -1966,6 +2006,7 @@ def delete_reposts(
                         stop_reason = (
                             f"批量删除因平台限流/风控停止（{risk}），剩余条目保持原状态。"
                         )
+                        _record_global_risk_if_unified(risk, exc)
                 else:
                     code = payload.get("code") if isinstance(payload, dict) else None
                     if type(code) is not int:
@@ -2011,7 +2052,20 @@ def delete_reposts(
                             stop_reason = (
                                 f"批量删除因平台限流/风控停止（{code}），剩余条目保持原状态。"
                             )
+                            _record_global_risk_if_unified(code, error)
+            except AssessmentRateLimited as exc:
+                # 明确平台风控（删除前 recheck / 详情校验命中统一风险）：
+                # 当前候选绝不进入 DELETE，剩余候选 0 远程，整批立即停止。
+                risk = _risk_code_from_message(exc)
+                status, message = "skipped", str(exc)
+                stopped = True
+                stop_reason = (
+                    f"批量删除因平台限流/风控停止（{risk if risk is not None else 'risk'}），"
+                    f"剩余条目保持原状态。{exc}"
+                )
+                _record_global_risk_if_unified(risk, exc)
             except (RemoteStateUnknown, RuntimeError, ValueError) as exc:
+                # 普通失败保持原单条跳过语义（不可读/404/业务不满足等），继续下一候选。
                 status, message = "skipped", str(exc)
 
             items.append(

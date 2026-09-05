@@ -66,23 +66,16 @@ class ClassifyFetchContext:
             self._risk_code = code
 
     def risk_control_code(self) -> int | None:
-        """返回本轮分类中命中的风控码（-352/-509/429 等），无则 None。"""
+        """返回本轮分类中命中的结构化风控码（仅 API code 字段，绝不扫描正文）。
+
+        -352 / -509 / -799 等来自 detail/notice API 的整数 code；
+        普通正文文本（含“429”“风控”“限流”字样）不参与判定。
+        """
         if self._risk_code is not None:
             return self._risk_code
         code = self._detail_api_code
         if isinstance(code, int) and code in (-352, -509, -799):
             return code
-        message = "" if self._detail_api_message is _UNSET else str(self._detail_api_message or "")
-        lowered = message.lower()
-        for token, risk_code in (
-            ("-352", -352),
-            ("-509", -509),
-            ("429", 429),
-            ("too many", 429),
-            ("风控", -352),
-        ):
-            if token in lowered:
-                return risk_code
         return None
 
     def _fetch_detail_api_item(self, *, retries: int) -> dict | None:

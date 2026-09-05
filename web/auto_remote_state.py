@@ -20,27 +20,18 @@ from pathlib import Path
 from typing import Any
 
 from web.auto_config import AUTO_REMOTE_RISK_COOLDOWN_SECONDS
-
-_PLATFORM_RISK_MARKERS = (
-    "-352",
-    "-509",
-    "429",
-    "too many",
-    "rate-limit",
-    "rate limit",
-    "risk-control",
-    "risk control",
-    "风控",
-    "限流",
-)
+from src.platform_risk import matches_platform_risk as _matches_platform_risk
 
 _FILE_NAME = "auto_remote_state.json"
 
+# 同一风控事件经多层传播时，短时间内的重复 record 不重复延长冷却。
+# 只有距离上次记录超过该窗口（视为新一次真实风控）才重新计时。
+_RECORD_EXTEND_GRACE_SECONDS = 300
+
 
 def matches_platform_risk(message: object) -> bool:
-    """与现有 cleanup / DS 风控识别保持一致；不自行扩大范围（不含 -799）。"""
-    lowered = str(message or "").lower()
-    return any(marker in lowered for marker in _PLATFORM_RISK_MARKERS)
+    """统一风控判定：结构化 API code / HTTP 429 / 官方错误信封，绝不扫描正文文本。"""
+    return _matches_platform_risk(message)
 
 
 def _state_path() -> Path:
@@ -114,9 +105,30 @@ def record_auto_remote_risk(
     now_ts: int | None = None,
     cooldown_seconds: int = AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
 ) -> dict[str, Any]:
-    """命中明确风控后写入固定冷却（per-Profile 本地，0 远程）。"""
+    """命中明确风控后写入固定冷却（per-Profile 本地，0 远程）。
+
+    同一风控事件若经过业务层 + 调度层两次传播，只在很短窗口内各记录一次：
+    幂等合并（不把 paused_until 无意义向后推）；窗口之外视为新一次真实风控，
+    正常重新计时（原「冷却中再次命中并延长」语义保留）。
+    """
     now = int(time.time()) if now_ts is None else int(now_ts)
     state = _read_state()
+    paused_at = state.get("paused_at")
+    if (
+        state.get("paused")
+        and isinstance(paused_at, int)
+        and now - paused_at < _RECORD_EXTEND_GRACE_SECONDS
+    ):
+        # 同一次风控的重复传播：保留首次冷却起点，只补全可读字段，不延长。
+        state.update(
+            {
+                "trigger_stage": str(trigger_stage or "").strip() or state.get("trigger_stage"),
+                "code": str(code or "").strip() or state.get("code"),
+                "reason": str(reason or "").strip() or state.get("reason"),
+            }
+        )
+        _write_state(state)
+        return risk_pause_state(now_ts=now)
     state.update(
         {
             "paused": True,

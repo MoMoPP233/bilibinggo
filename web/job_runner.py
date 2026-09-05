@@ -21,8 +21,10 @@ from src.job_store import (
 )
 from src.log_context import job_log_context
 from src.log_span import log_event
+from src.platform_risk import risk_code_of as _risk_code_of
 from src.restart_control import RestartPendingError, restart_control
 from web.actions import run_action
+from web.auto_remote_state import record_auto_remote_risk
 from web.event_hub import event_hub
 from web.user_messages import JOB_ACTION_LABELS, friendly_error, sanitize_log
 
@@ -647,6 +649,36 @@ class JobRunner:
                     started_mono=started_mono,
                 )
             except Exception as exc:
+                # 语义优先级：明确平台风控 > 用户取消 > 普通失败。
+                # worker 遇到风控后可能为了停掉并行兄弟线程而 set cancel_event，
+                # 此时绝不能把真实风控覆盖成 cancelled。
+                risk_code = _risk_code_of(exc)
+                if risk_code is not None:
+                    message = friendly_error(exc)
+                    risk_reason = sanitize_log(str(exc)) or message
+                    try:
+                        current_result = dict(self.get_status().result or {})
+                    except Exception:
+                        current_result = {}
+                    current_result["risk_code"] = risk_code
+                    current_result["risk_reason"] = risk_reason
+                    if job_source == "auto":
+                        # 统一风控出口：JobRunner 是唯一记录者（Scheduler 侧幂等合并）。
+                        record_auto_remote_risk(
+                            trigger_stage=f"job:{action}",
+                            reason=risk_reason,
+                            code=str(risk_code),
+                        )
+                    self._apply_terminal(
+                        job_id,
+                        state="error",
+                        message=message,
+                        log=risk_reason,
+                        result=current_result or None,
+                        error_kind="risk",
+                        started_mono=started_mono,
+                    )
+                    return
                 if (cancel_event and cancel_event.is_set()) or _is_cancel_exception(exc):
                     cancel_msg = str(exc) if _is_cancel_exception(exc) else "任务已取消"
                     self._apply_terminal(

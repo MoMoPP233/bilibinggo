@@ -10,6 +10,7 @@ import httpx
 
 from src.bilibili_client import BilibiliClient
 from src.lottery_classifier import UPOWER_BUSINESS_TYPE
+from src.platform_risk import risk_code_of
 from src.sources.common import opus_link
 
 try:
@@ -27,7 +28,7 @@ DYNAMIC_DETAIL_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail"
 OPUS_DETAIL_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail"
 OPUS_DETAIL_FEATURES = "htmlNewStyle,ugcDelete,editable,opusPrivateVisible"
 
-_OPUS_UNREADABLE_CODES = frozenset({-404, 404, -403, -509, -799})
+_OPUS_UNREADABLE_CODES = frozenset({-404, 404, -403, -799})
 
 RESERVE_RESERVED_STATUS = 2
 
@@ -181,8 +182,16 @@ def _fetch_opus_detail_item(
             retries=retries,
         )
     except Exception as exc:
+        # 明确平台风控绝不能被“不可读/跳过当前动态”吞掉；普通失败允许跳过该条。
+        if risk_code_of(exc) is not None:
+            raise OpusRiskControlError(f"opus/detail API error 命中风控：{exc}") from exc
         logger.debug("opus/detail 请求失败 %s: %s", dynamic_id, exc)
         return None
+    code = data.get("code")
+    if code in (-352, -509):
+        raise OpusRiskControlError(
+            f"opus/detail API error {code}: {data.get('message') or ''}"
+        )
     if data.get("code") != 0:
         logger.debug(
             "opus/detail 返回错误 %s: code=%s msg=%s",
@@ -220,12 +229,19 @@ def fetch_opus_detail_item_strict(
             retries=0,
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        # HTTP 429 属于明确平台风控：不得降级成“单条不可读”。
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429,):
+            raise OpusRiskControlError(
+                f"opus/detail HTTP {exc.response.status_code}: 访问过于频繁"
+            ) from exc
         raise OpusReadError(f"opus/detail 请求失败: {exc}") from exc
     except RuntimeError as exc:
         # request_json 只会将网络请求错误包装成此带 cause 的 RuntimeError。
         # JSON 解析失败或程序错误不能作为可忽略的容器读取错误处理。
         if isinstance(exc.__cause__, httpx.RequestError):
             raise OpusReadError(f"opus/detail 请求失败: {exc}") from exc
+        if risk_code_of(exc) is not None:
+            raise OpusRiskControlError(str(exc)) from exc
         raise
 
     if not isinstance(payload, dict):
@@ -233,7 +249,7 @@ def fetch_opus_detail_item_strict(
     code = payload.get("code")
     if type(code) is not int:
         raise ValueError("opus/detail 响应缺少有效的整数 code")
-    if code == -352:
+    if code in (-352, -509):
         raise OpusRiskControlError(f"opus/detail API error {code}: {payload.get('message') or ''}")
     if code in _OPUS_UNREADABLE_CODES:
         raise OpusReadError(f"opus/detail API error {code}: {payload.get('message') or ''}")

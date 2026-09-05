@@ -357,7 +357,7 @@ def test_http_429_persists_maintenance_pause(isolated_home, monkeypatch) -> None
     )
 
     def assess(*args, **kwargs):
-        raise RuntimeError("429 Too Many Requests")
+        raise RuntimeError("API error 429: Too Many Requests")
 
     monkeypatch.setattr("src.repost_cleanup._assess_original", assess)
 
@@ -396,7 +396,7 @@ def test_initial_nav_http_429_persists_pause(isolated_home, monkeypatch) -> None
         [RepostImportRecord(REPOST_ID, DYNAMIC_ID, 100)],
         seen_at=100,
     )
-    client = _NavClient(RuntimeError("HTTP 429 Too Many Requests"))
+    client = _NavClient(RuntimeError("API error 429: Too Many Requests"))
 
     result = auto_maintain(client_factory=lambda: client)
 

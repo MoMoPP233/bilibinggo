@@ -38,9 +38,26 @@ def _cleanup_paused_factory():
 
 
 def test_risk_markers() -> None:
-    for text in ("API error -352: risk", "-509 访问频繁", "HTTP 429 Too Many Requests", "rate-limit", "风控", "限流"):
+    import httpx
+
+    req = httpx.Request("GET", "https://api.bilibili.com/x/example")
+    http429 = httpx.HTTPStatusError(
+        "429", request=req, response=httpx.Response(429, request=req)
+    )
+    for text in (
+        "API error -352: 风控校验失败",
+        "API error -509: 访问过于频繁",
+        "Bilibili API error -352: risk-control",
+        http429,
+    ):
         assert state_mod.matches_platform_risk(text) is True
-    assert state_mod.matches_platform_risk("普通网络错误 ConnectError") is False
+    for text in (
+        "普通网络错误 ConnectError",
+        "正文里出现了 429、风控、限流 等字样，但它们只是普通文本",
+        "rate-limit 出现在普通文案里也不触发",
+        RuntimeError("请求过于频繁，请稍后重试"),
+    ):
+        assert state_mod.matches_platform_risk(text) is False
 
 
 def test_record_risk_sets_cooldown_until(state_path: Path) -> None:

@@ -722,10 +722,13 @@ class AutoScheduler:
         final = self._wait_until_terminal(job_id, label)
         if self._is_stale():
             # 停止/换代：立即停止等待；JobRunner 中已启动的 Job 继续自然完成，绝不 cancel。
+            # 该 Job 若后来命中平台风控，由 JobRunner（source=auto）负责记录 global cooldown，
+            # 与调度代际是否 stale 无关。
             return {"stopped": True, "message": "", "job": final}
         state = str(final.get("state") or "")
         msg = str(final.get("message") or "")
         result = final.get("result") if isinstance(final.get("result"), dict) else {}
+        risk_code = result.get("risk_code")
         if result.get("skipped") or (
             action == "participate_triple" and state == "error" and _is_triple_empty_skip(msg)
         ):
@@ -733,6 +736,9 @@ class AutoScheduler:
         if state == "cancelled":
             raise RuntimeError(msg or f"「{label}」已取消")
         if state in {"error", "interrupted"}:
+            if risk_code is not None:
+                # 保留结构化风控语义，供上层统一判定（停止后续 stage / 冷却记录）。
+                raise RuntimeError(f"API error {risk_code}: {msg or '平台风控'}")
             raise RuntimeError(msg or f"「{label}」以 {state} 结束")
         if state != "success":
             raise RuntimeError(msg or f"「{label}」异常结束：state={state}")
