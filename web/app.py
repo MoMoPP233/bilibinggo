@@ -44,7 +44,7 @@ from src.user_settings import (
 )
 from src.watch_sync import MAX_WINDOW_SECONDS, OUTPUT_PATH as WATCH_OUTPUT_PATH, compute_sync_window
 from src.watch_users import add_watch_user, get_watch_users_payload, remove_watch_user, seed_from_candidates_if_empty
-from web.account_service import ack_at_unread_notice, clear_login_cookie, get_account_extras, get_account_profile
+from web.account_service import ack_at_unread_notice, clear_login_cookie, get_account_extras, get_account_profile, get_local_login_state
 from web.activity_service import (
     ACTIVITY_PAGE_SIZE,
     get_summary,
@@ -206,8 +206,9 @@ def api_remove_watch_user(mid: int) -> OkResponse:
 
 
 @app.get("/api/account", tags=["stable"])
-def api_account() -> dict[str, Any]:
-    return get_account_profile()
+def api_account(force: bool = Query(default=False)) -> dict[str, Any]:
+    """账号基础信息。force=1（用户主动“刷新账号”）绕过 15s success TTL。"""
+    return get_account_profile(force=force)
 
 
 def _require_profile_operations_idle(*, switching: bool = False) -> None:
@@ -420,14 +421,26 @@ def api_triple_participate_targets(
     )
 
 
-def _require_runtime_bilibili_uid() -> str:
+def _require_runtime_bilibili_uid(message: str | None = None) -> str:
     from src.bilibili_auth import require_login as require_bilibili_login
 
     try:
         _csrf, uid = require_bilibili_login()
     except RuntimeError as exc:
-        raise AppError(ErrorCode.AUTH_REQUIRED, "请先扫码登录后再管理转发历史") from exc
+        raise AppError(
+            ErrorCode.AUTH_REQUIRED,
+            message or "请先扫码登录后再管理转发历史",
+        ) from exc
     return str(uid)
+
+
+def _require_local_account(message: str) -> str:
+    """本地页面读取的登录门：只检查本地 Cookie 中的 runtime UID（0 Bilibili）。
+
+    不执行远程 NAV 验证——页面数据定位/本地读取不需要实时远程身份；
+    真正危险写操作仍保留各自实时 recheck。
+    """
+    return _require_runtime_bilibili_uid(message=message)
 
 
 @app.get("/api/repost-cleanup/history", tags=["stable"])
@@ -442,9 +455,7 @@ def api_repost_cleanup_history(
 
     from src.repost_history import get_checkpoint, list_repost_history
 
-    account = get_account_profile()
-    require_login(account, message="请先扫码登录后再查看转发历史")
-    uid = _require_runtime_bilibili_uid()
+    uid = _require_local_account("请先扫码登录后再查看转发历史")
     normalized_status = str(status or "").strip() or None
     try:
         rows, total = list_repost_history(
@@ -475,9 +486,7 @@ def api_repost_cleanup_candidates(
 
     from src.repost_cleanup import repost_cleanup_summary
 
-    account = get_account_profile()
-    require_login(account, message="请先扫码登录后再查看删除候选")
-    uid = _require_runtime_bilibili_uid()
+    uid = _require_local_account("请先扫码登录后再查看删除候选")
     try:
         summary = repost_cleanup_summary(uid, show_deleted=bool(show_deleted))
     except ValueError as exc:
@@ -496,9 +505,7 @@ def api_repost_cleanup_health() -> dict[str, Any]:
     from src.repost_cleanup import cleanup_health_check
     from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, cleanup_maintain_enabled
 
-    account = get_account_profile()
-    require_login(account, message="请先扫码登录后再查看维护状态")
-    uid = _require_runtime_bilibili_uid()
+    uid = _require_local_account("请先扫码登录后再查看维护状态")
     job = runner.get_status().to_dict()
     delete_job_in_progress = bool(
         job.get("state") == "running" and job.get("action") == "delete_expired_reposts"
@@ -514,9 +521,7 @@ def api_repost_cleanup_health() -> dict[str, Any]:
 def _defer_common(request: RepostDeferRequest, *, restore: bool) -> dict[str, Any]:
     from src.repost_cleanup import defer_candidate, repost_cleanup_summary, restore_candidate
 
-    account = get_account_profile()
-    require_login(account, message="请先扫码登录后再管理转发清理")
-    uid = _require_runtime_bilibili_uid()
+    uid = _require_local_account("请先扫码登录后再管理转发清理")
     repost_ids: list[str] = []
     seen_ids: set[str] = set()
     for raw_id in request.repost_dynamic_ids:
@@ -756,9 +761,7 @@ def api_auto_following_feed_status() -> dict[str, Any]:
     """
     from src.following_feed import following_feed_summary
 
-    account = get_account_profile()
-    require_login(account, message="请先扫码登录后再查看关注动态补漏")
-    uid = _require_runtime_bilibili_uid()
+    uid = _require_local_account("请先扫码登录后再查看关注动态补漏")
     return {"ok": True, "uid": uid, **following_feed_summary()}
 
 
@@ -794,17 +797,15 @@ def api_auto_cleanup_maintain_recover() -> dict[str, Any]:
     """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
     from src.repost_cleanup import maintenance_risk_state, recover_auto_maintenance
 
-    account = get_account_profile()
-    require_login(account, message="请先扫码登录后再恢复自动维护")
-    uid = _require_runtime_bilibili_uid()
+    uid = _require_local_account("请先扫码登录后再恢复自动维护")
     recover_auto_maintenance(uid)
     return {"ok": True, "uid": uid, **maintenance_risk_state(uid)}
 
 
 def _build_settings_payload() -> dict[str, Any]:
-    account = get_account_profile()
+    local = get_local_login_state()
     llm = get_llm_settings_public()
-    logged_in = bool(account.get("logged_in"))
+    logged_in = bool(local.get("logged_in"))
     return {
         "participate_text": get_participate_text(),
         "default_participate_text": DEFAULT_PARTICIPATE_TEXT,
@@ -824,9 +825,9 @@ def api_settings() -> dict[str, Any]:
 
 @app.get("/api/settings/llm", tags=["stable"])
 def api_get_llm_settings() -> dict[str, Any]:
-    account = get_account_profile()
+    local = get_local_login_state()
     llm = get_llm_settings_public()
-    logged_in = bool(account.get("logged_in"))
+    logged_in = bool(local.get("logged_in"))
     return {
         "llm": llm,
         "setup_complete": logged_in and bool(llm.get("ready")),

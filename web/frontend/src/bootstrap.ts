@@ -126,7 +126,8 @@ document.getElementById("reset-participate-text")?.addEventListener("click", () 
 sidebarRefreshBtn?.addEventListener("click", async () => {
   setButtonLoading(sidebarRefreshBtn, true, { label: "刷新中…" });
   try {
-    const account = await loadAccount();
+    // 用户主动“刷新账号”：force 绕过后端 15s success TTL，真实远程验证。
+    const account = await loadAccount({ force: true });
     const merged = (await loadAccountExtras()) || account;
     await loadSettings();
     if (!merged?.at_alert?.increased) {

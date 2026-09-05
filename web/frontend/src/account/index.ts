@@ -497,11 +497,15 @@ export function renderAccountViews(account) {
   renderOnboardingPanel();
 }
 
-export async function loadAccount() {
+export async function loadAccount(options = {}) {
+  const { force = false } = options;
   const token = ++accountRequestSeq;
   let account;
   try {
-    account = await fetchJSON("/api/account", { timeoutMs: 12000 });
+    // force=true：用户主动“刷新账号”，绕过后端 success TTL，真实远程验证。
+    account = await fetchJSON(force ? "/api/account?force=1" : "/api/account", {
+      timeoutMs: 12000,
+    });
   } catch (error) {
     if (token !== accountRequestSeq) {
       // 旧请求晚返回：不覆盖更新后的登录状态。
