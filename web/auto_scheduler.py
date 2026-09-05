@@ -122,7 +122,11 @@ class AutoScheduler:
     def __init__(self, job_runner: JobRunner | None = None) -> None:
         self._runner = job_runner or runner
         self._lock = threading.Lock()
+        # 每代调度器拥有自己独立的 stop Event；新代 start 绝不 clear 旧代 Event。
+        # 线程运行期间所有停止判定都绑定“自己的代际上下文”，避免旧代被唤醒后继续调度。
+        self._generation = 0
         self._stop_event = threading.Event()
+        self._ctx = threading.local()
         self._thread: threading.Thread | None = None
         self._logs: deque[LogEntry] = deque(maxlen=200)
         self._status = SchedulerStatus(refresh_pipeline=_idle_pipeline())
@@ -135,6 +139,23 @@ class AutoScheduler:
         self._snapshot_pending = False
         # 上一次“自动远程大任务”结束的单调时间；用于不同大任务之间 60s 错峰。
         self._last_remote_stage_finished_mono = 0.0
+
+    def _active_stop_event(self) -> threading.Event:
+        """当前线程绑定的 stop Event；直接调用（无线程上下文，如单测）回退到实例当前 Event。"""
+        event = getattr(self._ctx, "stop_event", None)
+        return event if event is not None else self._stop_event
+
+    def _context_generation(self) -> int:
+        gen = getattr(self._ctx, "generation", None)
+        return gen if gen is not None else self._generation
+
+    def _is_stale(self) -> bool:
+        """本线程（代际上下文）是否已失效：自己被 stop，或已被新一代 start 取代。"""
+        generation = self._context_generation()
+        with self._lock:
+            if generation != self._generation:
+                return True
+        return self._active_stop_event().is_set()
 
     def get_status(self) -> dict[str, Any]:
         now = datetime.now(CN_TZ)
@@ -162,7 +183,12 @@ class AutoScheduler:
                     raise RuntimeError("调度器已在运行")
                 if self._status.state == "fatal":
                     self._status.fatal_error = None
-                self._stop_event.clear()
+                # 新一代：自建独立 stop Event + generation 递增。旧代线程持有自己的
+                # Event 引用与代际，start 永不 clear 旧 Event，旧代不会被再次唤醒。
+                generation = self._generation + 1
+                self._generation = generation
+                stop_event = threading.Event()
+                self._stop_event = stop_event
                 self._status.state = "running"
                 self._status.message = "调度器运行中"
                 self._status.started_at = _now_iso()
@@ -172,6 +198,7 @@ class AutoScheduler:
                 self._status.refresh_pipeline = _idle_pipeline()
                 self._thread = threading.Thread(
                     target=self._loop,
+                    args=(generation, stop_event),
                     name="binggo-auto-scheduler",
                     daemon=True,
                 )
@@ -181,9 +208,11 @@ class AutoScheduler:
         return self.get_status()
 
     def stop(self, *, reason: str = "用户停止") -> dict[str, Any]:
-        """只停止本调度器，绝不取消抽奖端任务。"""
-        self._stop_event.set()
+        """只停止本调度器，绝不取消抽奖端任务；不 join，立即返回。"""
         with self._lock:
+            # 先 set 当前代的 stop Event，再落状态；旧代线程会因自己绑定的
+            # Event 被 set 而退出，即使此刻已被新一代取代也不影响新代。
+            self._active_stop_event().set()
             if self._status.state == "running":
                 self._status.state = "stopped"
                 self._status.message = reason
@@ -195,7 +224,11 @@ class AutoScheduler:
         return self.get_status()
 
     def _fatal(self, message: str) -> None:
-        self._stop_event.set()
+        # 旧代线程晚到的致命错误不得停机/污染新一代调度器。
+        if self._is_stale():
+            self._log("warn", f"调度器已换代，忽略旧代致命信号：{message}")
+            return
+        self._active_stop_event().set()
         with self._lock:
             self._status.state = "fatal"
             self._status.message = "因任务撞车或严重错误已停机"
@@ -216,6 +249,9 @@ class AutoScheduler:
         self._publish_auto_log(entry)
 
     def _set_phase(self, phase: str, message: str | None = None) -> None:
+        # 旧代线程的过期阶段更新不得污染新一代调度器的状态展示。
+        if self._is_stale():
+            return
         with self._lock:
             prev = (
                 self._status.current_phase,
@@ -237,6 +273,10 @@ class AutoScheduler:
             self._schedule_auto_snapshot(force=False)
 
     def _pause_all_auto_remote(self, stage_label: str, message: object) -> None:
+        # 旧代线程晚到的风控判断不得把新一代调度器打进全局冷却。
+        if self._is_stale():
+            self._log("warn", f"调度器已换代，忽略旧代风控信号：{stage_label}")
+            return
         state = record_auto_remote_risk(
             trigger_stage=stage_label, reason=str(message or "")
         )
@@ -359,6 +399,9 @@ class AutoScheduler:
             logger.exception("发布 auto.snapshot 失败")
 
     def _set_pipeline(self, *, active: bool, step_index: int = -1, waiting: bool = False) -> None:
+        # 旧代线程的过期流水线更新不得污染新一代调度器的展示。
+        if self._is_stale():
+            return
         steps = []
         for i, item in enumerate(REFRESH_STEPS):
             if not active or step_index < 0:
@@ -388,9 +431,13 @@ class AutoScheduler:
             self._status.refresh_pipeline = pipeline
         self._schedule_auto_snapshot(force=False)
 
-    def _loop(self) -> None:
+    def _loop(self, generation: int, stop_event: threading.Event) -> None:
+        # 绑定本线程所属代际：此后所有停止/换代判定都以这对上下文为准，
+        # 旧代线程即使在新代启动后晚醒，也只会退出而不再调度。
+        self._ctx.generation = generation
+        self._ctx.stop_event = stop_event
         try:
-            while not self._stop_event.is_set():
+            while not self._is_stale():
                 now = datetime.now(CN_TZ)
                 with self._lock:
                     self._status.last_tick_at = _now_iso()
@@ -430,7 +477,7 @@ class AutoScheduler:
 
                 if self._status.state == "running":
                     self._set_phase("等待下一刻度", "调度器运行中")
-                self._stop_event.wait(1.0)
+                stop_event.wait(1.0)
         except CollisionError as exc:
             self._fatal(f"任务撞车：{exc}")
         except Exception as exc:
@@ -448,7 +495,8 @@ class AutoScheduler:
         actions = ("refresh_all", "refresh_watch", "refresh_status")
         try:
             for index, action in enumerate(actions):
-                if self._stop_event.is_set():
+                # 停止/换代后：不再安排后续任何自动任务。
+                if self._is_stale():
                     self._set_pipeline(active=False)
                     return
                 self._set_pipeline(active=True, step_index=index, waiting=False)
@@ -508,6 +556,9 @@ class AutoScheduler:
         try:
             self._click_and_wait("following_feed_scan")
             self._done_following.add(key)
+            if self._is_stale():
+                # 停止/换代：Job 自行自然结束，旧代不再推进阶段状态。
+                return
             with self._lock:
                 self._status.message = "关注动态补漏完成"
             self._mark_remote_stage_finished()
@@ -536,6 +587,9 @@ class AutoScheduler:
         try:
             outcome = self._click_and_wait("participate_triple")
             self._done_triple.add(key)
+            if self._is_stale():
+                # 停止/换代：Job 自行自然结束，旧代不再推进阶段状态。
+                return
             with self._lock:
                 self._status.triple_slot_key = key
             self._mark_remote_stage_finished()
@@ -595,6 +649,9 @@ class AutoScheduler:
         try:
             self._click_and_wait("cleanup_auto_maintain")
             self._done_maintain.add(key)
+            if self._is_stale():
+                # 停止/换代：Job 自行自然结束，旧代不再推进阶段状态。
+                return
             with self._lock:
                 self._status.message = "自动维护完成"
             self._mark_remote_stage_finished()
@@ -623,6 +680,11 @@ class AutoScheduler:
             raise ValueError(f"禁止的操作：{action}")
 
         label = ACTION_LABELS.get(action, action)
+        # 停止/换代后本代不得再启动任何新 Job（JobRunner 端既有 Job 不受影响）。
+        if self._is_stale():
+            raise CollisionError(
+                f"调度已停止或被新一代接管，放弃自动点击「{label}」（{action}）"
+            )
         self._set_phase(f"点击：{label}", f"正在点击「{label}」")
         self._log("info", f"点击按钮：{label} ({action})")
 
@@ -631,6 +693,12 @@ class AutoScheduler:
             raise CollisionError(
                 f"准备点击「{label}」时发现抽奖端仍有任务在运行"
                 f"（action={current.get('action')}, message={current.get('message')}）"
+            )
+
+        # 二次确认：is_running 检查与 try_start 之间可能已 stop/换代，绝不能启动新 Job。
+        if self._is_stale():
+            raise CollisionError(
+                f"调度已停止或被新一代接管，放弃启动「{label}」（{action}）"
             )
 
         params = {"from_auto": True} if action == "participate_triple" else {}
@@ -652,6 +720,9 @@ class AutoScheduler:
             self._set_pipeline(active=True, step_index=pipeline_index, waiting=True)
 
         final = self._wait_until_terminal(job_id, label)
+        if self._is_stale():
+            # 停止/换代：立即停止等待；JobRunner 中已启动的 Job 继续自然完成，绝不 cancel。
+            return {"stopped": True, "message": "", "job": final}
         state = str(final.get("state") or "")
         msg = str(final.get("message") or "")
         result = final.get("result") if isinstance(final.get("result"), dict) else {}
@@ -668,12 +739,12 @@ class AutoScheduler:
         return {"skipped": False, "message": msg, "job": final}
 
     def _wait_until_terminal(self, job_id: int, label: str) -> dict[str, Any]:
-        """按 job id 只读轮询至终态。绝不 cancel。"""
+        """按 job id 只读轮询至终态。绝不 cancel。停止/换代立即退出等待。"""
         deadline = time.monotonic() + JOB_POLL_TIMEOUT_SEC
         self._set_phase(f"等待结束：{label}", f"已点击「{label}」，等待抽奖端自行结束…")
         time.sleep(0.8)
         last: dict[str, Any] = {}
-        while not self._stop_event.is_set():
+        while not self._is_stale():
             if time.monotonic() > deadline:
                 raise RuntimeError(f"等待「{label}」超时（超过 {int(JOB_POLL_TIMEOUT_SEC)} 秒）")
             job = self._runner.resolve_job_status(job_id).to_dict()
@@ -686,7 +757,7 @@ class AutoScheduler:
             detail = str(job.get("progress_message") or job.get("message") or "")
             if detail:
                 self._set_phase(f"等待结束：{label}", detail)
-            self._stop_event.wait(JOB_POLL_INTERVAL_SEC)
+            self._active_stop_event().wait(JOB_POLL_INTERVAL_SEC)
         return last
 
 
