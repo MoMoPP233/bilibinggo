@@ -109,8 +109,44 @@ export function renderActivityCard(item, index = 0) {
     </article>`;
 }
 
+let activitiesRequestSeq = 0;
+let activitiesEverLoaded = false;
+
+function setActivitiesStatus(text, tone) {
+  const el = document.getElementById("activities-status");
+  if (!el) return;
+  if (text) {
+    el.hidden = false;
+    el.textContent = String(text);
+    el.classList.remove("warn", "error");
+    if (tone) el.classList.add(tone);
+  } else {
+    el.hidden = true;
+    el.textContent = "";
+    el.classList.remove("warn", "error");
+  }
+}
+
+function renderActivitiesFailure() {
+  const message =
+    '<div class="activity-empty">活动加载失败' +
+    '<span class="activity-empty-hint">可以点击“重新加载”重试，无需刷新浏览器</span>' +
+    '<button type="button" class="btn btn-secondary btn-compact btn-pill activities-retry-btn">重新加载</button></div>';
+  activitiesBody.innerHTML = `<tr class="empty-row"><td colspan="7">${message}</td></tr>`;
+  if (activitiesCards) {
+    activitiesCards.innerHTML = message;
+  }
+  document.querySelectorAll(".activities-retry-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      loadActivities();
+    });
+  });
+  setActivitiesStatus("", "");
+}
+
 export function renderActivities(payload) {
   const items = payload.items || [];
+  setActivitiesStatus("", "");
 
   if (filterResultSummary) {
     filterResultSummary.innerHTML = formatFilterSummary(payload);
@@ -352,20 +388,32 @@ export async function loadActivities() {
     page_size: String(state.pageSize),
   });
   buildActivityFilterQueryParams().forEach((value, key) => params.set(key, value));
+  const token = ++activitiesRequestSeq;
+  setActivitiesStatus(activitiesEverLoaded ? "正在刷新…" : "正在加载活动…", "");
   try {
     const payload = await fetchJSON(`/api/activities?${params.toString()}`);
+    if (token !== activitiesRequestSeq) return; // 旧请求丢弃
+    activitiesEverLoaded = true;
     renderActivities(payload);
     const preview = resolveTripleTargets(payload);
+    if (token !== activitiesRequestSeq) return;
     if (preview) {
       applyTripleTargets(preview);
-    } else {
+    } else if (token === activitiesRequestSeq) {
       await loadTripleTargets();
     }
-    if (state.tripleFilterKey !== filterKey) {
+    if (token !== activitiesRequestSeq) return;
+    if (state.tripleFilterKey !== filterKey && token === activitiesRequestSeq) {
       await loadTripleTargets();
     }
   } catch (error) {
-    showToast(String(error.message || error), "error");
+    if (token !== activitiesRequestSeq) return; // 过期失败不弹 toast、不覆盖
+    if (activitiesEverLoaded) {
+      // 已有数据：保留旧列表，不把 total/分页清空。
+      setActivitiesStatus("活动刷新失败，当前显示上次结果", "warn");
+      return;
+    }
+    renderActivitiesFailure();
   }
 }
 

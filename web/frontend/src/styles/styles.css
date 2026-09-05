@@ -8104,3 +8104,16 @@ body.job-running .main-shell .topbar {
   font-size: 11px;
   line-height: 1.4;
 }
+
+.activities-status {
+  margin: 0 0 8px;
+}
+
+.activities-status.warn {
+  color: var(--warning);
+}
+
+.activities-status.error {
+  color: var(--danger);
+}
+
