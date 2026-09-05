@@ -8,6 +8,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import threading
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -284,14 +285,37 @@ def get_runtime_profile_id() -> str:
     return _runtime_profile_id
 
 
+_layout_lock = threading.Lock()
+# 进程内已“完整初始化过布局”的 (root_key, runtime_profile) → profile 目录。
+# runtime Profile 在进程运行期冻结；key 含解析后的 data root 与 profile id，
+# 不同 root / 不同 Profile 天然隔离。显式 get_profile_dir(account-x) 不经过此缓存。
+_layout_cache: dict[tuple[str, str], Path] = {}
+
+
+def _runtime_layout_cache_key() -> tuple[str, str]:
+    root = get_data_root().resolve(strict=False)
+    runtime = get_runtime_profile_id()
+    return (os.path.normcase(str(root)), runtime)
+
+
+
 def get_profile_dir(profile_id: str | None = None) -> Path:
     if profile_id is None:
-        # 任意业务 CLI 都可能先通过 app_paths/db.engine 取得当前目录。
-        # 必须在返回可写路径前完成一次性迁移，避免空库先创建后遮蔽旧库。
-        initialize_data_layout()
-        value = get_runtime_profile_id()
-    else:
-        value = validate_profile_id(profile_id)
+        key = _runtime_layout_cache_key()
+        with _layout_lock:
+            cached = _layout_cache.get(key)
+            if cached is not None and cached.is_dir():
+                return cached
+            if cached is not None:
+                _layout_cache.pop(key, None)
+            # 当前 runtime Profile 冻结：完整布局初始化（含旧版迁移）在锁内
+            # 只执行一次；其余并发首次访问等待后直接复用缓存结果。
+            initialize_data_layout()
+            value = get_runtime_profile_id()
+            profile_dir = get_profiles_dir() / value
+            _layout_cache[key] = profile_dir
+            return profile_dir
+    value = validate_profile_id(profile_id)
     return get_profiles_dir() / value
 
 
@@ -498,6 +522,8 @@ def reset_runtime_profile_for_tests() -> None:
     global _runtime_profile_id, _runtime_data_root
     _runtime_profile_id = None
     _runtime_data_root = None
+    with _layout_lock:
+        _layout_cache.clear()
 
 
 __all__ = [

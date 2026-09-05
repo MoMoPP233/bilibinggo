@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from sqlalchemy import event
 from sqlmodel import Session, create_engine
@@ -22,30 +23,40 @@ def _sqlite_url(path: Path) -> str:
     return f"sqlite:///{resolved.as_posix()}"
 
 
+_engine_lock = threading.Lock()
+
+
 def get_engine():
-    """返回全局引擎；若 DATA_DIR/库路径变化则自动重建（避免粘连到旧库）。"""
+    """返回全局引擎；若 DATA_DIR/库路径变化则自动重建（避免粘连到旧库）。
+
+    仅引擎创建/重建阶段加锁：并发首次访问只创建一个引擎；
+    已缓存路径的日常调用走快速比较，不持锁等待业务事务。
+    """
     global _engine, _engine_db_path
     path = db_path().resolve()
-    if _engine is not None and _engine_db_path is not None and _engine_db_path != path:
-        _engine.dispose()
-        _engine = None
-        _engine_db_path = None
-    if _engine is None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _engine = create_engine(
-            _sqlite_url(path),
-            connect_args={"check_same_thread": False},
-            pool_pre_ping=True,
-        )
-        _engine_db_path = path
+    if _engine is not None and _engine_db_path is not None and _engine_db_path == path:
+        return _engine
+    with _engine_lock:
+        if _engine is not None and _engine_db_path is not None and _engine_db_path != path:
+            _engine.dispose()
+            _engine = None
+            _engine_db_path = None
+        if _engine is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _engine = create_engine(
+                _sqlite_url(path),
+                connect_args={"check_same_thread": False},
+                pool_pre_ping=True,
+            )
+            _engine_db_path = path
 
-        @event.listens_for(_engine, "connect")
-        def _on_connect(dbapi_conn, _connection_record) -> None:  # type: ignore[no-untyped-def]
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
+            @event.listens_for(_engine, "connect")
+            def _on_connect(dbapi_conn, _connection_record) -> None:  # type: ignore[no-untyped-def]
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.close()
 
     return _engine
 
