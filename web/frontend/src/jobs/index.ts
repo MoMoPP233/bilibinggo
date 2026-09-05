@@ -1253,17 +1253,52 @@ export function collectFinishedDynamicIds(job) {
   return [];
 }
 
+async function refreshAfterJobFinished(job) {
+  const tasks = [
+    loadSummary(),
+    syncProjectState(),
+    syncProfilesAfterLoginJob(job),
+    loadActivities(),
+  ];
+  if (job.action === "refresh_watch") {
+    tasks.push(loadWatchUsers());
+  }
+  const results = await Promise.allSettled(tasks);
+  const rejected = results.filter((result) => result.status === "rejected");
+  if (rejected.length > 0) {
+    // 后台同步失败不打扰用户（不弹一排 toast）；各模块页面保留各自上次结果。
+    const reasons = rejected.map((result) =>
+      String(result.reason?.message || result.reason)
+    );
+    console.warn(`[jobs] Job 后台同步 ${rejected.length} 项失败：${reasons.join("；")}`);
+  }
+  if (job.action === "refresh_watch" && job.state === "success") {
+    pulseWatchSyncCard();
+  }
+  // 后台同步期间若已有更新的 Job（用户新启任务/新终态），
+  // 用权威 currentJob 回刷一次，避免旧 /api/summary 快照盖掉当前任务状态。
+  if (state.currentJob) updateJobUI(state.currentJob);
+}
+
+function beginPostJobBackgroundRefresh(job) {
+  // 阶段二：终态已确认后的数据同步，全部后台执行，不阻塞用户反馈。
+  refreshAfterJobFinished(job).catch((error) => {
+    console.warn("[jobs] Job 后台刷新失败", job?.action, error);
+  });
+}
+
 export async function handleJobCompletion(job) {
   dismissRunningToasts();
 
   const isParticipation = job.action === "participate" || job.action === "participate_triple";
-  if (job.action === "login" && job.state === "success" && !state.qrcodeDismissed) {
+  const loginSuccessPending =
+    job.action === "login" && job.state === "success" && !state.qrcodeDismissed;
+  if (loginSuccessPending) {
     renderQrcodeLoginState({
       ...job,
       result: { ...(job.result || {}), login_phase: "success" },
       message: "登录成功，账号已就绪",
     });
-    await new Promise((resolve) => window.setTimeout(resolve, 450));
   }
 
   if (isParticipation && (job.state === "success" || job.state === "error")) {
@@ -1300,29 +1335,23 @@ export async function handleJobCompletion(job) {
 
   window.dispatchEvent(new CustomEvent("binggo:job-completed", { detail: job }));
 
-  const finishedDynamicIds = collectFinishedDynamicIds(job);
-  try {
-    await loadSummary();
-    await syncProjectState();
-    await syncProfilesAfterLoginJob(job).catch(() => false);
-    await loadActivities();
-    if (job.action === "refresh_watch") {
-      await loadWatchUsers();
-      if (job.state === "success") pulseWatchSyncCard();
-    }
-    if (job.action === "refresh_source" && job.state === "success") {
-      const sourceId = state.lastJobAttempt?.params?.source_id;
-      flashSourceRow(sourceId);
-    }
-  } catch (error) {
-    showToast(String(error.message || error), "error");
-  }
+  // 阶段一：终态已确认，立即恢复按钮/loading，并给出任务结果反馈；不等待后台刷新。
   clearActionButtonLoading();
   if (job.action === "participate_triple") {
     renderTripleParticipateBar(state.tripleTargets);
   }
-  flashActivityRows(finishedDynamicIds);
-  if (job.action === "login" && job.state === "success") hideQrcodeModal(false);
+  flashActivityRows(collectFinishedDynamicIds(job));
+  if (job.action === "refresh_source" && job.state === "success") {
+    const sourceId = state.lastJobAttempt?.params?.source_id;
+    flashSourceRow(sourceId);
+  }
+
+  if (loginSuccessPending) {
+    await new Promise((resolve) => window.setTimeout(resolve, 450));
+    hideQrcodeModal(false);
+  }
+
+  beginPostJobBackgroundRefresh(job);
 }
 
 export function bindActionButtons() {
@@ -1398,7 +1427,9 @@ export function applyRunningJobView(job) {
 }
 
 export async function finishJobOnce(job) {
-  const key = `${job.id || ""}:${job.action || ""}:${job.state || ""}:${job.finished_at || ""}`;
+  // 不用 finished_at 参与去重键：SSE job.terminal 载荷不含 finished_at，
+  // 而 polling /api/jobs/current 的 to_dict 含 finished_at，避免同一终态两条通道各刷一次。
+  const key = `${job.id || ""}:${job.action || ""}:${job.state || ""}`;
   if (key && key === state.lastFinishedJobKey) return;
   state.lastFinishedJobKey = key;
   state.currentJob = job;
