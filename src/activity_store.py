@@ -140,9 +140,9 @@ def _load_payload_unlocked() -> dict[str, Any]:
                 changed_items.append(item)
         if changed_items:
             now = int(time.time())
+            # 归一化已在原 dict 上就地完成：直接写回，无需二次全表 SELECT+hydrate。
             _upsert_activities(session, changed_items, updated_at=now)
             max_updated = max(max_updated, now)
-            activities = _list_activity_dicts(session)
     payload = _empty_payload()
     payload["activities"] = activities
     payload["updated_at"] = max_updated

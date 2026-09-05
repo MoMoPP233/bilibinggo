@@ -88,6 +88,7 @@ def _apply_classification(
     prev_status = str(item.get("activity_status") or "")
     prev_draw = str(item.get("draw_status") or "")
     prev_draw_tag = str(item.get("draw_tag") or "")
+    prev_classified = bool(item.get("status_classified"))
     ended_newly = draw_status == "ended" and prev_draw != "ended"
     soon_newly = draw_tag == "即将开奖" and prev_draw_tag != "即将开奖"
 
@@ -96,12 +97,15 @@ def _apply_classification(
     item["draw_tag"] = draw_tag
     item["status_classified"] = True
 
+    # updated 统计口径与旧实现一致：只统计可见状态字段变化。
     changed = (
         activity_status != prev_status
         or draw_status != prev_draw
         or draw_tag != prev_draw_tag
     )
-    return True, changed, ended_newly, soon_newly
+    # 是否真的需要写库：可见字段变化 或 status_classified 需要补写。
+    needs_persist = changed or not prev_classified
+    return True, changed, ended_newly, soon_newly, needs_persist
 
 
 def _empty_result(*, total: int = 0) -> dict[str, Any]:
@@ -131,7 +135,7 @@ def persist_activity_record(
         dynamic_id = str(item.get("dynamic_id") or "")
         current = int(now if now is not None else time.time())
 
-        was_handled, _, _, _ = _apply_classification(item, participation, now=current)
+        was_handled, _, _, _, _ = _apply_classification(item, participation, now=current)
         if not was_handled:
             raise RuntimeError("该活动不参与状态管理")
 
@@ -157,13 +161,14 @@ def refresh_local_activity_statuses(*, path: Path | None = None) -> dict[str, An
         updated = 0
         ended_marked = 0
         soon_marked = 0
+        any_persist = False
 
         for item in activities:
             if not _is_refresh_candidate(item):
                 continue
 
             dynamic_id = str(item.get("dynamic_id") or "")
-            was_handled, changed, ended_newly, soon_newly = _apply_classification(
+            was_handled, changed, ended_newly, soon_newly, needs_persist = _apply_classification(
                 item,
                 participations.get(dynamic_id),
                 now=now,
@@ -178,8 +183,14 @@ def refresh_local_activity_statuses(*, path: Path | None = None) -> dict[str, An
                 ended_marked += 1
             if soon_newly:
                 soon_marked += 1
+            if needs_persist:
+                any_persist = True
 
-        replace_all_activities(activities)
+        # 没有任何行需要持久化（可见字段未变且 status_classified 已落库）时，
+        # 跳过全表 delete+insert rewrite（避免无意义写入与锁占用）。
+        # 指标（skipped/scanned/updated/ended_marked/soon_marked/total）口径不变。
+        if any_persist:
+            replace_all_activities(activities)
 
         return {
             "skipped": scanned == 0,
