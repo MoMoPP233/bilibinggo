@@ -99,6 +99,11 @@ class EventHub:
         with self._lock:
             self._subs = [item for item in self._subs if item is not sub]
 
+    def latest_seq(self) -> int:
+        """当前已发布事件的最大全局 seq（进程内单调递增，重启归零）。"""
+        with self._lock:
+            return self._seq
+
     def publish(self, event: str, data: dict[str, Any] | None = None) -> int:
         payload = dict(data or {})
         with self._lock:
@@ -192,6 +197,9 @@ class EventHub:
                 keep.append(last_auto_log)
 
         limit = self._queue_maxsize - reserve
+        # 保留的每个事件都带原始全局 seq；先按 seq 升序稳定排序再回填，
+        # 保证 overflow 后剩余事件绝不重排（允许丢弃，不允许倒序）。
+        keep.sort(key=lambda item: item.seq)
         for item in keep[: max(0, limit)]:
             try:
                 sub.queue.put_nowait(item)

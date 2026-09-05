@@ -704,10 +704,24 @@ def api_events():
     """SSE：job.* + auto.* 进程级事件流（协议见方向二）。"""
     from web.sse import sse_response
 
+    # 快照以 callable 注入：在流启动、订阅建立之后再读取，
+    # 关闭“读快照 → 订阅”之间的事件丢失窗口。
     return sse_response(
-        job_snapshot=runner.get_status().to_dict(),
-        auto_snapshot=auto_scheduler.get_status(),
+        job_snapshot=lambda: runner.get_status().to_dict(),
+        auto_snapshot=lambda: auto_scheduler.get_status(),
     )
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatusOut, tags=["stable"])
+def api_job_by_id(job_id: int) -> dict[str, Any]:
+    """按精确 job_id 读取任务状态（供 MCP/客户端等待指定 Job，与当前槽位解耦）。"""
+    from src.job_store import get_job
+    from web.job_runner import _status_from_row
+
+    row = get_job(job_id)
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, f"任务不存在：{job_id}")
+    return _status_from_row(row).to_dict()
 
 
 @app.get("/api/auto/status", tags=["stable"])

@@ -20,6 +20,76 @@ import { loadWatchUsers } from "../watch/index";
 let qrcodeLastFocus = null;
 let lastLogDockJobState = "idle";
 
+const JOB_TERMINAL_STATES = new Set(["success", "error", "cancelled", "interrupted"]);
+const ACCEPTED_TERMINAL_IDS_CAP = 24;
+let acceptedTerminalJobIds: number[] = [];
+// 单条 SSE 连接内的单调窗口：快照 watermark / 事件 seq 都在同一把尺子下。
+// 新连接（startRealtime）会调用 resetJobStreamFreshness() 归零，避免 backend
+// 重启后 seq 归零导致永久拒绝（REST 路径不消耗该窗口）。
+let lastAcceptedStreamSeq: number | null = null;
+
+export function resetJobStreamFreshness() {
+  lastAcceptedStreamSeq = null;
+}
+
+export function isJobTerminalState(state) {
+  return JOB_TERMINAL_STATES.has(String(state || ""));
+}
+
+function jobIdValue(jobOrId) {
+  if (jobOrId == null) return null;
+  const id = typeof jobOrId === "object" ? jobOrId?.id : jobOrId;
+  if (id === undefined || id === null || id === "") return null;
+  const numeric = Number(id);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function noteTerminalAccepted(id: number) {
+  if (!acceptedTerminalJobIds.includes(id)) {
+    acceptedTerminalJobIds.push(id);
+    if (acceptedTerminalJobIds.length > ACCEPTED_TERMINAL_IDS_CAP) {
+      acceptedTerminalJobIds = acceptedTerminalJobIds.slice(-ACCEPTED_TERMINAL_IDS_CAP);
+    }
+  }
+}
+
+export function isJobTerminalAccepted(jobOrId) {
+  const id = jobIdValue(jobOrId);
+  return id !== null && acceptedTerminalJobIds.includes(id);
+}
+
+/**
+ * 统一 freshness gate：所有状态入口（SSE snapshot/terminal/progress/log、
+ * REST poll、job.created）都必须先过这里。
+ *
+ * 规则：
+ * - seq 窗口：<= 当前窗口的事件是旧帧（snapshot 已包含/重复/倒灌），拒绝；
+ * - 同一 job_id 的 terminal 是吸收态：一旦接受终态，该 id 后续任何
+ *   running/progress/snapshot/log 都拒绝；
+ * - 不同 job_id 不受影响（terminal 不是全局吸收态）。
+ *
+ * 返回 true 表示该更新应当继续应用；返回 false 表示过期/重复，调用方直接丢弃。
+ */
+export function acceptJobUpdate(job: any, options: { seq?: number | null } = {}) {
+  const { seq = null } = options;
+  if (seq != null && lastAcceptedStreamSeq != null && Number(seq) <= lastAcceptedStreamSeq) {
+    return false;
+  }
+  if (seq != null) {
+    lastAcceptedStreamSeq = Number(seq);
+  }
+  const id = jobIdValue(job);
+  if (id === null) return true;
+  if (acceptedTerminalJobIds.includes(id)) {
+    // 同一 job 已 terminal：吸收态，拒绝回退。
+    return false;
+  }
+  if (isJobTerminalState(job?.state)) {
+    noteTerminalAccepted(id);
+  }
+  return true;
+}
+
 export function isRefreshPipelineAction(action) {
   return action === "refresh_all" || action === "refresh_source";
 }
@@ -1221,11 +1291,18 @@ export async function startJob(action, params = {}) {
   }
   toggleLogDock(true);
   // 错误提示由调用方 notifyJobStartError 统一处理，避免重复 toast
-  await fetchJSON("/api/jobs", {
+  const startResponse = await fetchJSON("/api/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, params }),
   });
+  const startedJob = startResponse?.job;
+  if (startedJob?.id != null && acceptJobUpdate(startedJob)) {
+    // POST 已返回权威新 job_id：立刻确定当前任务身份，
+    // 旧 Job 任何晚到事件都无法覆盖它。
+    state.currentJob = startedJob;
+    updateJobUI(startedJob);
+  }
   if (action === "login") {
     state.qrcodeDismissed = false;
     state.lastQrcodeRefresh = 0;
@@ -1236,6 +1313,11 @@ export async function startJob(action, params = {}) {
 
 export async function trackCurrentJob() {
   const current = await fetchJSON("/api/jobs/current");
+  if (current?.id != null && !acceptJobUpdate(current)) {
+    // 迟到的旧快照：不覆盖权威身份，但仍继续建立实时通道。
+    startRealtime();
+    return current;
+  }
   state.currentJob = current;
   updateJobUI(current);
   startRealtime();
@@ -1427,6 +1509,11 @@ export function applyRunningJobView(job) {
 }
 
 export async function finishJobOnce(job) {
+  // 同 job_id terminal 吸收态登记（双保险：即使绕过 accept 直接调用也只完成一次）。
+  if (job && isJobTerminalState(job.state)) {
+    const terminalId = jobIdValue(job);
+    if (terminalId !== null) noteTerminalAccepted(terminalId);
+  }
   // 不用 finished_at 参与去重键：SSE job.terminal 载荷不含 finished_at，
   // 而 polling /api/jobs/current 的 to_dict 含 finished_at，避免同一终态两条通道各刷一次。
   const key = `${job.id || ""}:${job.action || ""}:${job.state || ""}`;
@@ -1482,6 +1569,13 @@ export function startPolling() {
   // H2：SSE 健康时不双通道
   if (state.sseHealthy && state.eventSource) return;
   if (state.polling) return;
+  const scheduleNext = (delayMs) => {
+    if (state.sseHealthy && state.eventSource) {
+      stopJobPolling();
+      return;
+    }
+    state.polling = window.setTimeout(poll, delayMs);
+  };
   const poll = async () => {
     if (state.sseHealthy && state.eventSource) {
       stopJobPolling();
@@ -1489,9 +1583,14 @@ export function startPolling() {
     }
     try {
       const job = await fetchJSON("/api/jobs/current");
-      state.currentJob = job;
-      updateJobUI(job);
       if (job.state === "running") {
+        if (!acceptJobUpdate(job)) {
+          // 迟到的旧 running（该 job 已 terminal / 已被新 job 取代）：不更新 UI。
+          scheduleNext(resolveJobPollIntervalMs(job.action));
+          return;
+        }
+        state.currentJob = job;
+        updateJobUI(job);
         if (job.action === "login" && !state.qrcodeDismissed) {
           ensureQrcodeModalVisible();
           renderQrcodeLoginState(job);
@@ -1505,7 +1604,9 @@ export function startPolling() {
         return;
       }
       stopJobPolling();
-      await finishJobOnce(job);
+      if (acceptJobUpdate(job)) {
+        await finishJobOnce(job);
+      }
     } catch (error) {
       console.error(error);
       state.polling = window.setTimeout(poll, 1500);

@@ -52,27 +52,50 @@ async def start_job(
 async def wait_job_terminal(
     client: BinggoClient,
     *,
+    expect_job_id: int | None = None,
     expect_action: str | None = None,
     timeout_sec: float = JOB_WAIT_TIMEOUT_SEC,
 ) -> dict[str, Any]:
+    """等待指定任务到达终态。
+
+    带 expect_job_id 时通过 /api/jobs/{job_id} 按精确身份轮询：
+    同 action 的先后两个 Job 绝不会互相串结果（A 等待期间 B 结束也不影响 A）。
+    expect_job_id 为空时退化为按当前槽位等待（兼容调用方/旧行为）。
+    """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout_sec
     last: dict[str, Any] = {}
+
+    async def fetch_once() -> dict[str, Any]:
+        if expect_job_id is not None:
+            job = await client.get_json(f"/api/jobs/{expect_job_id}")
+            return job if isinstance(job, dict) else {}
+        return await get_current_job(client)
+
     while True:
-        last = await get_current_job(client)
+        last = await fetch_once()
+        job_id = last.get("id")
         state = str(last.get("state") or "idle")
         action = str(last.get("action") or "")
-        if is_terminal_job_state(state):
-            if expect_action and action and action != expect_action:
-                # Finished some other job; keep waiting for ours if still needed.
-                pass
-            else:
+        if expect_job_id is not None:
+            if job_id is None or int(job_id) != expect_job_id:
+                # 身份不匹配：继续按原 job_id 轮询，绝不拿别的任务当结果。
+                last = {}
+            elif is_terminal_job_state(state):
                 return last
-        if state == "idle" and not action:
-            return last
+        else:
+            if state == "idle" and not action:
+                return last
+            if is_terminal_job_state(state):
+                if expect_action and action and action != expect_action:
+                    # Finished some other job; keep waiting for ours if still needed.
+                    pass
+                else:
+                    return last
         if loop.time() >= deadline:
             raise BinggoApiError(
-                f"等待任务结束超时（action={expect_action or action or '—'}, state={state}）。"
+                f"等待任务结束超时（job_id={expect_job_id or '—'}, "
+                f"action={expect_action or action or '—'}, state={state}）。"
             )
         await asyncio.sleep(POLL_INTERVAL_SEC)
 
@@ -84,14 +107,23 @@ async def run_job_to_terminal(
     *,
     timeout_sec: float = JOB_WAIT_TIMEOUT_SEC,
 ) -> dict[str, Any]:
-    """Wait for any prior job, start action, wait until this job reaches a terminal state."""
+    """等待已有任务结束 → 启动新任务 → 按精确 job_id 等待该任务到达终态。
+
+    同 action 的先后多个 Job 不会串结果：等待期间任何其它任务结束都不影响本任务。
+    """
     await wait_until_idle_or_terminal(client, timeout_sec=timeout_sec)
     started = await start_job(client, action, params)
     job = started.get("job") if isinstance(started.get("job"), dict) else {}
+    job_id = job.get("id")
     # If server returned a snapshot already terminal (unlikely), use it.
-    if is_terminal_job_state(str(job.get("state") or "")):
+    if job_id is not None and is_terminal_job_state(str(job.get("state") or "")):
         return {"ok": True, "job": job, "started": started}
-    final = await wait_job_terminal(client, expect_action=action, timeout_sec=timeout_sec)
+    final = await wait_job_terminal(
+        client,
+        expect_job_id=int(job_id) if job_id is not None else None,
+        expect_action=action,
+        timeout_sec=timeout_sec,
+    )
     return {"ok": True, "job": final, "started": started}
 
 

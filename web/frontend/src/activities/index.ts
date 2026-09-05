@@ -6,7 +6,7 @@ import { state } from "../state";
 import { fetchJSON } from "../api/client";
 import { isSetupComplete } from "../account/index";
 import { activitiesBody, activitiesCards, filterDrawWindowHint, filterResultSummary, pagination, statsGrid } from "../dom";
-import { bindActionButtons, updateJobUI } from "../jobs/index";
+import { acceptJobUpdate, bindActionButtons, updateJobUI } from "../jobs/index";
 import { showToast } from "../shell/toast";
 import { activityStatusTone, badgeClass, formatFilterSummary, formatHeat, formatLastParticipation, formatLotteryTime, isLotterySoon, lotteryTypeTone } from "../utils/format";
 import { animateStatValue, flashFilterPill, playActivityListEnter, pulseFilterSummary } from "../utils/motion";
@@ -194,7 +194,14 @@ export async function loadSummary() {
   const summary = await fetchJSON("/api/summary");
   renderStats(summary);
   renderSources(summary.sources);
-  updateJobUI(summary.job || { state: "idle" });
+  const snapshotJob =
+    summary.job && typeof summary.job === "object" ? summary.job : null;
+  if (snapshotJob) {
+    // summary 也属于 REST 快照入口：过期/重复快照不得回退当前权威状态。
+    if (acceptJobUpdate(snapshotJob)) updateJobUI(snapshotJob);
+  } else if (!state.currentJob?.id) {
+    updateJobUI({ state: "idle" });
+  }
   return summary.job;
 }
 

@@ -4,7 +4,7 @@
 
 import { state } from "../state";
 import { ensureAutoCountdown, ensureAutoPolling, mergeAutoLogs, renderAutoDock } from "../auto/index";
-import { appendJobLogChunk, applyRunningJobView, finishJobOnce, mergeJobProgress, startPolling, stopJobPolling, updateJobUI } from "../jobs/index";
+import { acceptJobUpdate, appendJobLogChunk, applyRunningJobView, finishJobOnce, isJobTerminalAccepted, isJobTerminalState, mergeJobProgress, resetJobStreamFreshness, startPolling, stopJobPolling, updateJobUI } from "../jobs/index";
 
 export const SSE_WATCHDOG_MS = 45000;
 
@@ -64,52 +64,94 @@ export function fallbackToPolling(reason) {
   }
 }
 
+function sameJobAsCurrent(payload) {
+  const current = state.currentJob;
+  if (!current || current.id === undefined || current.id === null || current.id === "") {
+    // 尚无权威身份：允许（随后 snapshot/job.created 会建立身份）。
+    return true;
+  }
+  if (payload?.id === undefined || payload?.id === null || payload?.id === "") {
+    return true;
+  }
+  return Number(current.id) === Number(payload.id);
+}
+
 export function handleSseMessage(eventName, payload) {
   markSseActive();
   if (eventName === "heartbeat") return;
 
-  if (eventName === "job.snapshot" || eventName === "job.created") {
+  if (eventName === "job.snapshot") {
+    // 快照参与同一套 freshness：snapshot 携带读取时 watermark（payload.seq）。
+    const job = { ...payload };
+    if (!acceptJobUpdate(job, { seq: payload?.seq })) {
+      // 旧快照（已被新事件覆盖/该 job 已 terminal）：不得回退 UI。
+      return;
+    }
+    if (isJobTerminalState(job.state)) {
+      // 断线/重连期间完成的任务：terminal snapshot 首次确认 → 完整 finishJobOnce。
+      // 页面加载时 bootstrap 已通过 loadSummary 展示过的同一 terminal 视为已知，不重复完成。
+      const current = state.currentJob;
+      const alreadyKnown =
+        current?.id != null
+        && job?.id != null
+        && Number(current.id) === Number(job.id)
+        && current.state === job.state;
+      if (!alreadyKnown) {
+        void finishJobOnce(job);
+      } else {
+        state.currentJob = job;
+        updateJobUI(job);
+      }
+      return;
+    }
+    applyRunningJobView(job);
+    return;
+  }
+
+  if (eventName === "job.created") {
     const job = {
       ...(state.currentJob || {}),
       ...payload,
-      state: payload.state || (eventName === "job.created" ? "running" : payload.state),
+      state: "running",
     };
-    if (eventName === "job.created") {
-      // 新任务不得沿用上一任务的 log/result/进度
-      job.log = "";
-      job.result = payload.result && typeof payload.result === "object" ? payload.result : {};
-      job.progress_step = payload.progress_step ?? 0;
-      job.progress_total = payload.progress_total ?? 0;
-      job.finished_at = null;
-      job.message = payload.message || "任务已启动";
-      state.lastFinishedJobKey = "";
-    }
-    if (job.state === "running") {
-      applyRunningJobView(job);
-    } else {
-      state.currentJob = job;
-      updateJobUI(job);
-    }
+    // 新任务不得沿用上一任务的 log/result/进度
+    job.log = "";
+    job.result = payload.result && typeof payload.result === "object" ? payload.result : {};
+    job.progress_step = payload.progress_step ?? 0;
+    job.progress_total = payload.progress_total ?? 0;
+    job.finished_at = null;
+    job.message = payload.message || "任务已启动";
+    state.lastFinishedJobKey = "";
+    if (!acceptJobUpdate(job, { seq: payload?.seq })) return;
+    applyRunningJobView(job);
     return;
   }
 
   if (eventName === "job.progress") {
+    if (!sameJobAsCurrent(payload)) return; // 旧 Job 的 progress 不写当前 Job
+    if (!acceptJobUpdate({ id: payload?.id, state: "running" }, { seq: payload?.seq })) {
+      return;
+    }
     applyRunningJobView(mergeJobProgress(payload));
     return;
   }
 
   if (eventName === "job.log") {
-    if (payload?.chunk) appendJobLogChunk(String(payload.chunk));
+    if (!payload?.chunk) return;
+    if (!sameJobAsCurrent(payload)) return; // 旧 Job 的 log 不写当前 Job
+    if (!acceptJobUpdate({ id: payload?.id, state: "running" }, { seq: payload?.seq })) {
+      return;
+    }
+    appendJobLogChunk(String(payload.chunk));
     return;
   }
 
   if (eventName === "job.terminal") {
-    const job = {
-      ...(state.currentJob || {}),
-      ...payload,
-      state: payload.state,
-      id: payload.id ?? state.currentJob?.id,
-    };
+    const job = { ...payload, state: payload.state };
+    if (!acceptJobUpdate(job, { seq: payload?.seq })) {
+      // 该 job 已 terminal（重复路径）或属于旧身份：不再重复 completion。
+      return;
+    }
     void finishJobOnce(job);
     return;
   }
@@ -145,6 +187,9 @@ export function startRealtime() {
   if (state.eventSource && state.eventSource.readyState === EventSource.CONNECTING) return;
 
   closeEventSource();
+  // 新连接 = 新流：stream seq 窗口归零（backend 重启后 seq 从 1 重新开始，
+  // 旧窗口不保留，否则会永久拒绝所有新事件）。REST 路径不消耗该窗口。
+  resetJobStreamFreshness();
   try {
     const es = new EventSource("/api/events");
     state.eventSource = es;
