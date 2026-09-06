@@ -7,6 +7,10 @@
 - 风控（-352/-509/429/rate-limit/risk-control/风控/限流）向上抛，由 AutoScheduler 走全局 6h 冷却；
   不把风控当成“空 Feed / 0 条”。
 - 复用现有 run_new_links_pipeline（含去重、分类、详情、明确已结束过滤、入库），不另造分类器。
+- checkpoint 推进语义（V16）：只要本轮存在“仍需要以后重试的未完成候选”
+  （正文不可读取），就保留进入本轮前的旧 checkpoint，让该候选下一轮可再次进入流水线；
+  终态安全项（404 链接失效、充电/非抽奖等 skip、详情提取失败、扫描开始前已结束过滤、
+  DB 去重命中）不阻塞推进，坏动态只隔离自身、不拖垮整轮。
 - 开关默认 OFF，本地 per-Profile JSON；开关动作 0 远程。
 - 不升 DB Schema（v10 不变）。
 """
@@ -34,6 +38,10 @@ FOLLOW_FEED_MAX_ITEMS = 30
 _VALID_DYNAMIC_ID = re.compile(r"^\d{18,19}$")
 
 _FILE_NAME = "following_feed_state.json"
+
+# 仍需以后重试的失败：动态仍可能存在，只是本轮未能成功处理完毕。
+# checkpoint 不得越过这类候选。其余 pipeline skip 均属终态安全项，不阻塞推进。
+CHECKPOINT_BLOCKING_SKIP_REASONS = frozenset({"正文不可读取"})
 
 
 def matches_platform_risk(message: object) -> bool:
@@ -235,8 +243,28 @@ def scan_following_feed(
     added = int(getattr(pipeline, "persisted_count", 0) or 0)
     now = int(time.time())
 
-    # 只有正常完成整轮才推进 checkpoint；风险异常在更早处抛出而未写盘。
-    new_checkpoint = processed[0] if processed else (checkpoint or None)
+    # checkpoint 语义（V16）：
+    # 1) 本轮没有任何“仍需以后重试”的未完成候选 → 推进到本轮最新处理项 processed[0]
+    #    （与 V1 完全一致：完整成功推进到最新）。
+    # 2) 存在 CHECKPOINT_BLOCKING_SKIP_REASONS 命中的失败（正文不可读取）→ 保留进入本轮前
+    #    的旧 checkpoint，下一轮会再次看到该候选并重新进入 pipeline；已成功/终态项
+    #    由 DB 去重与 participation 防重链在重扫时安全挡下。
+    # 3) pipeline 抛异常 / feed 请求失败 / risk 都发生在写 checkpoint 之前（直接上抛）。
+    #    终态安全 skip（404 链接失效、充电/非抽奖、详情提取失败、已结束过滤、去重命中）
+    #    不阻塞推进，避免坏动态卡死整轮扫描。
+    blocking_count = 0
+    skip_reasons = getattr(pipeline, "skip_reasons", None)
+    if isinstance(skip_reasons, dict):
+        blocking_count = sum(
+            int(skip_reasons.get(reason, 0) or 0)
+            for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
+        )
+
+    if blocking_count > 0:
+        # 保守语义：只保留进入本轮前 checkpoint 的值；不先写新值再 rollback。
+        new_checkpoint = checkpoint or None
+    else:
+        new_checkpoint = processed[0] if processed else (checkpoint or None)
     state["last_seen_dynamic_id"] = new_checkpoint
     state["last_scan_at"] = now
     state["last_found"] = found
