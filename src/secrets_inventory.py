@@ -45,6 +45,16 @@ REDACT_SECRET_KEY_NAMES: frozenset[str] = frozenset(
         "authorization",
         "api_key",
         "api-key",
+        "csrf",
+        "csrf_token",
+        "csrf-token",
+        "x_csrf",
+        "x-csrf",
+        "bili_jct",
+        "sessdata",
+        "dedeuserid",
+        "access_key",
+        "access-key",
     }
 )
 

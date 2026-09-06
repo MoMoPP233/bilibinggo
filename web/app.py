@@ -45,6 +45,7 @@ from src.user_settings import (
 from src.watch_sync import MAX_WINDOW_SECONDS, OUTPUT_PATH as WATCH_OUTPUT_PATH, compute_sync_window
 from src.watch_users import add_watch_user, get_watch_users_payload, remove_watch_user, seed_from_candidates_if_empty
 from web.account_service import ack_at_unread_notice, clear_login_cookie, get_account_extras, get_account_profile, get_local_login_state
+from web.security import LocalControlPlaneGuard
 from web.activity_service import (
     ACTIVITY_PAGE_SIZE,
     get_summary,
@@ -113,6 +114,7 @@ class AssetCacheMiddleware:
 
 
 # 纯 ASGI 中间件：勿用 BaseHTTPMiddleware，以免缓冲/打断 SSE
+app.add_middleware(LocalControlPlaneGuard)
 app.add_middleware(AssetCacheMiddleware)
 app.add_middleware(ApiContractMiddleware)
 register_exception_handlers(app)

@@ -7,10 +7,15 @@ from typing import Any
 
 from src.secrets_inventory import is_redact_secret_key
 
+# 参数 value 用 &/;/|/空白做边界即可完整覆盖 URL 编码值（%26/%2F 等不是分隔符）；
+# 覆盖 query 与 Cookie/header 形式的 csrf / csrf_token / bili_jct / SESSDATA 等。
 _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(SESSDATA=)[^\s;|&]+", re.IGNORECASE), r"\1***"),
     (re.compile(r"(bili_jct=)[^\s;|&]+", re.IGNORECASE), r"\1***"),
     (re.compile(r"(DedeUserID=)[^\s;|&]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(csrf(?:_token)?\s*=\s*)[^\s;|&]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(x-csrf(?:_token)?\s*[:=]\s*)[^\s;|&]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(access(?:_|-)?key=)[^\s;|&]+", re.IGNORECASE), r"\1***"),
     (re.compile(r"(Bearer\s+)\S+", re.IGNORECASE), r"\1***"),
     (re.compile(r"(LLM_API_KEY\s*=\s*)\S+", re.IGNORECASE), r"\1***"),
     (re.compile(r"(api[_-]?key\s*[=:]\s*)\S+", re.IGNORECASE), r"\1***"),
