@@ -15,7 +15,7 @@ from src.app_logging import get_logger, setup_logging
 from src.app_paths import __version__, ensure_user_dirs
 from src.bilibili_login import QR_IMAGE_PATH
 from src.data_paths import get_data_root, get_runtime_profile_id, get_selected_profile_id
-from src.llm_client import test_llm_connection
+from src.llm_client import test_llm_connection_async
 from src.llm_settings import (
     build_llm_config_from_inputs,
     get_llm_settings_public,
@@ -850,7 +850,10 @@ def api_test_llm_settings(request: LlmSettingsRequest) -> dict[str, Any]:
             base_url=test_base,
             model_name=test_model,
         )
-        endpoint = test_llm_connection(config)
+        import asyncio
+
+        # 总 deadline 由 test_llm_connection_async 内的 asyncio.timeout 保证（TOTAL=90s，<frontend 100s）。
+        endpoint = asyncio.run(test_llm_connection_async(config))
         llm = mark_llm_test_passed(
             api_key=test_key,
             base_url=test_base,

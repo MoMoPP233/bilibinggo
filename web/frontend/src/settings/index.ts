@@ -267,6 +267,12 @@ export async function saveLlmSettings() {
   }
 }
 
+// 后端 LLM provider 单次最大窗口为 90s（read/generation）；前端等待必须略长，
+// 让 backend 先返回真实 timeout/error，而不是前端先 Abort。非 LLM 请求不延长。
+export const LLM_TEST_REQUEST_TIMEOUT_MS = 100000;
+
+let llmTestRequestSeq = 0;
+
 export async function testLlmSettings() {
   if (!isLoggedIn()) {
     setInlineFeedback(llmActionFeedback, "请先扫码登录后再测试", "info", { autoHide: false });
@@ -275,13 +281,15 @@ export async function testLlmSettings() {
   const button = document.getElementById("test-llm-settings");
   setButtonLoading(button, true, { label: "测试中…" });
   setInlineFeedback(llmActionFeedback, "正在测试连接…", "info", { autoHide: false });
+  const seq = ++llmTestRequestSeq;
   try {
     const result = await fetchJSON("/api/settings/llm/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(getLlmFormValues()),
-      timeoutMs: 60000,
+      timeoutMs: LLM_TEST_REQUEST_TIMEOUT_MS,
     });
+    if (seq !== llmTestRequestSeq) return; // 旧请求晚到：不覆盖新请求结果
     state.settings = {
       ...(state.settings || {}),
       llm: result.llm,
@@ -291,10 +299,13 @@ export async function testLlmSettings() {
     if (state.account) renderAccountViews(state.account);
     setInlineFeedback(llmActionFeedback, result.message || "LLM 连接正常", "success");
   } catch (error) {
+    if (seq !== llmTestRequestSeq) return; // 过期失败不污染新请求的反馈
     setInlineFeedback(llmActionFeedback, String(error.message || error), "error");
     throw error;
   } finally {
-    setButtonLoading(button, false);
+    if (seq === llmTestRequestSeq) {
+      setButtonLoading(button, false);
+    }
   }
 }
 
