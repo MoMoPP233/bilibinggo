@@ -24,7 +24,7 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-_RATE_LIMIT_CODES = frozenset({-352, -509})
+_PLATFORM_RISK_CODES = frozenset({-352, -509})
 
 MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
@@ -186,7 +186,10 @@ class BilibiliClient:
                 code = data.get("code")
                 if code in (0, None):
                     return data
-                if code in (-352, -509, -799) and attempt < retries:
+                if code in _PLATFORM_RISK_CODES:
+                    # 明确平台风控（-352/-509）：已真实发送一次，绝不在客户端重试。
+                    raise RuntimeError(f"API error {code}: {data.get('message')}")
+                if code == -799 and attempt < retries:
                     time.sleep(1.2 * (attempt + 1))
                     last_error = RuntimeError(f"API error {code}: {data.get('message')}")
                     continue
@@ -195,7 +198,7 @@ class BilibiliClient:
                 last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
                 if attempt < retries and (
                     isinstance(exc, (httpx.RequestError, json.JSONDecodeError))
-                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 429, 500, 502, 503, 504))
+                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
                     time.sleep(2.0 * (attempt + 1))
                     continue
@@ -219,7 +222,7 @@ class BilibiliClient:
                 last_error = exc
                 if attempt < retries and (
                     isinstance(exc, httpx.RequestError)
-                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 429, 500, 502, 503, 504))
+                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
                     time.sleep(2.0 * (attempt + 1))
                     continue
@@ -256,21 +259,21 @@ class BilibiliClient:
                 code = payload.get("code")
                 if code in (0, None):
                     return payload
-                if not raise_on_code and code not in _RATE_LIMIT_CODES:
+                if code in _PLATFORM_RISK_CODES:
+                    # 明确平台风控（-352/-509）：已真实发送一次，绝不在客户端重试。
+                    if raise_on_code:
+                        message = payload.get("message") or payload.get("msg") or ""
+                        raise RuntimeError(f"API error {code}: {message}")
                     return payload
-                if code in _RATE_LIMIT_CODES and attempt < retries:
-                    time.sleep(1.2 * (attempt + 1))
-                    last_error = RuntimeError(f"API error {code}: {payload.get('message')}")
-                    continue
-                if raise_on_code:
-                    message = payload.get("message") or payload.get("msg") or ""
-                    raise RuntimeError(f"API error {code}: {message}")
-                return payload
+                if not raise_on_code:
+                    return payload
+                message = payload.get("message") or payload.get("msg") or ""
+                raise RuntimeError(f"API error {code}: {message}")
             except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError) as exc:
                 last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
                 if attempt < retries and (
                     isinstance(exc, (httpx.RequestError, json.JSONDecodeError))
-                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 429, 500, 502, 503, 504))
+                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
                     time.sleep(2.0 * (attempt + 1))
                     continue
@@ -305,21 +308,21 @@ class BilibiliClient:
                 code = data.get("code")
                 if code in (0, None):
                     return data
-                if not raise_on_code and code not in _RATE_LIMIT_CODES:
+                if code in _PLATFORM_RISK_CODES:
+                    # 明确平台风控（-352/-509）：已真实发送一次，绝不在客户端重试。
+                    if raise_on_code:
+                        message = data.get("message") or data.get("msg") or ""
+                        raise RuntimeError(f"API error {code}: {message}")
                     return data
-                if code in _RATE_LIMIT_CODES and attempt < retries:
-                    time.sleep(1.2 * (attempt + 1))
-                    last_error = RuntimeError(f"API error {code}: {data.get('message')}")
-                    continue
-                if raise_on_code:
-                    message = data.get("message") or data.get("msg") or ""
-                    raise RuntimeError(f"API error {code}: {message}")
-                return data
+                if not raise_on_code:
+                    return data
+                message = data.get("message") or data.get("msg") or ""
+                raise RuntimeError(f"API error {code}: {message}")
             except (httpx.HTTPStatusError, httpx.RequestError, json.JSONDecodeError) as exc:
                 last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
                 if attempt < retries and (
                     isinstance(exc, (httpx.RequestError, json.JSONDecodeError))
-                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 429, 500, 502, 503, 504))
+                    or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
                     time.sleep(2.0 * (attempt + 1))
                     continue

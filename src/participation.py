@@ -17,12 +17,15 @@ from src.lottery_actions import (
     ActionResult,
     ParticipationReadClient,
     build_dynamic_context,
+    current_participation_risk_breaker,
     execute_full_participation,
     follow_user,
     has_comment,
     is_following,
     resolve_sender_uid,
     _api_code,
+    _raise_payload_risk,
+    _risk_error_from_exc,
 )
 from src.lottery_api import (
     fetch_dynamic_detail,
@@ -313,6 +316,24 @@ def participate_five_action_lottery(
             on_action=completed_actions.append,
         )
     except Exception as exc:
+        # 明确平台风控：保留已完成动作的记录，触发共享 breaker，并把风险上抛给
+        # JobRunner（唯一 6h cooldown 出口），不能被普通失败语义吞掉/覆盖。
+        risk = _risk_error_from_exc(exc)
+        if risk is not None:
+            breaker = current_participation_risk_breaker()
+            if breaker is not None:
+                breaker.trigger(risk.code)
+            result = ParticipateResult(
+                dynamic_id=dynamic_id,
+                lottery_type=lottery_type,
+                status="failed",
+                message=str(risk),
+                action_text=text,
+                actions=completed_actions,
+                context_snapshot=_context_snapshot(context, extra={**text_meta, "notice": _notice_snapshot(notice)}),
+            )
+            _persist_result(result=result, persist=persist, dry_run=dry_run)
+            raise risk from exc
         # Keep completed actions even when a later request fails. Unexpected
         # exceptions still propagate after preserving the diagnostic record.
         message = str(exc).strip() or "参与失败"
@@ -438,6 +459,7 @@ def _reserve_click(
     message = str(payload.get("message") or payload.get("msg") or "")
     if "已预约" in message:
         return ActionResult("reserve", True, "已预约")
+    _raise_payload_risk(payload, "预约")
     return ActionResult("reserve", False, f"code={code} {message}".strip())
 
 
@@ -509,6 +531,7 @@ def participate_reserve_lottery(
         return result
 
     referer = str(reserve_info["referer"])
+    follow_risk: Exception | None = None
 
     if on_step:
         on_step(1, total_steps, f"正在关注（1/{total_steps}）", "follow")
@@ -529,7 +552,12 @@ def participate_reserve_lottery(
             else:
                 follow_action = follow_user(client, uid=sender_uid, csrf=csrf, referer=referer)
     except RuntimeError as exc:
-        follow_action = ActionResult("follow", False, str(exc).strip() or "关注失败")
+        risk = _risk_error_from_exc(exc)
+        if risk is not None:
+            follow_risk = risk
+            follow_action = ActionResult("follow", False, str(risk))
+        else:
+            follow_action = ActionResult("follow", False, str(exc).strip() or "关注失败")
 
     actions: list[ActionResult] = [follow_action]
     snapshot = _context_snapshot(
@@ -555,44 +583,69 @@ def participate_reserve_lottery(
             context_snapshot=snapshot,
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
+        if follow_risk is not None:
+            breaker = current_participation_risk_breaker()
+            if breaker is not None:
+                breaker.trigger(getattr(follow_risk, "code", -352))
+            raise follow_risk
         return result
 
-    if not dry_run:
-        time.sleep(ACTION_INTERVAL_SEC)
+    try:
+        if not dry_run:
+            time.sleep(ACTION_INTERVAL_SEC)
 
-    if on_step:
-        on_step(2, total_steps, f"正在预约（2/{total_steps}）", "reserve")
-    reserve_action = _reserve_click(
-        client,
-        dynamic_id=dynamic_id,
-        reserve_id=reserve_info["reserve_id"],
-        reserve_total=reserve_info["reserve_total"],
-        button_status=reserve_info["button_status"],
-        dry_run=dry_run,
-    )
-    actions.append(reserve_action)
+        if on_step:
+            on_step(2, total_steps, f"正在预约（2/{total_steps}）", "reserve")
+        reserve_action = _reserve_click(
+            client,
+            dynamic_id=dynamic_id,
+            reserve_id=reserve_info["reserve_id"],
+            reserve_total=reserve_info["reserve_total"],
+            button_status=reserve_info["button_status"],
+            dry_run=dry_run,
+        )
+        actions.append(reserve_action)
 
-    if dry_run:
-        status: ParticipationOutcome = "dry_run"
-        message = "预演完成，未实际请求 B 站"
-    elif participation_succeeded(actions, lottery_type="预约抽奖"):
-        status = "joined"
-        message = "关注与预约均已完成"
-    else:
-        status = "failed"
-        message = reserve_action.detail if not reserve_action.ok else "部分操作失败"
+        if dry_run:
+            status: ParticipationOutcome = "dry_run"
+            message = "预演完成，未实际请求 B 站"
+        elif participation_succeeded(actions, lottery_type="预约抽奖"):
+            status = "joined"
+            message = "关注与预约均已完成"
+        else:
+            status = "failed"
+            message = reserve_action.detail if not reserve_action.ok else "部分操作失败"
 
-    result = ParticipateResult(
-        dynamic_id=dynamic_id,
-        lottery_type="预约抽奖",
-        status=status,
-        message=message,
-        action_text="",
-        actions=actions,
-        context_snapshot=snapshot,
-    )
-    _persist_result(result=result, persist=persist, dry_run=dry_run)
-    return result
+        result = ParticipateResult(
+            dynamic_id=dynamic_id,
+            lottery_type="预约抽奖",
+            status=status,
+            message=message,
+            action_text="",
+            actions=actions,
+            context_snapshot=snapshot,
+        )
+        _persist_result(result=result, persist=persist, dry_run=dry_run)
+        return result
+    except Exception as exc:
+        # 明确平台风控：保留已发起动作记录并触发共享 breaker，把风险上抛给 JobRunner。
+        risk = _risk_error_from_exc(exc)
+        if risk is None:
+            raise
+        breaker = current_participation_risk_breaker()
+        if breaker is not None:
+            breaker.trigger(risk.code)
+        result = ParticipateResult(
+            dynamic_id=dynamic_id,
+            lottery_type="预约抽奖",
+            status="failed",
+            message=str(risk),
+            action_text="",
+            actions=actions,
+            context_snapshot=snapshot,
+        )
+        _persist_result(result=result, persist=persist, dry_run=dry_run)
+        raise risk from exc
 
 
 def _participate_activity_unlocked(

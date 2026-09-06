@@ -13,10 +13,11 @@ from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
 from src.bilibili_login import login_with_qrcode
 from src.log_span import PhaseSpanTracker, log_span
-from src.lottery_actions import ActionResult
+from src.lottery_actions import ActionResult, ParticipationRiskBreaker, bind_participation_risk_breaker, current_participation_risk_breaker, reset_participation_risk_breaker
 from src.lottery_classifier import PARTICIPATABLE_TYPES
 from src.participation import participate_activity
 from src.participation_log import participation_succeeded
+from src.platform_risk import risk_code_of as _risk_code_of
 from src.pipeline.refresh_all_pipeline import PipelineResult, run_new_links_pipeline, run_refresh_all_pipeline
 from src.sources import (
     ds1_xiaozhuli,
@@ -1462,11 +1463,15 @@ def run_action(
             progress(step=step, total=total, message=message, log_append=message)
 
         _raise_if_cancelled(cancel_event)
-        payload = _participate_dynamic_payload(
-            dynamic_id,
-            on_step,
-            lottery_type_hint=lottery_type,
-        )
+        _breaker_token = bind_participation_risk_breaker(ParticipationRiskBreaker())
+        try:
+            payload = _participate_dynamic_payload(
+                dynamic_id,
+                on_step,
+                lottery_type_hint=lottery_type,
+            )
+        finally:
+            reset_participation_risk_breaker(_breaker_token)
 
         if _is_participation_dedup_skip(payload):
             message = str(payload.get("message") or "参与已跳过")
@@ -1601,6 +1606,10 @@ def run_action(
         def _participate_triple_target(target: dict[str, Any]) -> dict[str, Any]:
             if cancel_event and cancel_event.is_set():
                 raise ValueError("任务已取消")
+            active_breaker = current_participation_risk_breaker()
+            if active_breaker is not None:
+                # 兄弟 worker 已命中平台风控：不再开始本目标的远程动作。
+                active_breaker.check()
 
             dynamic_id = str(target.get("dynamic_id") or "")
             title = str(target.get("activity_title") or dynamic_id)
@@ -1637,37 +1646,52 @@ def run_action(
 
         results: list[dict[str, Any]] = []
         _emit_triple_progress()
-        with ThreadPoolExecutor(max_workers=PARTICIPATE_TRIPLE_WORKERS) as executor:
-            # 每个 future 各自 copy_context：同一 Context 不能被多线程并发 enter
-            future_to_id = {
-                executor.submit(
-                    contextvars.copy_context().run,
-                    _participate_triple_target,
-                    target,
-                ): str(target.get("dynamic_id") or "")
-                for target in targets
-            }
-            try:
-                for future in as_completed(future_to_id):
-                    dynamic_id = future_to_id[future]
+        breaker = ParticipationRiskBreaker()
+        _breaker_token = bind_participation_risk_breaker(breaker)
+        try:
+            with ThreadPoolExecutor(max_workers=PARTICIPATE_TRIPLE_WORKERS) as executor:
+                # 每个 future 各自 copy_context：同一 Context 不能被多线程并发 enter
+                future_to_id = {
+                    executor.submit(
+                        contextvars.copy_context().run,
+                        _participate_triple_target,
+                        target,
+                    ): str(target.get("dynamic_id") or "")
+                    for target in targets
+                }
+                failures: dict[str, Exception] = {}
+                try:
+                    for future in as_completed(future_to_id):
+                        dynamic_id = future_to_id[future]
+                        if cancel_event and cancel_event.is_set():
+                            raise ValueError("任务已取消")
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            # 记录全部失败而不是立刻抛出：并行 worker 的普通失败
+                            # 不能掩盖同批兄弟 worker 命中的第一条平台风控。
+                            failures[dynamic_id] = exc
+                            if cancel_event is not None:
+                                cancel_event.set()
+                            with progress_lock:
+                                task_states[dynamic_id] = f"失败：{exc}"
+                            _mark_other_tasks_stopped(dynamic_id, reason="已停止（其他活动失败）")
+                            _emit_triple_progress(log_append=f"{dynamic_id}：失败")
+                            for pending in future_to_id:
+                                pending.cancel()
+                finally:
                     if cancel_event and cancel_event.is_set():
-                        raise ValueError("任务已取消")
-                    try:
-                        results.append(future.result())
-                    except Exception as exc:
-                        if cancel_event is not None:
-                            cancel_event.set()
-                        with progress_lock:
-                            task_states[dynamic_id] = f"失败：{exc}"
-                        _mark_other_tasks_stopped(dynamic_id, reason="已停止（其他活动失败）")
-                        _emit_triple_progress(log_append=f"{dynamic_id}：失败")
-                        for pending in future_to_id:
-                            pending.cancel()
-                        raise
-            finally:
-                if cancel_event and cancel_event.is_set():
-                    _mark_other_tasks_stopped("", reason="已取消")
-                    _emit_triple_progress()
+                        _mark_other_tasks_stopped("", reason="已取消")
+                        _emit_triple_progress()
+                if failures:
+                    # 风险优先级：同一批内有任何明确平台风控就以风控作为本 Job 结果。
+                    risk_error = next(
+                        (exc for exc in failures.values() if _risk_code_of(exc) is not None),
+                        None,
+                    )
+                    raise risk_error if risk_error is not None else next(iter(failures.values()))
+        finally:
+            reset_participation_risk_breaker(_breaker_token)
 
         refresh_local_activity_statuses()
         results.sort(key=lambda item: target_ids.index(item["dynamic_id"]))
