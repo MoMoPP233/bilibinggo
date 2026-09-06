@@ -4,7 +4,7 @@
 
 import { state } from "../state";
 import { ensureAutoCountdown, ensureAutoPolling, mergeAutoLogs, renderAutoDock } from "../auto/index";
-import { acceptJobUpdate, appendJobLogChunk, applyRunningJobView, finishJobOnce, isJobTerminalAccepted, isJobTerminalState, mergeJobProgress, resetJobStreamFreshness, startPolling, stopJobPolling, updateJobUI } from "../jobs/index";
+import { acceptJobUpdate, appendJobLogChunk, applyRunningJobView, commitCurrentJob, finishJobOnce, isJobTerminalAccepted, isJobTerminalState, mergeJobProgress, resetJobStreamFreshness, startPolling, stopJobPolling, updateJobUI } from "../jobs/index";
 
 export const SSE_WATCHDOG_MS = 45000;
 
@@ -107,7 +107,7 @@ export function handleSseMessage(eventName, payload) {
       if (terminalSnapshotShouldComplete(job, state.currentJob)) {
         void finishJobOnce(job);
       } else {
-        state.currentJob = job;
+        commitCurrentJob(job);
         updateJobUI(job);
       }
       return;

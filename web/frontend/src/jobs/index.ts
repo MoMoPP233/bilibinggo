@@ -28,6 +28,43 @@ let acceptedTerminalJobIds: number[] = [];
 // 重启后 seq 归零导致永久拒绝（REST 路径不消耗该窗口）。
 let lastAcceptedStreamSeq: number | null = null;
 
+// V19：无 server seq 的 REST /api/jobs/current 快照用本地两道门保护。
+// - jobAuthorityVersion：页面/模块生命周期单调递增，只在真正提交当前 Job
+//   authority（commitCurrentJob，含 SSE 事件、POST 结果、REST 快照自身）时 +1；
+//   EventSource 重连只重置上面的 stream seq 窗口，绝不重置本计数。
+// - jobRestSnapshotSeq：每次发起 /api/jobs/current 请求递增；只有仍然是最新
+//   代数、且 authority 版本未在飞行期间变化过的响应才允许应用。
+let jobAuthorityVersion = 0;
+let jobRestSnapshotSeq = 0;
+const STALE_JOB_SNAPSHOT = Symbol("stale-job-snapshot");
+
+export function commitCurrentJob(job) {
+  // 唯一提交当前 Job authority 的写点：写 state.currentJob 的同时推进本地版本。
+  jobAuthorityVersion += 1;
+  state.currentJob = job;
+}
+
+export function isStaleJobSnapshot(value) {
+  return value === STALE_JOB_SNAPSHOT;
+}
+
+export function currentJobAuthorityVersion() {
+  // 仅诊断/测试读取：本地 authority 版本在页面生命周期内单调前进。
+  return jobAuthorityVersion;
+}
+
+export async function fetchFreshCurrentJob() {
+  // 两道门：1) 仍是最新 generation；2) authority version 自请求开始未变化。
+  // 任一不满足说明飞行期间已接受更新的 Job authority → 丢弃（正常竞态消解）。
+  const requestSeq = ++jobRestSnapshotSeq;
+  const authorityAtStart = jobAuthorityVersion;
+  const job = await fetchJSON("/api/jobs/current");
+  if (requestSeq !== jobRestSnapshotSeq || jobAuthorityVersion !== authorityAtStart) {
+    return STALE_JOB_SNAPSHOT;
+  }
+  return job;
+}
+
 export function resetJobStreamFreshness() {
   lastAcceptedStreamSeq = null;
 }
@@ -449,7 +486,8 @@ export function hideQrcodeModal(manual = false) {
 
 export async function cancelLoginJob() {
   try {
-    const job = await fetchJSON("/api/jobs/current");
+    const job = await fetchFreshCurrentJob();
+    if (isStaleJobSnapshot(job)) return; // 飞行期间已有更新：不基于旧快照取消
     if (job.state === "running" && job.action === "login") {
       await fetchJSON("/api/jobs/cancel", { method: "POST" });
       stopJobPolling();
@@ -1266,8 +1304,11 @@ export async function startJob(action, params = {}) {
   state.lastJobAttempt = { action, params: { ...params } };
   if (action === "login") {
     try {
-      const current = await fetchJSON("/api/jobs/current");
-      if (current.state === "running" && current.action === "login") {
+      const current = await fetchFreshCurrentJob();
+      if (isStaleJobSnapshot(current)) {
+        // 飞行期间已有更新的 Job authority：不基于旧快照恢复登录界面。
+        // 与网络失败同等处理：继续尝试发起新任务，由后端裁决是否 busy。
+      } else if (current.state === "running" && current.action === "login") {
         state.qrcodeDismissed = false;
         ensureQrcodeModalVisible();
         const refreshedAt = Number(current.result?.qrcode_refreshed_at) || 0;
@@ -1300,7 +1341,7 @@ export async function startJob(action, params = {}) {
   if (startedJob?.id != null && acceptJobUpdate(startedJob)) {
     // POST 已返回权威新 job_id：立刻确定当前任务身份，
     // 旧 Job 任何晚到事件都无法覆盖它。
-    state.currentJob = startedJob;
+    commitCurrentJob(startedJob);
     updateJobUI(startedJob);
   }
   if (action === "login") {
@@ -1312,13 +1353,20 @@ export async function startJob(action, params = {}) {
 }
 
 export async function trackCurrentJob() {
-  const current = await fetchJSON("/api/jobs/current");
+  const current = await fetchFreshCurrentJob();
+  if (isStaleJobSnapshot(current)) {
+    // 请求飞行期间已有更新的 Job authority 被接受：丢弃旧快照（竞态消解），
+    // 不覆盖 state.currentJob；实时通道仍然建立，等下一次权威更新。
+    startRealtime();
+    startPolling();
+    return undefined;
+  }
   if (current?.id != null && !acceptJobUpdate(current)) {
     // 迟到的旧快照：不覆盖权威身份，但仍继续建立实时通道。
     startRealtime();
     return current;
   }
-  state.currentJob = current;
+  commitCurrentJob(current);
   updateJobUI(current);
   startRealtime();
   startPolling();
@@ -1495,7 +1543,7 @@ export function stopJobPolling() {
 }
 
 export function applyRunningJobView(job) {
-  state.currentJob = job;
+  commitCurrentJob(job);
   updateJobUI(job);
   if (job.state === "running" && job.action === "login" && !state.qrcodeDismissed) {
     ensureQrcodeModalVisible();
@@ -1519,7 +1567,7 @@ export async function finishJobOnce(job) {
   const key = `${job.id || ""}:${job.action || ""}:${job.state || ""}`;
   if (key && key === state.lastFinishedJobKey) return;
   state.lastFinishedJobKey = key;
-  state.currentJob = job;
+  commitCurrentJob(job);
   updateJobUI(job);
 
   if (job.action === "login" && (job.state === "cancelled" || job.state === "idle")) {
@@ -1561,7 +1609,7 @@ export function appendJobLogChunk(chunk) {
   const base = state.currentJob || { state: "running", log: "" };
   const current = String(base.log || "").trim();
   const next = current ? `${current}\n${chunk}` : chunk;
-  state.currentJob = { ...base, log: next, state: base.state || "running" };
+  commitCurrentJob({ ...base, log: next, state: base.state || "running" });
   updateJobUI(state.currentJob);
 }
 
@@ -1582,14 +1630,20 @@ export function startPolling() {
       return;
     }
     try {
-      const job = await fetchJSON("/api/jobs/current");
+      const job = await fetchFreshCurrentJob();
+      if (isStaleJobSnapshot(job)) {
+        // 飞行期间已有更新的 authority：丢弃旧快照并继续下一轮，不清空任何状态。
+        const interval = resolveJobPollIntervalMs(state.currentJob?.action);
+        scheduleNext(interval);
+        return;
+      }
       if (job.state === "running") {
         if (!acceptJobUpdate(job)) {
           // 迟到的旧 running（该 job 已 terminal / 已被新 job 取代）：不更新 UI。
           scheduleNext(resolveJobPollIntervalMs(job.action));
           return;
         }
-        state.currentJob = job;
+        commitCurrentJob(job);
         updateJobUI(job);
         if (job.action === "login" && !state.qrcodeDismissed) {
           ensureQrcodeModalVisible();

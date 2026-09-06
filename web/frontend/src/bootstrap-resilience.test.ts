@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
   startPolling: vi.fn(),
   loadRuntimeInfo: vi.fn(async () => ({})),
   showToast: vi.fn(),
-  fetchJSON: vi.fn(async () => ({ state: "idle", action: "", message: "" })),
+  fetchJSON: vi.fn(async (_url?: string) => ({ state: "idle", action: "", message: "" })),
 }));
 
 vi.mock("./account/index", () => ({
@@ -74,6 +74,10 @@ vi.mock("./jobs/index", () => ({
   setLogDockOpen: () => {},
   startPolling: mocks.startPolling,
   acceptJobUpdate: () => true,
+  commitCurrentJob: () => {},
+  currentJobAuthorityVersion: () => 0,
+  fetchFreshCurrentJob: async () => mocks.fetchJSON("/api/jobs/current"),
+  isStaleJobSnapshot: () => false,
   updateJobUI: () => {},
 }));
 

@@ -7,7 +7,7 @@ import { bindOnboardingPanel, loadAccount, loadAccountExtras, logoutAccount, req
 import { bindFilterPills, loadActivities, loadSummary } from "./activities/index";
 import { bindAutoDock, fetchAutoStatus, setAutoDockOpen } from "./auto/index";
 import { sidebarLogoutBtn, sidebarRefreshBtn } from "./dom";
-import { bindActionButtons, setLogDockOpen, startPolling } from "./jobs/index";
+import { bindActionButtons, commitCurrentJob, setLogDockOpen, startPolling } from "./jobs/index";
 import { startRealtime } from "./realtime/sse";
 import { bindLlmApiKeyToggle, bindParticipateSettings, bindSettingsDirtyTracking, loadSettings, refreshLlmSettings, resetParticipateText, saveLlmSettings, saveParticipateText, testLlmSettings } from "./settings/index";
 import { bindNavigation } from "./shell/nav";
@@ -66,7 +66,7 @@ export async function init() {
   const summaryResult = await runBootstrapStep("summary", async () => {
     const job = await loadSummary();
     if (job) {
-      state.currentJob = job;
+      commitCurrentJob(job);
     }
     return { ok: true, job: job ?? null };
   });
@@ -87,12 +87,19 @@ export async function init() {
   } else if (summaryFailed) {
     // summary 失败时用 /api/jobs/current 补一次权威种子（仅在失败路径，
     // 成功路径不新增请求），避免“运行中任务但没有任何通道知道它”。
+    // V19：REST 快照同样过本地 generation/authority 两道门，飞行期间若已有
+    // 更新的 authority（SSE/新任务）则丢弃旧快照。
     await runBootstrapStep("current job seed", async () => {
-      const { fetchJSON } = await import("./api/client");
-      const current = await fetchJSON("/api/jobs/current");
-      const { acceptJobUpdate, updateJobUI } = await import("./jobs/index");
+      const {
+        fetchFreshCurrentJob,
+        isStaleJobSnapshot,
+        acceptJobUpdate,
+        updateJobUI,
+      } = await import("./jobs/index");
+      const current = await fetchFreshCurrentJob();
+      if (isStaleJobSnapshot(current)) return;
       if (acceptJobUpdate(current)) {
-        state.currentJob = current;
+        commitCurrentJob(current);
         if (current?.state === "running") {
           updateJobUI(current);
           startPolling();
