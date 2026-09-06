@@ -1,4 +1,3 @@
-// @ts-nocheck
 /* eslint-disable */
 /** Migrated from web/static/app.js — logic preserved. */
 
@@ -7,7 +6,24 @@ import { ACTION_LABELS, PARTICIPATE_STEP_LABELS } from "../dom";
 import { calcJobProgressPercent, parseTripleProgressLanes, participateProgressLabels, summarizeTripleProgressLanes } from "../jobs/index";
 import { escapeHtml, sanitizeUserText } from "../utils/text";
 
-export function lotteryTypeTone(type) {
+interface FormatJobLike {
+  log?: unknown;
+  action?: unknown;
+  progress_step?: unknown;
+  progress_total?: unknown;
+  progress_message?: unknown;
+  message?: unknown;
+  label?: unknown;
+  result?: { targets?: unknown[] | null } | null;
+}
+
+interface LastParticipationLike {
+  status?: string;
+  message?: string;
+  actions?: Array<{ action?: unknown; ok?: boolean }> | null;
+}
+
+export function lotteryTypeTone(type: unknown): string {
   const text = String(type || "");
   if (text.includes("互动")) return "interact";
   if (text.includes("转发")) return "repost";
@@ -15,7 +31,7 @@ export function lotteryTypeTone(type) {
   return "default";
 }
 
-export function isLotterySoon(value) {
+export function isLotterySoon(value: unknown): boolean {
   const text = String(value || "").trim();
   const match = text.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
   if (!match) return false;
@@ -27,28 +43,28 @@ export function isLotterySoon(value) {
   return delta >= 0 && delta <= 3 * 24 * 60 * 60 * 1000;
 }
 
-export function activityStatusTone(status) {
+export function activityStatusTone(status: unknown): string {
   if (status === "已参加") return "joined";
   if (status === "已结束") return "ended";
   return "pending";
 }
 
-export function formatUnixTimestamp(ts) {
+export function formatUnixTimestamp(ts: unknown): string {
   const value = Number(ts);
   if (!value) return "尚未同步";
   const date = new Date(value * 1000);
   if (Number.isNaN(date.getTime())) return "尚未同步";
-  const pad = (n) => String(n).padStart(2, "0");
+  const pad = (n: number) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-export function formatWatchWindow(start, end) {
-  const fmt = (ts) => {
+export function formatWatchWindow(start: unknown, end: unknown): string {
+  const fmt = (ts: unknown) => {
     const value = Number(ts);
     if (!value) return "—";
     const date = new Date(value * 1000);
     if (Number.isNaN(date.getTime())) return "—";
-    const pad = (n) => String(n).padStart(2, "0");
+    const pad = (n: number) => String(n).padStart(2, "0");
     return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   };
   const from = fmt(start);
@@ -57,12 +73,12 @@ export function formatWatchWindow(start, end) {
   return `${from} — ${to}`;
 }
 
-export function formatWindowDays(seconds) {
+export function formatWindowDays(seconds: unknown): string {
   const days = Math.max(1, Math.round(Number(seconds || 0) / 86400));
   return `${days} 天`;
 }
 
-export function formatToastDetail(job) {
+export function formatToastDetail(job: FormatJobLike | null | undefined): string {
   if (!job?.log) return "";
   const lines = sanitizeUserText(job.log)
     .split("\n")
@@ -72,7 +88,7 @@ export function formatToastDetail(job) {
   return lines.join(" · ");
 }
 
-export function formatLastParticipation(last) {
+export function formatLastParticipation(last: LastParticipationLike | null | undefined): string {
   if (!last) return "";
   const status = last.status || "";
   const message = last.message || "";
@@ -80,21 +96,27 @@ export function formatLastParticipation(last) {
   if (status === "failed") {
     const failed = (last.actions || []).filter((item) => item && item.ok === false);
     if (failed.length) {
-      const labels = failed.map((item) => ACTION_LABELS[item.action] || item.action).join("、");
-      return `失败：${labels}${message ? `（${message}）` : ""}`;
+      const labels = failed.map((item) => {
+        const key = item.action;
+        if (typeof key === "string" && key in ACTION_LABELS) {
+          return ACTION_LABELS[key as keyof typeof ACTION_LABELS];
+        }
+        return String(key ?? "");
+      });
+      return `失败：${labels.join("、")}${message ? `（${message}）` : ""}`;
     }
     return message || "参与失败";
   }
   return message || status;
 }
 
-export function badgeClass(status) {
+export function badgeClass(status: unknown): string {
   if (status === "已参加") return "badge joined";
   if (status === "已结束") return "badge ended";
   return "badge pending";
 }
 
-export function formatAutoCountdown(targetUnix) {
+export function formatAutoCountdown(targetUnix: unknown): string {
   if (!targetUnix) return "—";
   const nowSec = Math.floor((Date.now() + state.autoServerSkewMs) / 1000);
   const diff = Math.max(0, Number(targetUnix) - nowSec);
@@ -107,7 +129,12 @@ export function formatAutoCountdown(targetUnix) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-export function formatJobProgressDisplay(job) {
+export function formatJobProgressDisplay(job: FormatJobLike): {
+  percent: number;
+  value: string;
+  suffix: string;
+  showPercentSuffix: boolean;
+} {
   const step = Number(job.progress_step) || 0;
   const total = Number(job.progress_total) || 0;
   const percent = calcJobProgressPercent(job);
@@ -120,17 +147,17 @@ export function formatJobProgressDisplay(job) {
   return { percent, value: String(percent), suffix: "%", showPercentSuffix: true };
 }
 
-export function formatProgressTitle(job) {
+export function formatProgressTitle(job: FormatJobLike): string {
   if (job.action === "participate") return "正在参与活动";
   if (job.action === "participate_triple") {
     const lanes = parseTripleProgressLanes(job.progress_message);
     const count = lanes.length || Number(job.result?.targets?.length) || 3;
     return `三连参与 · 并行 ${count} 个活动`;
   }
-  return job.label || "任务运行中…";
+  return String(job.label || "任务运行中…");
 }
 
-export function formatProgressDetail(job) {
+export function formatProgressDetail(job: FormatJobLike): string {
   if (job.action === "participate") {
     const message = sanitizeUserText(job.progress_message || job.message || "");
     if (message && !message.includes("|")) return message;
@@ -158,7 +185,7 @@ export function formatProgressDetail(job) {
   return sanitizeUserText(job.progress_message || job.message || "请稍候，任务在后台执行中");
 }
 
-export function formatAccountStat(value, loggedIn, loading = false) {
+export function formatAccountStat(value: unknown, loggedIn: unknown, loading = false): unknown {
   if (value === null || value === undefined) {
     if (!loggedIn) return "—";
     return loading ? "…" : 0;
@@ -166,7 +193,7 @@ export function formatAccountStat(value, loggedIn, loading = false) {
   return value;
 }
 
-export function formatFilterSummary(payload) {
+export function formatFilterSummary(payload: { total?: unknown; page?: unknown; pages?: unknown }): string {
   const total = Number(payload.total) || 0;
   const page = Number(payload.page) || 1;
   const pages = Math.max(1, Number(payload.pages) || 1);
@@ -182,14 +209,14 @@ export function formatFilterSummary(payload) {
   return `共 <strong class="filter-summary-count">${total}</strong> 条${filterText} · 第 ${page}/${pages} 页`;
 }
 
-export function formatHeat(item) {
+export function formatHeat(item: { heat_missing?: unknown; repost_count?: unknown } | null | undefined): string {
   if (item?.heat_missing) return "—";
   const value = Number(item?.repost_count) || 0;
   if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
   return String(value);
 }
 
-export function formatLotteryTime(value) {
+export function formatLotteryTime(value: unknown): string {
   const text = String(value || "").trim();
   if (!text || text === "—") return "—";
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(text)) return text;
