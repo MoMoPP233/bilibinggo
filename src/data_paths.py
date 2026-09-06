@@ -69,20 +69,49 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+_atomic_target_locks: dict[str, threading.RLock] = {}
+_atomic_target_locks_guard = threading.Lock()
+
+
+def get_atomic_path_lock(path: Path) -> threading.RLock:
+    """进程内共享 per-target 锁（V10 跨模块收敛）。
+
+    规范化：Windows normcase + resolve(strict=False)。同 target 的所有写入方
+    （data_paths / profile_manager / 其它模块）必须调用本函数取得同一 RLock；
+    不同 target 之间可并发。RLock 允许 RMW 外层持锁后再调内层原子写。
+    """
+    key = os.path.normcase(str(path.resolve(strict=False)))
+    with _atomic_target_locks_guard:
+        lock = _atomic_target_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _atomic_target_locks[key] = lock
+        return lock
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+    """同目录唯一临时文件原子替换（mkstemp；同进程多线程/并发调用不共用 temp）。
+
+    同一 target 的并发写由 per-path 锁串行化 replace 窗口（Windows 上并发
+    os.replace 同一目标可能瞬时 Access denied）；锁只覆盖本地 IO。
+    """
+    with get_atomic_path_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
         )
-        os.replace(tmp, path)
-    finally:
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 def _read_persisted_data_root() -> Path | None:
@@ -401,6 +430,27 @@ def _legacy_data_exists() -> bool:
     return database is not None or cookie is not None
 
 
+def _ensure_profile_metadata_file(profile_dir: Path, profile_id: str) -> None:
+    """仅当 metadata 缺失时才补写默认值（conditional backfill）。
+
+    check 与 conditional write 位于同一 target 共享 RLock 内：
+    其它线程（profile_manager）对同一 profile.json 的写入不会被过期的
+    “缺失”判断覆盖；锁内不执行任何远程/DB 操作。
+    """
+    metadata = profile_dir / "profile.json"
+    with get_atomic_path_lock(metadata):
+        if metadata.exists():
+            return
+        _write_json_atomic(
+            metadata,
+            {
+                "profile_id": profile_id,
+                "mid": _cookie_mid(profile_dir / "cookies.txt"),
+                "nickname": "",
+            },
+        )
+
+
 def _copy_sqlite_database(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -430,15 +480,24 @@ def _copy_sqlite_database(source: Path, destination: Path) -> None:
 
 
 def _copy_file_atomic(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        return
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    try:
-        shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    # 与其它模块可能写同一 destination 时使用共享 per-target 锁。
+    with get_atomic_path_lock(destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            return
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+        )
+        os.close(fd)
+        try:
+            shutil.copy2(source, temporary_name)
+            os.replace(temporary_name, destination)
+        except BaseException:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+            raise
 
 
 def _cookie_mid(path: Path | None) -> str:
@@ -492,24 +551,17 @@ def initialize_data_layout() -> str:
     else:
         for profile_id in existing:
             profile_dir = profiles / profile_id
-            metadata = profiles / profile_id / "profile.json"
-            if not metadata.exists():
-                _write_json_atomic(
-                    metadata,
-                    {
-                        "profile_id": profile_id,
-                        "mid": _cookie_mid(profile_dir / "cookies.txt"),
-                        "nickname": "",
-                    },
-                )
+            _ensure_profile_metadata_file(profile_dir, profile_id)
 
-    selected = get_selected_profile_id()
-    if selected not in existing:
-        selected = existing[0]
     active_path = get_active_profile_path()
-    active_payload = _read_json(active_path)
-    if active_payload.get("profile_id") != selected:
-        _write_json_atomic(active_path, {"profile_id": selected})
+    # conditional write 与判断处于同一 target 共享 RLock：基于取锁后的最新
+    # selected/active 重新判定，避免把用户并发 set_active 的选择倒写回去。
+    with get_atomic_path_lock(active_path):
+        selected = get_selected_profile_id()
+        if selected not in existing:
+            selected = existing[0]
+        if _read_json(active_path).get("profile_id") != selected:
+            _write_json_atomic(active_path, {"profile_id": selected})
 
     # 运行时快照若已在导入期确定，必须与迁移的确定性初始 ID 一致。
     runtime = get_runtime_profile_id()

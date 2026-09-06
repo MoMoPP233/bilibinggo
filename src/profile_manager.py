@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from src.data_paths import (
     get_active_profile_path,
+    get_atomic_path_lock,
     get_profile_dir,
     get_profile_metadata_path,
     get_profiles_dir,
@@ -29,19 +31,29 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+    """同目录唯一临时文件原子替换；同一 target 的并发写由共享 per-target 锁串行化。
+
+    temp 使用 tempfile.mkstemp（同进程多线程不共用文件名），先关闭句柄再 os.replace，
+    Windows 安全；失败时尽力清理自己的 temp 并保持旧 target 完整。
+    锁与 src.data_paths 的原子写入共用同一把（get_atomic_path_lock，RLock 可重入）。
+    """
+    with get_atomic_path_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
         )
-        os.replace(tmp, path)
-    finally:
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 def _sort_key(profile_id: str) -> tuple[int, int | str]:
@@ -154,12 +166,16 @@ def update_profile_metadata(
     nickname: str | None = None,
 ) -> dict[str, str]:
     value = validate_profile_id(profile_id) if profile_id is not None else get_runtime_profile_id()
-    metadata = get_profile_metadata(value)
-    if mid is not None:
-        metadata["mid"] = str(mid).strip()
-    if nickname is not None:
-        metadata["nickname"] = str(nickname).strip()
-    _write_json(get_profile_metadata_path(value), metadata)
+    path = get_profile_metadata_path(value)
+    with get_atomic_path_lock(path):
+        # read-modify-write：read + mutate + write 处于同一 per-target 临界区，
+        # 并发更新不同字段不会互相丢失（锁内全部为本地 IO）。
+        metadata = get_profile_metadata(value)
+        if mid is not None:
+            metadata["mid"] = str(mid).strip()
+        if nickname is not None:
+            metadata["nickname"] = str(nickname).strip()
+        _write_json(path, metadata)
     return metadata
 
 
