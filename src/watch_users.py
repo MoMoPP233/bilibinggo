@@ -142,6 +142,20 @@ def get_watch_users_payload(*, ensure_seeded: bool = True) -> dict[str, Any]:
     }
 
 
+def _touch_meta(session, updated_at: int) -> None:
+    meta = session.get(WatchUsersMetaRow, 1)
+    if meta is None:
+        session.add(
+            WatchUsersMetaRow(
+                id=1,
+                updated_at=updated_at,
+                seeded_from=None,
+            )
+        )
+    else:
+        meta.updated_at = updated_at
+
+
 def add_watch_user(*, mid: int) -> WatchUser:
     ensure_user_dirs()
     mid_i = int(mid)
@@ -150,27 +164,28 @@ def add_watch_user(*, mid: int) -> WatchUser:
     with BilibiliClient() as client:
         name = resolve_watch_user_name(client, mid_i)
     user = WatchUser(mid=mid_i, name=name)
+    now = int(time.time())
     with _watch_lock:
-        payload = _read_payload()
-        users = [item for item in (payload.get("users") or []) if isinstance(item, dict)]
-        users = [item for item in users if int(item.get("mid") or 0) != mid_i]
-        users.append(user.to_dict())
-        payload["users"] = users
-        payload["updated_at"] = int(time.time())
-        _write_payload(payload)
+        with session_scope() as session:
+            row = session.get(WatchUserRow, mid_i)
+            if row is None:
+                session.add(WatchUserRow(mid=mid_i, name=user.name, updated_at=now))
+            else:
+                # 重复 add 的旧语义：更新 nickname（替换）；PK(mid) 保证不会产生重复行。
+                row.name = user.name
+                row.updated_at = now
+            _touch_meta(session, now)
     return user
 
 
 def remove_watch_user(*, mid: int) -> bool:
     mid_i = int(mid)
+    now = int(time.time())
     with _watch_lock:
-        payload = _read_payload()
-        users = [item for item in (payload.get("users") or []) if isinstance(item, dict)]
-        before = len(users)
-        users = [item for item in users if int(item.get("mid") or 0) != mid_i]
-        if len(users) == before:
-            return False
-        payload["users"] = users
-        payload["updated_at"] = int(time.time())
-        _write_payload(payload)
-        return True
+        with session_scope() as session:
+            row = session.get(WatchUserRow, mid_i)
+            if row is None:
+                return False
+            session.delete(row)
+            _touch_meta(session, now)
+            return True
