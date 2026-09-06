@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from src.data_paths import (
+    ActiveProfileStateError,
     get_active_profile_path,
     get_atomic_path_lock,
     get_profile_dir,
@@ -102,7 +103,12 @@ def get_profile_metadata(profile_id: str) -> dict[str, str]:
 
 
 def list_profiles() -> list[dict[str, str]]:
-    initialize_data_layout()
+    # active_profile.json 损坏时本地列出仍然可用：不隐式选择、不改写指针，
+    # 让 Web 选择页能继续展示 Profile 列表供用户明确重建选择。
+    try:
+        initialize_data_layout()
+    except ActiveProfileStateError:
+        pass
     return [get_profile_metadata(profile_id) for profile_id in _profile_ids()]
 
 

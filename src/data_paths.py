@@ -27,6 +27,14 @@ class DataRootNotConfiguredError(RuntimeError):
     """安装版尚未选择数据目录。"""
 
 
+class ActiveProfileStateError(RuntimeError):
+    """active_profile.json 存在但损坏/不可读/悬空（指向不存在 Profile）。
+
+    出现该状态时禁止隐式选择其它账号、禁止自动改写/删除指针；
+    只能通过现有 Profile 选择动作（set_active_profile / Web 切换）重建合法指针后重启。
+    """
+
+
 def _absolute_path(value: str | os.PathLike[str]) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -258,6 +266,56 @@ def get_active_profile_path() -> Path:
     return get_data_root() / "active_profile.json"
 
 
+# active_profile.json 读取状态（仅本指针文件专用，不影响通用 _read_json）：
+#   missing    从未产生过选择（首次初始化合法状态）
+#   ok         内容合法且指向存在的 Profile
+#   invalid    JSON 损坏 / 根不是 object / profile_id 缺失或非法
+#   unreadable PermissionError / OSError
+#   dangling   profile_id 合法但对应 Profile 目录不存在
+ActivePointerStatus = tuple[str, str | None, str]
+
+
+def _read_active_pointer_state() -> ActivePointerStatus:
+    """专用安全读取：区分 missing / valid / invalid / unreadable / dangling。
+
+    读取或解析失败绝不降级成“没有选择”，也不触碰/改写文件本身。
+    """
+    path = get_active_profile_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ("missing", None, "")
+    except OSError as exc:
+        return ("unreadable", None, f"无法读取 active_profile.json：{exc}")
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        return ("invalid", None, f"active_profile.json 内容损坏（{exc}）")
+    if not isinstance(raw, dict):
+        return ("invalid", None, "active_profile.json 根节点必须是对象")
+    pid = raw.get("profile_id")
+    if not isinstance(pid, str) or not pid.strip():
+        return ("invalid", None, "active_profile.json 缺少合法的 profile_id 字段")
+    pid = pid.strip()
+    try:
+        validate_profile_id(pid)
+    except ValueError:
+        return ("invalid", None, "active_profile.json 中的 profile_id 格式非法")
+    if not (get_profiles_dir() / pid).is_dir():
+        return ("dangling", pid, f"active_profile.json 指向不存在的 Profile：{pid}")
+    return ("ok", pid, "")
+
+
+def read_active_profile_pointer_state() -> dict[str, Any]:
+    """只读视图：给 Web/本地控制面展示指针状态（0 远程、不抛错、不改写）。"""
+    kind, pid, detail = _read_active_pointer_state()
+    return {
+        "state_status": kind,
+        "profile_id": pid,
+        "message": detail,
+    }
+
+
 def _profile_sort_key(profile_id: str) -> tuple[int, int | str]:
     if profile_id == "default":
         return (0, 0)
@@ -280,21 +338,26 @@ def _existing_profile_ids() -> list[str]:
 
 
 def get_selected_profile_id() -> str:
-    """读取磁盘上的下次启动 Profile；不改变本进程运行时绑定。"""
-    raw = str(_read_json(get_active_profile_path()).get("profile_id") or "").strip()
-    try:
-        profile_id = validate_profile_id(raw)
-    except ValueError:
-        profile_id = ""
-    if profile_id and (get_profiles_dir() / profile_id).is_dir():
-        return profile_id
+    """读取磁盘上的下次启动 Profile；不改变本进程运行时绑定。
 
-    existing = _existing_profile_ids()
-    if existing:
-        return existing[0]
-    if _legacy_data_exists():
-        return "default"
-    return "account-1"
+    安全语义（V18）：
+    - active_profile.json 不存在（首次初始化/尚未选择）→ 保持 V17 首次初始化行为：
+      选择已存在的首个 Profile（无则按旧数据迁移规则 default/account-1）。
+    - 文件存在且合法且指向存在的 Profile → 返回该 profile_id。
+    - 文件存在但损坏 / 不可读 / 悬空（指向不存在 Profile）→ 抛出
+      ActiveProfileStateError，绝不隐式回退到排序后的第一个 Profile。
+    """
+    kind, pid, detail = _read_active_pointer_state()
+    if kind == "ok":
+        return pid  # type: ignore[return-value]
+    if kind == "missing":
+        existing = _existing_profile_ids()
+        if existing:
+            return existing[0]
+        if _legacy_data_exists():
+            return "default"
+        return "account-1"
+    raise ActiveProfileStateError(detail)
 
 
 def get_active_profile_id() -> str:
@@ -303,11 +366,16 @@ def get_active_profile_id() -> str:
 
 
 def get_runtime_profile_id() -> str:
-    """返回进程启动时冻结的 Profile，切换指针后仍保持不变。"""
+    """返回进程启动时冻结的 Profile，切换指针后仍保持不变。
+
+    指针存在但损坏/不可读/悬空时：Fail-Closed——在绑定任何 Profile、打开任何
+    DB/Cookie 之前抛出 ActiveProfileStateError（绝不静默绑定排序后的第一个账号）。
+    """
     global _runtime_profile_id, _runtime_data_root
     root = get_data_root().resolve(strict=False)
     if _runtime_profile_id is None:
-        _runtime_profile_id = get_selected_profile_id()
+        selected = get_selected_profile_id()  # 可能抛 ActiveProfileStateError
+        _runtime_profile_id = selected
         _runtime_data_root = root
     elif _runtime_data_root != root:
         raise RuntimeError("BINGGO_DATA_ROOT 在进程运行期间发生变化，请重新启动 Binggo")
@@ -555,11 +623,24 @@ def initialize_data_layout() -> str:
 
     active_path = get_active_profile_path()
     # conditional write 与判断处于同一 target 共享 RLock：基于取锁后的最新
-    # selected/active 重新判定，避免把用户并发 set_active 的选择倒写回去。
+    # active 指针状态重新判定，避免把用户并发 set_active 的选择倒写回去。
+    # V18：指针存在但损坏/不可读/悬空时禁止自动改写（不 heal、不隐式选首个 Profile）。
     with get_atomic_path_lock(active_path):
-        selected = get_selected_profile_id()
+        kind, pointer_pid, _detail = _read_active_pointer_state()
+        if kind == "ok":
+            selected = pointer_pid  # type: ignore[assignment]
+        elif kind == "missing":
+            selected = get_selected_profile_id()
+        else:
+            raise ActiveProfileStateError(
+                f"active_profile.json 状态异常（{kind}），已拒绝隐式选择与自动改写；"
+                "请通过界面重新选择账号后重启 Binggo"
+            )
         if selected not in existing:
-            selected = existing[0]
+            raise ActiveProfileStateError(
+                f"active_profile.json 指向的 Profile 不存在（{selected}），"
+                "请通过界面重新选择账号后重启 Binggo"
+            )
         if _read_json(active_path).get("profile_id") != selected:
             _write_json_atomic(active_path, {"profile_id": selected})
 
@@ -581,6 +662,7 @@ def reset_runtime_profile_for_tests() -> None:
 __all__ = [
     "DATA_ROOT_ENV",
     "LEGACY_DATA_ROOT_ENV",
+    "ActiveProfileStateError",
     "DataRootNotConfiguredError",
     "data_root_locator_path",
     "ensure_data_root_selected",
@@ -598,6 +680,7 @@ __all__ = [
     "get_shared_dir",
     "initialize_data_layout",
     "persist_data_root",
+    "read_active_profile_pointer_state",
     "reset_runtime_profile_for_tests",
     "validate_profile_id",
 ]

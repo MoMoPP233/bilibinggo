@@ -14,7 +14,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src.app_logging import get_logger, setup_logging
 from src.app_paths import __version__, ensure_user_dirs
 from src.bilibili_login import QR_IMAGE_PATH
-from src.data_paths import get_data_root, get_runtime_profile_id, get_selected_profile_id
+from src.data_paths import (
+    ActiveProfileStateError,
+    get_data_root,
+    get_runtime_profile_id,
+    get_selected_profile_id,
+)
 from src.llm_client import test_llm_connection_async
 from src.llm_settings import (
     build_llm_config_from_inputs,
@@ -239,14 +244,32 @@ def _raise_profile_value_error(exc: ValueError) -> None:
     raise AppError(code, message) from exc
 
 
+def _runtime_binding_or_none() -> str | None:
+    """本进程冻结的 runtime Profile；指针损坏（未绑定）时返回 None，绝不隐式 fallback。"""
+    try:
+        return get_runtime_profile_id()
+    except ActiveProfileStateError:
+        return None
+
+
+def _selected_binding_or_none() -> str | None:
+    """下次启动 Profile；指针损坏/不可读/悬空时返回 None，绝不隐式 fallback。"""
+    try:
+        return get_selected_profile_id()
+    except ActiveProfileStateError:
+        return None
+
+
 @app.get("/api/profiles", tags=["stable"])
 def api_profiles() -> dict[str, Any]:
-    runtime_profile_id = get_runtime_profile_id()
-    active_profile_id = get_selected_profile_id()
+    runtime_profile_id = _runtime_binding_or_none()
+    active_profile_id = _selected_binding_or_none()
     return {
         "runtime_profile_id": runtime_profile_id,
         "active_profile_id": active_profile_id,
-        "restart_required": active_profile_id != runtime_profile_id,
+        "restart_required": bool(
+            runtime_profile_id and active_profile_id and active_profile_id != runtime_profile_id
+        ),
         "data_root": str(get_data_root()),
         "profiles": list_profiles(),
     }
@@ -266,6 +289,9 @@ def api_create_profile() -> dict[str, Any]:
 
 @app.post("/api/profiles/{profile_id}/activate", tags=["stable"])
 def api_activate_profile(profile_id: str) -> dict[str, Any]:
+    # 在写盘前读取 runtime：指针损坏时进程未绑定任何 Profile（None），
+    # 写回合法指针后绝不能在本进程提前冻结绑定，必须重启。
+    runtime_profile_id = _runtime_binding_or_none()
     try:
         with restart_control.new_work_guard():
             _require_profile_operations_idle()
@@ -276,18 +302,30 @@ def api_activate_profile(profile_id: str) -> dict[str, Any]:
         _raise_profile_value_error(exc)
     except OSError as exc:
         raise AppError(ErrorCode.INTERNAL, f"切换账号 Profile 失败：{exc}") from exc
+    active_profile_id = _selected_binding_or_none()
+    restart_required = (
+        bool(runtime_profile_id and active_profile_id and active_profile_id != runtime_profile_id)
+        or runtime_profile_id is None
+    )
     return {
         "ok": True,
         "profile": profile,
-        "restart_required": get_selected_profile_id() != get_runtime_profile_id(),
+        "restart_required": restart_required,
     }
 
 
 @app.post("/api/profiles/{profile_id}/switch", tags=["stable"])
 def api_switch_profile(profile_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
-    """Persist the target Profile, then gracefully stop for supervisor respawn."""
+    """Persist the target Profile, then gracefully stop for supervisor respawn.
 
-    runtime_profile_id = get_runtime_profile_id()
+    active_profile.json 损坏（本进程尚未绑定任何 Profile）时同样可恢复：
+    显式选择目标 Profile 会原子写回合法指针，随后进程优雅重启绑定新选择。
+    """
+
+    try:
+        runtime_profile_id = get_runtime_profile_id()
+    except ActiveProfileStateError:
+        runtime_profile_id = None
 
     # Restoring the already-running Profile only clears an older pending manual
     # selection.  There is no reason to bounce the process in that case.
@@ -306,7 +344,7 @@ def api_switch_profile(profile_id: str, background_tasks: BackgroundTasks) -> di
             "ok": True,
             "profile": profile,
             "runtime_profile_id": runtime_profile_id,
-            "active_profile_id": get_selected_profile_id(),
+            "active_profile_id": _selected_binding_or_none(),
             "restart_requested": False,
         }
 
@@ -328,11 +366,21 @@ def api_switch_profile(profile_id: str, background_tasks: BackgroundTasks) -> di
     # Starlette executes response background tasks after sending the response
     # body.  Only then tell Uvicorn to enter its normal graceful shutdown path.
     background_tasks.add_task(restart_control.request_restart)
+    if runtime_profile_id is None:
+        # 指针曾损坏、本进程未绑定任何 Profile：只写回合法指针并重启，
+        # 不在此进程提前冻结 runtime 绑定。
+        return {
+            "ok": True,
+            "profile": profile,
+            "runtime_profile_id": None,
+            "active_profile_id": _selected_binding_or_none(),
+            "restart_requested": True,
+        }
     return {
         "ok": True,
         "profile": profile,
         "runtime_profile_id": runtime_profile_id,
-        "active_profile_id": get_selected_profile_id(),
+        "active_profile_id": _selected_binding_or_none(),
         "restart_requested": True,
     }
 
