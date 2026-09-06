@@ -1,4 +1,3 @@
-// @ts-nocheck
 /* eslint-disable */
 /** Migrated from web/static/app.js — logic preserved. */
 
@@ -30,27 +29,36 @@ export function initSystemPreferences() {
     sidebarMobileMq.addListener(syncSidebarViewport);
   }
   jobResultClose?.addEventListener("click", () => hideParticipationResult());
-  jobResultBanner?.addEventListener("mouseenter", () => {
-    if (jobResultBanner.hidden || jobResultBanner.classList.contains("is-hiding")) return;
-    if (state.jobResultTimer) {
-      window.clearTimeout(state.jobResultTimer);
-      state.jobResultTimer = null;
-    }
-    if (jobResultProgress) jobResultProgress.style.animationPlayState = "paused";
-  });
-  jobResultBanner?.addEventListener("mouseleave", () => {
-    if (jobResultBanner.hidden || jobResultBanner.classList.contains("is-hiding")) return;
-    if (jobResultProgress) jobResultProgress.style.animationPlayState = "running";
-    scheduleParticipationResultDismiss(JOB_RESULT_HOVER_DISMISS_MS);
-  });
+  if (jobResultBanner) {
+    const banner = jobResultBanner;
+    banner.addEventListener("mouseenter", () => {
+      if (banner.hidden || banner.classList.contains("is-hiding")) return;
+      if (state.jobResultTimer) {
+        window.clearTimeout(state.jobResultTimer);
+        state.jobResultTimer = null;
+      }
+      if (jobResultProgress) jobResultProgress.style.animationPlayState = "paused";
+    });
+    banner.addEventListener("mouseleave", () => {
+      if (banner.hidden || banner.classList.contains("is-hiding")) return;
+      if (jobResultProgress) jobResultProgress.style.animationPlayState = "running";
+      scheduleParticipationResultDismiss(JOB_RESULT_HOVER_DISMISS_MS);
+    });
+  }
 }
 
 export const SIDEBAR_ANIM_MS = 400;
 
 export const THEME_ANIM_MS = 320;
 
-export function applySidebarCollapsed(collapsed, { animate = true } = {}) {
-  const shell = document.querySelector(".app-shell");
+let sidebarAnimTimer: number | null = null;
+let themeAnimTimer: number | null = null;
+
+export function applySidebarCollapsed(
+  collapsed: boolean,
+  { animate = true }: { animate?: boolean } = {},
+) {
+  const shell = document.querySelector(".app-shell") as HTMLElement | null;
   if (!shell) return;
   const isCollapsed = shell.classList.contains("sidebar-collapsed");
   if (isCollapsed === collapsed) {
@@ -74,13 +82,16 @@ export function applySidebarCollapsed(collapsed, { animate = true } = {}) {
   }
   localStorage.setItem("binggo-sidebar-collapsed", collapsed ? "1" : "0");
   if (!animate) return;
-  window.clearTimeout(shell._sidebarAnimTimer);
-  shell._sidebarAnimTimer = window.setTimeout(() => {
+  if (sidebarAnimTimer !== null) window.clearTimeout(sidebarAnimTimer);
+  sidebarAnimTimer = window.setTimeout(() => {
     shell.classList.remove("sidebar-animating");
   }, SIDEBAR_ANIM_MS);
 }
 
-export function applyTheme(theme, { animate = true } = {}) {
+export function applyTheme(
+  theme: "dark" | "light",
+  { animate = true }: { animate?: boolean } = {},
+) {
   const next = theme === "dark" ? "dark" : "light";
   const current = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
   const run = () => {
@@ -118,8 +129,8 @@ export function applyTheme(theme, { animate = true } = {}) {
 
   document.documentElement.classList.add("theme-animating");
   run();
-  window.clearTimeout(document.documentElement._themeAnimTimer);
-  document.documentElement._themeAnimTimer = window.setTimeout(() => {
+  if (themeAnimTimer !== null) window.clearTimeout(themeAnimTimer);
+  themeAnimTimer = window.setTimeout(() => {
     document.documentElement.classList.remove("theme-animating");
   }, THEME_ANIM_MS);
 }

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /* eslint-disable */
 /** Migrated from web/static/app.js — logic preserved. */
 
@@ -6,22 +5,34 @@ import { INLINE_FEEDBACK_MS, inlineFeedbackTimers, toastStack } from "../dom";
 import { prefersReducedMotion } from "../utils/motion";
 import { escapeHtml } from "../utils/text";
 
-export const TOAST_META = {
+export type ToastType = "success" | "error" | "info" | "running";
+
+export interface ToastAction {
+  label: string;
+  onClick?: () => void;
+}
+
+export const TOAST_META: Record<ToastType, { title: string; icon: string }> = {
   success: { title: "执行成功", icon: "✓" },
   error: { title: "执行失败", icon: "!" },
   info: { title: "提示", icon: "i" },
   running: { title: "执行中", icon: "…" },
 };
 
-export function showToast(message, type = "info", detail = "", actions = []) {
+export function showToast(
+  message: unknown,
+  type: ToastType = "info",
+  detail: unknown = "",
+  actions: ToastAction[] = [],
+) {
   if (!toastStack || !message) return;
   const meta = TOAST_META[type] || TOAST_META.info;
-  const toast = document.createElement("div");
+  const toast = document.createElement("div") as HTMLElement;
   toast.className = `toast toast-${type}`;
   const actionHtml = actions.length
     ? `<div class="toast-actions">${actions
         .map(
-          (action, index) =>
+          (action: ToastAction, index: number) =>
             `<button type="button" class="btn btn-secondary btn-compact btn-pill toast-action-btn" data-toast-action="${index}">${escapeHtml(action.label)}</button>`
         )
         .join("")}</div>`
@@ -44,10 +55,11 @@ export function showToast(message, type = "info", detail = "", actions = []) {
         : type === "running"
           ? 1400
           : 3200;
-  const progress = toast.querySelector(".toast-progress");
+  const progress = toast.querySelector(".toast-progress") as HTMLElement | null;
   if (progress) progress.style.animationDuration = `${duration}ms`;
   toast.querySelector(".toast-close")?.addEventListener("click", () => toast.remove());
-  toast.querySelectorAll("[data-toast-action]").forEach((button) => {
+  toast.querySelectorAll("[data-toast-action]").forEach((item) => {
+    const button = item as HTMLElement;
     button.addEventListener("click", () => {
       const action = actions[Number(button.dataset.toastAction)];
       toast.remove();
@@ -66,7 +78,12 @@ export function dismissRunningToasts() {
   toastStack.querySelectorAll(".toast-running").forEach((toast) => toast.remove());
 }
 
-export function setInlineFeedback(element, message, type = "info", { autoHide = true } = {}) {
+export function setInlineFeedback(
+  element: HTMLElement | null,
+  message: unknown,
+  type: "success" | "error" | "info" = "info",
+  { autoHide = true }: { autoHide?: boolean } = {},
+) {
   if (!element) return;
   const existing = inlineFeedbackTimers.get(element);
   if (existing) window.clearTimeout(existing);
@@ -79,7 +96,7 @@ export function setInlineFeedback(element, message, type = "info", { autoHide = 
   }
 
   element.hidden = false;
-  element.textContent = message;
+  element.textContent = String(message);
   element.className = `inline-feedback inline-feedback--${type}`;
   if (!prefersReducedMotion()) {
     element.classList.remove("is-feedback-pop");

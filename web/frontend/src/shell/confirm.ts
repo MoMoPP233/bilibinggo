@@ -1,4 +1,3 @@
-// @ts-nocheck
 /* eslint-disable */
 /** Migrated from web/static/app.js — logic preserved. */
 
@@ -36,15 +35,18 @@ export function openAppConfirm({
   onSecondary = null,
 }: AppConfirmOptions = {}): Promise<boolean> {
   return new Promise((resolve) => {
-    if (!appConfirmModal || !appConfirmCancel || !appConfirmYes) {
+    const modal = appConfirmModal;
+    const cancelBtn = appConfirmCancel;
+    const yesBtn = appConfirmYes;
+    if (!modal || !cancelBtn || !yesBtn) {
       resolve(window.confirm(title || "确认继续？"));
       return;
     }
 
     const cleanup = () => {
       closeAppConfirm();
-      appConfirmCancel.removeEventListener("click", onCancel);
-      appConfirmYes.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      yesBtn.removeEventListener("click", onConfirm);
       appConfirmBackdrop?.removeEventListener("click", onCancel);
       appConfirmSecondary?.removeEventListener("click", onSecondaryClick);
       document.removeEventListener("keydown", onKeyDown);
@@ -70,7 +72,7 @@ export function openAppConfirm({
       resolve(false);
     };
 
-    const onKeyDown = (event) => {
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onCancel();
     };
 
@@ -94,25 +96,25 @@ export function openAppConfirm({
         appConfirmBullets.innerHTML = "";
       }
     }
-    appConfirmCancel.textContent = cancelLabel;
-    appConfirmYes.textContent = confirmLabel;
-    appConfirmYes.classList.toggle("btn-danger", Boolean(danger));
+    cancelBtn.textContent = cancelLabel;
+    yesBtn.textContent = confirmLabel;
+    yesBtn.classList.toggle("btn-danger", Boolean(danger));
     if (appConfirmSecondary) {
       const showSecondary = Boolean(secondaryLabel);
       appConfirmSecondary.toggleAttribute("hidden", !showSecondary);
       appConfirmSecondary.textContent = showSecondary ? secondaryLabel : "";
     }
 
-    appConfirmModal.hidden = false;
+    modal.hidden = false;
     document.body.classList.add("modal-open");
-    appConfirmCancel.addEventListener("click", onCancel);
-    appConfirmYes.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    yesBtn.addEventListener("click", onConfirm);
     appConfirmBackdrop?.addEventListener("click", onCancel);
     if (secondaryLabel && appConfirmSecondary) {
       appConfirmSecondary.addEventListener("click", onSecondaryClick);
     }
     document.addEventListener("keydown", onKeyDown);
-    appConfirmCancel.focus();
+    cancelBtn.focus();
   });
 }
 
