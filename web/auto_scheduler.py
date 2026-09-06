@@ -35,7 +35,6 @@ from web.auto_config import (
 )
 from web.auto_remote_state import (
     clear_expired_risk_pause,
-    is_risk_paused,
     matches_platform_risk,
     record_auto_remote_risk,
     risk_pause_state,
@@ -415,13 +414,24 @@ class AutoScheduler:
     def _remote_stage_allowed(self) -> bool:
         """返回当前是否允许启动下一个自动远程大任务（0 远程只读判断）。
 
-        仅在风控冷却期内禁止新的自动远程任务；冷却到期后本地清除，
-        只恢复“等待下一次正常调度”的资格，绝不主动探测或补跑。
+        仅禁止新的自动远程任务：
+        - 风控冷却期内（含状态文件损坏/不可读的 Fail-Closed）；
+        - 或距上一自动远程大任务结束未达最小错峰间隔。
+        冷却到期后本地清除，只恢复“等待下一次正常调度”的资格，绝不主动探测或补跑。
+        状态文件损坏不会自动清空/重写；修复后或新一次真实风控写入后才恢复。
         """
-        if is_risk_paused():
-            state = risk_pause_state()
-            reason = state.get("reason") or state.get("code") or "平台风控"
-            until = state.get("paused_until")
+        view = risk_pause_state()
+        if view.get("paused"):
+            status = str(view.get("state_status") or "ok")
+            if status in ("invalid", "unreadable"):
+                self._log(
+                    "warn",
+                    "自动远程风控状态文件损坏/不可读，fail-closed：本轮跳过且不联网，"
+                    "请检查 auto_remote_state.json。",
+                )
+                return False
+            reason = view.get("reason") or view.get("code") or "平台风控"
+            until = view.get("paused_until")
             until_text = (
                 datetime.fromtimestamp(int(until), CN_TZ).strftime("%H:%M")
                 if until
@@ -429,7 +439,7 @@ class AutoScheduler:
             )
             self._log(
                 "warn",
-                f"自动远程任务风控冷却中（{state.get('trigger_stage') or '未知'}）："
+                f"自动远程任务风控冷却中（{view.get('trigger_stage') or '未知'}）："
                 f"{reason}，至 {until_text}。本轮跳过且不联网。",
             )
             return False
