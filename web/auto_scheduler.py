@@ -1,7 +1,15 @@
-"""定时点击调度器：只向 JobRunner 投递意图，撞车即停，绝不 cancel。"""
+"""定时点击调度器：只向 JobRunner 投递意图，撞车即停，绝不 cancel。
+
+V9：自动 slot 跨进程防重复。同一 Profile 的已消费 logical slot 会持久化到
+per-Profile scheduler_slots.json；进程重启后相同 slot 不再二次投递
+（fail-closed：宁可漏跑，绝不重复远程）。手动 Job 不经过本状态。
+"""
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -53,6 +61,114 @@ REFRESH_STEPS = (
 )
 _AUTO_SNAPSHOT_MIN_INTERVAL_SEC = 0.5
 _AUTO_SNAPSHOT_LOG_LIMIT = 30
+
+_SLOT_STATE_FILE = "scheduler_slots.json"
+_SLOT_STATE_MAX_TASKS = 8
+_slot_state_lock = threading.Lock()
+
+
+class SlotStateError(RuntimeError):
+    """自动调度槽位状态不可用（损坏 / 无法写入）。
+
+    Fail-closed：遇到本异常时调度器不得再启动任何自动远程 Job。
+    """
+
+
+def _slot_state_path() -> Any:
+    from src.data_paths import get_profile_dir
+
+    return get_profile_dir() / _SLOT_STATE_FILE
+
+
+def _read_slot_state(path: Any) -> dict[str, str]:
+    """读取已消费槽位。文件不存在 = 首次运行（空历史）；存在但损坏 = 明确异常。"""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise SlotStateError(f"调度槽位状态读取失败：{exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SlotStateError("调度槽位状态文件损坏，已停止自动远程任务（请人工修复后重启）") from exc
+    if not isinstance(data, dict):
+        raise SlotStateError("调度槽位状态文件结构非法，已停止自动远程任务")
+    cleaned: dict[str, str] = {}
+    for key, value in data.items():
+        if isinstance(key, str) and isinstance(value, str):
+            cleaned[key] = value
+    return cleaned
+
+
+def _write_slot_state_atomic(path: Any, state: dict[str, str]) -> None:
+    """同目录唯一临时文件 → write → flush → fsync → close → os.replace（Windows 兼容）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, tmp_name = tempfile.mkstemp(
+        prefix=f".{_SLOT_STATE_FILE}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, ensure_ascii=False, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _persist_slot_claimed(task: str, slot: str) -> bool:
+    """原子 check+claim：返回 True 表示本次成功消费该 slot（可继续自动投递）。
+
+    返回 False 表示该 (task, slot) 已被（本进程或历史进程）消费，不得再次投递。
+    文件损坏/不可写时抛 SlotStateError，由调用方 fail closed（0 remote）。
+    """
+    path = _slot_state_path()
+    with _slot_state_lock:
+        state = _read_slot_state(path)
+        if state.get(task) == slot:
+            return False
+        state[task] = slot
+        if len(state) > _SLOT_STATE_MAX_TASKS:
+            # 有界：只保留最近消费的少量 task；key 天然含 task 身份，不会错判当前 slot。
+            for key in sorted(state):
+                del state[key]
+                if len(state) <= _SLOT_STATE_MAX_TASKS:
+                    break
+        try:
+            _write_slot_state_atomic(path, state)
+        except OSError as exc:
+            raise SlotStateError(f'调度槽位状态写入失败：{exc}') from exc
+    return True
+
+
+def _reset_slot_state_for_tests() -> None:
+    """仅测试用：清除 slot 状态文件，避免跨用例污染。"""
+    with _slot_state_lock:
+        path = _slot_state_path()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _log_slot_skip(scheduler: "AutoScheduler", task: str, slot: str) -> None:
+    scheduler._log("info", f"自动任务槽位 {slot}（{task}）已被消费（含历史进程），本轮跳过")
+
+
+def _stale_or_slot_guard(scheduler: "AutoScheduler", task: str, slot: str) -> bool:
+    """阶段入口：stale 或槽位已消费时返回 False（调用方不得投递任何远程任务）。"""
+    if scheduler._is_stale():
+        return False
+    try:
+        return _persist_slot_claimed(task, slot)
+    except SlotStateError as exc:
+        scheduler._log("error", f"调度槽位状态不可用，自动任务（{slot}）fail-closed 跳过：{exc}")
+        return False
 
 
 class CollisionError(RuntimeError):
@@ -485,6 +601,9 @@ class AutoScheduler:
             self._fatal(f"未预期错误：{friendly_error(exc)}")
 
     def _run_refresh_batch(self, key: str) -> None:
+        if not _stale_or_slot_guard(self, "refresh", key):
+            self._done_refresh.add(key)
+            return
         if not self._remote_stage_allowed():
             # 全局暂停或 60s 错峰期内：本轮整批跳过，不致命、不补跑。
             self._done_refresh.add(key)
@@ -547,6 +666,9 @@ class AutoScheduler:
             self._set_phase("等待下一刻度", f"刷新批次异常已跳过：{exc}")
 
     def _run_following_scan(self, key: str) -> None:
+        if not _stale_or_slot_guard(self, "following", key):
+            self._done_following.add(key)
+            return
         if not self._remote_stage_allowed():
             self._done_following.add(key)
             return
@@ -578,6 +700,9 @@ class AutoScheduler:
             self._set_phase("等待下一刻度", f"关注动态补漏已跳过：{exc}")
 
     def _run_triple_slot(self, key: str) -> None:
+        if not _stale_or_slot_guard(self, "triple", key):
+            self._done_triple.add(key)
+            return
         if not self._remote_stage_allowed():
             self._done_triple.add(key)
             return
@@ -614,6 +739,9 @@ class AutoScheduler:
             self._set_phase("等待下一刻度", f"已跳过：{exc}")
 
     def _run_maintenance(self, key: str) -> None:
+        if not _stale_or_slot_guard(self, "maintain", key):
+            self._done_maintain.add(key)
+            return
         if not self._remote_stage_allowed():
             self._done_maintain.add(key)
             return

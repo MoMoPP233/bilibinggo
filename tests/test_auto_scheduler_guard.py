@@ -6,6 +6,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_scheduler_slots(tmp_path, monkeypatch):
+    """V9：把 Scheduler slot 持久化文件隔离到每个用例的临时目录。"""
+    from src import data_paths as _data_paths
+
+    monkeypatch.setattr(_data_paths, "get_profile_dir", lambda profile_id=None: tmp_path)
+
+
 from web import auto_remote_state as state_mod
 from web.auto_config import AUTO_REMOTE_RISK_COOLDOWN_SECONDS
 from web.auto_scheduler import AutoScheduler

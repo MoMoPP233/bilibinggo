@@ -2,6 +2,15 @@ from __future__ import annotations
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_scheduler_slots(tmp_path, monkeypatch):
+    """V9：把 Scheduler slot 持久化文件隔离到每个用例的临时目录。"""
+    from src import data_paths as _data_paths
+
+    monkeypatch.setattr(_data_paths, "get_profile_dir", lambda profile_id=None: tmp_path)
+
+
 from src.participation_guard import (
     confirm_repost,
     mark_repost_suspected,
