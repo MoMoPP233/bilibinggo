@@ -77,6 +77,7 @@ AUTO_ASSESSMENT_BUDGET = 20
 MANUAL_REVIEW_DEFER_SECONDS = 30 * 24 * 60 * 60
 CONSECUTIVE_FAILURE_LIMIT = 3
 MAX_DELETE_BATCH = 20
+AUTO_DELETE_BATCH_SIZE = 20
 HEALTH_ISSUE_LIMIT = 20
 TRUSTED_IDENTITY_SOURCES = frozenset({"space_feed", "legacy_space_feed"})
 RETRYABLE_ASSESSMENT_REASON_CODES = frozenset({"remote_unknown"})
@@ -2219,6 +2220,407 @@ def delete_reposts(
     }
 
 
+
+
+# ---------------------------------------------------------------------------
+# M6: strict-safe 自动清理动态（cleanup_auto_delete）
+# ---------------------------------------------------------------------------
+
+
+def _auto_delete_setting_path():
+    from src.data_paths import get_profile_dir
+
+    return get_profile_dir() / "auto_delete_enabled.json"
+
+
+def get_auto_delete_enabled() -> bool:
+    """per-Profile 自动删除开关（默认 False，绝不放 shared）。"""
+    import json
+    import os
+
+    path = _auto_delete_setting_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(raw.get("enabled")) if isinstance(raw, dict) else False
+
+
+def set_auto_delete_enabled(enabled: bool) -> bool:
+    """用户明确开启/关闭自动安全清理（原子写，per-Profile）。"""
+    import json
+    import os
+    import tempfile
+
+    from src.data_paths import get_atomic_path_lock
+
+    path = _auto_delete_setting_path()
+    with get_atomic_path_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".auto_delete.", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"enabled": bool(enabled)}, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    return bool(enabled)
+
+
+def _strict_safe(record: object, stored: object, *, now_ts: int) -> tuple[bool, str]:
+    """正向白名单 strict-safe：任何条件不满足即不可自动删除。"""
+    row = _record_dict(record)
+    if str(row.get("delete_status") or "") != "active":
+        return False, "delete_status 非 active"
+    if stored is None:
+        return False, "无 final assessment"
+    assessment = _record_dict(stored)
+    if assessment.get("assessment_status") != "final":
+        return False, "assessment 非 final"
+    if assessment.get("assessment_level") != "safe":
+        return False, "assessment_level 非 safe"
+    if assessment.get("lottery_time_reliable") is not True:
+        return False, "开奖时间不可靠"
+    eligible = assessment.get("eligible_after")
+    if eligible is not None:
+        try:
+            if int(eligible) > int(now_ts):
+                return False, "未到安全缓冲时间"
+        except (TypeError, ValueError):
+            return False, "eligible_after 非法"
+    if _defer_state(record, stored) is not None:
+        return False, "deferred"
+    return True, ""
+
+
+def _repost_delete_barrier_blocked(uid: str) -> bool:
+    """delete_pending / unknown 任一存在 → 本轮禁止任何自动 DELETE。"""
+    counts = count_repost_delete_statuses(uid)
+    return (int(counts.get("delete_pending") or 0) + int(counts.get("unknown") or 0)) > 0
+
+
+def auto_cleanup_delete(
+    *,
+    on_progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+    now_ts: int | None = None,
+    client_factory: Callable[[], BilibiliClient] = BilibiliClient,
+) -> dict[str, Any]:
+    """strict-safe 自动清理：每批 ≤20，自动连续处理当前 Job frozen scope。
+
+    规则（超集为 0 删除）：
+    - auto_delete_enabled=False → 0 DELETE；
+    - 启动或每批存在 delete_pending/unknown → 0 DELETE（barrier）；
+    - 只有 final+safe+开奖时间可靠+eligible_after<=now 且无 defer 的候选可处理；
+    - 每条 DELETE 前重新验证 strict-safe + 身份 + safe 复核 + participation_guard；
+    - claim_delete_pending 成功后才允许发送 DELETE（claim 失败 → 整 Job 停止，0 DELETE）；
+    - DELETE retries=0；transport/响应不可确认 → unknown durable + 整 Job 立即停止；
+    - 明确业务拒绝 → delete_failed durable + 整 Job 停止；
+    - 平台成功且本地 deleted durable 才计 deleted_success，然后才下一条；
+    - -352/-509/429 → 0 retry、停止全部后续批次、进入既有 risk/cooldown。
+    """
+    current = int(now_ts if now_ts is not None else time.time())
+    _check_cancel(cancel_check)
+    if not get_auto_delete_enabled():
+        return _auto_delete_result(
+            uid="", scope_total=0, processed=0, deleted=0, attempted=0,
+            stop_reason="DISABLED", stop_message="自动删除未开启（0 DELETE）",
+        )
+    breaker = _AssessmentBreaker()
+    profile_id = get_runtime_profile_id()
+    database_path = str(db_path().resolve())
+    with client_factory() as client:
+        _, uid_int = _require_verified_login(client)
+        uid = str(uid_int)
+        if _repost_delete_barrier_blocked(uid):
+            return _auto_delete_result(
+                uid=uid, scope_total=0, processed=0, deleted=0, attempted=0,
+                stop_reason="BARRIER", stop_message="存在 delete_pending/unknown，0 DELETE",
+            )
+        activities_map = {
+            str(item.get("dynamic_id") or ""): item
+            for item in load_activities()
+            if isinstance(item, dict) and item.get("dynamic_id")
+        }
+        assessments = list_repost_assessments(uid)
+        records = list_evaluable_reposts(uid)
+
+        def _is_scope_candidate(record: object) -> bool:
+            row = _record_dict(record)
+            original_id = str(row.get("original_dynamic_id") or "").strip()
+            ok, _ = _strict_safe(record, assessments.get(original_id), now_ts=current)
+            if not ok:
+                return False
+            guard = get_guard(uid, original_id)
+            if guard is not None and guard.repost_status in {"pending", "unknown", "suspected"}:
+                return False
+            return True
+
+        scope_ids = sorted(
+            (str(_record_dict(r).get("repost_dynamic_id") or "") for r in records if _is_scope_candidate(r))
+        )
+        scope_total = len(scope_ids)
+        max_batches = max(1, (scope_total + AUTO_DELETE_BATCH_SIZE - 1) // AUTO_DELETE_BATCH_SIZE) if scope_total else 0
+        attempted: set[str] = set()
+        items: list[dict[str, str]] = []
+        processed_total = 0
+        deleted_success = 0
+        made_progress_total = 0
+        batches_done = 0
+        stop_reason = ""
+        stop_message = ""
+        _progress(on_progress, 0, max(1, scope_total), f"自动安全清理：scope {scope_total} 条（frozen）")
+
+        def _record_risk(risk_code: int | None, exc: object) -> None:
+            if risk_code not in (-352, -509, 429):
+                return
+            try:
+                from web.auto_remote_state import record_auto_remote_risk
+
+                record_auto_remote_risk(
+                    trigger_stage="cleanup_auto_delete",
+                    reason=str(exc or "") or "",
+                    code=str(risk_code),
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("repost_cleanup").exception(
+                    "记录自动删除平台风控冷却失败 code=%s", risk_code
+                )
+
+        for batch_no in range(max_batches):
+            _check_cancel(cancel_check)
+            if breaker.stopped:
+                break
+            if get_runtime_profile_id() != profile_id or str(db_path().resolve()) != database_path:
+                stop_reason = "RUNTIME_MISMATCH"
+                stop_message = "运行期间 Profile/DB 路径变化，已停止"
+                break
+            if _repost_delete_barrier_blocked(uid):
+                stop_reason = "BARRIER"
+                stop_message = "批间出现 delete_pending/unknown，后续 0 DELETE"
+                break
+            assessments = list_repost_assessments(uid)
+            remaining = [
+                rid
+                for rid in scope_ids
+                if rid not in attempted
+            ]
+            if not remaining:
+                break
+            batch = remaining[:AUTO_DELETE_BATCH_SIZE]
+            processed_batch = 0
+            made_batch = 0
+            for rid in batch:
+                if breaker.stopped:
+                    break
+                _check_cancel(cancel_check)
+                attempted.add(rid)
+                original_id = ""
+                status = "skipped"
+                message = "安全条件未通过"
+                try:
+                    csrf = _assert_frozen_runtime(profile_id=profile_id, database_path=database_path, uid=uid)
+                    record = get_repost(uid, rid)
+                    if record is None:
+                        raise ValueError("转发历史中不存在该目标")
+                    row = _record_dict(record)
+                    original_id = str(row.get("original_dynamic_id") or "").strip()
+                    stored = assessments.get(original_id)
+                    ok, why = _strict_safe(record, stored, now_ts=current)
+                    if not ok:
+                        raise ValueError(why)
+                    guard = get_guard(uid, original_id)
+                    if guard is not None and guard.repost_status in {"pending", "unknown", "suspected"}:
+                        raise ValueError("participation_guard 未就绪")
+                    _verify_owned_repost_detail(
+                        client, uid=uid, repost_dynamic_id=rid, original_dynamic_id=original_id
+                    )
+                    recheck = _assess_original(
+                        client, original_id=original_id, uid=uid, now_ts=current,
+                        activities_map=activities_map,
+                    )
+                    if recheck.level != "safe":
+                        raise ValueError("安全复核未通过（不再 safe）")
+                    if not claim_delete_pending(uid, rid, requested_at=current):
+                        raise ValueError("claim_delete_pending 失败")
+                    try:
+                        payload = client.post_json(
+                            DELETE_REPOST_URL,
+                            {"dyn_id_str": rid},
+                            params={"platform": "web", "csrf": csrf},
+                            referer=f"https://space.bilibili.com/{uid}/dynamic",
+                            retries=0,
+                            raise_on_code=False,
+                        )
+                    except Exception as exc:
+                        risk = _risk_code_from_message(exc)
+                        error = f"删除结果无法确认：{type(exc).__name__}"
+                        try:
+                            mark_delete_result(uid, rid, status="unknown", error=error)
+                        except Exception:
+                            pass  # 原 pending 保留为安全屏障
+                        status, message = "unknown", error
+                        if risk is not None:
+                            _record_risk(risk, exc)
+                        stop_reason = "DELETE_UNKNOWN"
+                        stop_message = error
+                        breaker.stopped = True
+                        breaker.stop_message = error
+                    else:
+                        code = payload.get("code") if isinstance(payload, dict) else None
+                        if type(code) is not int:
+                            error = "删除响应缺少合法整数 code，无法确认"
+                            try:
+                                mark_delete_result(uid, rid, status="unknown", error=error)
+                            except Exception:
+                                pass
+                            status, message = "unknown", error
+                            stop_reason = "DELETE_UNKNOWN"
+                            stop_message = error
+                            breaker.stopped = True
+                            breaker.stop_message = error
+                        elif code == 0:
+                            save_error = ""
+                            saved = False
+                            try:
+                                saved = bool(
+                                    mark_delete_result(
+                                        uid, rid, status="deleted", deleted_at=int(time.time())
+                                    )
+                                )
+                            except Exception as exc:
+                                save_error = f"平台已返回成功但本地状态落盘失败：{exc}"
+                            if saved:
+                                status, message = "deleted", "删除成功"
+                            else:
+                                try:
+                                    mark_delete_result(uid, rid, status="unknown", error=save_error)
+                                except Exception:
+                                    pass
+                                status, message = "unknown", save_error or "本地 deleted 落盘失败"
+                                stop_reason = "DELETE_UNKNOWN"
+                                stop_message = message
+                                breaker.stopped = True
+                                breaker.stop_message = message
+                        else:
+                            api_message = str(payload.get("message") or payload.get("msg") or "").strip()
+                            error = f"Bilibili API error {code}: {api_message}".rstrip()
+                            try:
+                                saved = bool(
+                                    mark_delete_result(uid, rid, status="delete_failed", error=error)
+                                )
+                            except Exception:
+                                saved = False
+                            status, message = ("delete_failed" if saved else "unknown"), error
+                            if code in (-352, -509, -799, 429):
+                                _record_risk(code, error)
+                                breaker.rate_limited = True
+                            # 自动路径：任何明确业务拒绝都停止整 Job，留给人工检查
+                            stop_reason = "DELETE_FAILED"
+                            stop_message = error
+                            breaker.stopped = True
+                            breaker.stop_message = error
+                except AssessmentRateLimited as exc:
+                    risk = _risk_code_from_message(exc)
+                    status, message = "skipped", str(exc)
+                    _record_risk(risk, exc)
+                    stop_reason = "RISK"
+                    stop_message = str(exc)
+                    breaker.stopped = True
+                    breaker.stop_message = str(exc)
+                except (RemoteStateUnknown, RuntimeError, ValueError) as exc:
+                    # 安全验证/读取失败：不能证明 safe → 保守跳过本条（可继续其它候选）
+                    status, message = "skipped", str(exc)
+                finally:
+                    items.append(
+                        _delete_failure_item(
+                            repost_id=rid, original_id=original_id,
+                            status=status, message=message,
+                        )
+                    )
+                processed_batch += 1
+                processed_total += 1
+                if status in ("deleted", "delete_failed", "unknown"):
+                    made_batch += 1
+                    made_progress_total += 1
+                if status == "deleted":
+                    deleted_success += 1
+                _progress(
+                    on_progress,
+                    len(attempted),
+                    max(1, scope_total),
+                    f"第{batch_no + 1}批：{processed_batch}/{len(batch)} 累计{len(attempted)}/{scope_total}（{status}）",
+                    f"{rid}：{message}",
+                )
+                if breaker.stopped:
+                    break
+            batches_done += 1
+            if breaker.stopped or stop_reason:
+                break
+            if processed_batch == 0:
+                stop_reason = "NO_PROCESSED_PROGRESS"
+                break
+            if made_batch == 0:
+                stop_reason = "NO_STATE_PROGRESS"
+                break
+
+        if not stop_reason and not breaker.stopped and batches_done == max_batches and processed_total == scope_total:
+            stop_message = f"自动安全清理完成：删除 {deleted_success} 条（{batches_done} 批）"
+        elif stop_reason:
+            stop_message = stop_message or stop_reason
+        elif scope_total == 0:
+            stop_message = "没有符合 strict-safe 的候选（0 DELETE）"
+
+        return _auto_delete_result(
+            uid=uid,
+            scope_total=scope_total,
+            processed=processed_total,
+            deleted=deleted_success,
+            attempted=len(attempted),
+            stop_reason=stop_reason,
+            stop_message=stop_message,
+            batches_done=batches_done,
+            items=items,
+            rate_limited=breaker.rate_limited,
+            stopped_early=bool(stop_reason or breaker.stopped),
+        )
+
+
+def _auto_delete_result(*, uid: str, scope_total: int, processed: int, deleted: int,
+                        attempted: int, stop_reason: str, stop_message: str,
+                        batches_done: int = 0, items: list | None = None,
+                        rate_limited: bool = False, stopped_early: bool = False) -> dict[str, Any]:
+    counts = {}
+    if uid:
+        try:
+            counts = count_repost_delete_statuses(uid)
+        except Exception:
+            counts = {}
+    return {
+        "uid": uid,
+        "scope_size": scope_total,
+        "processed": processed,
+        "deleted_count": deleted,
+        "attempted": attempted,
+        "batches_done": batches_done,
+        "delete_counts": counts,
+        "stop_reason": stop_reason,
+        "stopped_early": stopped_early,
+        "rate_limited": rate_limited,
+        "message": stop_message or "自动安全清理结束",
+        "items": items or [],
+    }
+
+
+
 __all__ = [
     "AUTO_ASSESSMENT_BUDGET",
     "CandidateAssessment",
@@ -2228,7 +2630,11 @@ __all__ = [
     "MAX_ASSESSMENTS_PER_JOB",
     "MAX_DELETE_BATCH",
     "RemoteStateUnknown",
+    "AUTO_DELETE_BATCH_SIZE",
+    "auto_cleanup_delete",
     "auto_maintain",
+    "get_auto_delete_enabled",
+    "set_auto_delete_enabled",
     "cleanup_health_check",
     "defer_candidate",
     "delete_reposts",

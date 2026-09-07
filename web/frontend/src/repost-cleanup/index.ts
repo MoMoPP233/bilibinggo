@@ -1240,6 +1240,7 @@ async function requestCleanupStop(): Promise<void> {
 export function bindRepostCleanup(): void {
   if (bound) return;
   bound = true;
+  bindAutoCleanupUi().catch(() => {});
   // 同步 / 评估按钮由本页自管（立即 loading、逻辑锁、即时反馈）；
   // 标记 dataset.bound 避免全局 bindActionButtons 再绑一次造成重复提交。
   const syncStartBtn = document.getElementById("repost-sync-btn");
@@ -1367,4 +1368,98 @@ export async function startCleanupJob(
   } catch (error) {
     notifyJobStartError(error, action, params);
   }
+}
+
+
+// ---------- M6：strict-safe 自动安全清理 ----------
+
+async function bindAutoCleanupPanel(): Promise<void> {
+  const stack = document.querySelector(".repost-cleanup-stack");
+  if (!stack || document.getElementById("auto-cleanup-panel")) return;
+  const panel = document.createElement("article");
+  panel.className = "panel";
+  panel.id = "auto-cleanup-panel";
+  panel.innerHTML = `
+    <div class="panel-head-row">
+      <div>
+        <p class="eyebrow">Auto Cleanup</p>
+        <h2 class="section-title">自动安全清理</h2>
+        <p class="section-desc">只会自动删除程序确认 safe 的过期转发；结果未知时立即停机且绝不自动重试。</p>
+      </div>
+      <div class="action-row">
+        <label class="ntf-toggle"><input type="checkbox" id="auto-delete-toggle" /> 自动删除：关闭</label>
+        <button type="button" class="btn btn-primary btn-pill" id="auto-delete-run">立即执行安全清理</button>
+      </div>
+    </div>
+    <div class="auto-cleanup-meta">
+      <span class="caption">safe 候选：<b id="auto-delete-safe">0</b></span>
+      <span class="caption">delete_pending：<b id="auto-delete-pending">0</b></span>
+      <span class="caption">unknown：<b id="auto-delete-unknown">0</b></span>
+      <span class="caption" id="auto-delete-hint"></span>
+    </div>`;
+  stack.appendChild(panel);
+
+  const refresh = async () => {
+    try {
+      const state: Record<string, any> = (await fetchJSON("/api/cleanup/auto-delete")) as Record<string, any>;
+      const toggle = document.getElementById("auto-delete-toggle") as HTMLInputElement | null;
+      if (toggle) {
+        toggle.checked = Boolean(state && state.enabled);
+        const label = toggle.parentElement as HTMLElement | null;
+        if (label) label.textContent = "自动删除：" + (state && state.enabled ? "已开启" : "关闭");
+      }
+      const set = (id: string, value: unknown) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = String(value ?? 0);
+      };
+      set("auto-delete-safe", state ? state.safe_candidates : 0);
+      set("auto-delete-pending", state ? state.counts.delete_pending : 0);
+      set("auto-delete-unknown", state ? state.counts.unknown : 0);
+      const hint = document.getElementById("auto-delete-hint");
+      if (hint) {
+        hint.textContent = state && state.enabled
+          ? "已开启：仅处理 strict-safe 项；存在 delete_pending/unknown 时自动停机。"
+          : "默认关闭：开启前请确认理解删除风险。";
+      }
+    } catch (error) {
+      showToast(String((error as { message?: string })?.message || error), "error", "自动清理状态读取失败");
+    }
+  };
+
+  const toggle = document.getElementById("auto-delete-toggle");
+  toggle?.addEventListener("change", async (event) => {
+    const enabled = Boolean((event.target as HTMLInputElement).checked);
+    try {
+      await fetchJSON("/api/cleanup/auto-delete", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      if (
+        enabled
+        && !window.confirm("确认开启自动安全清理？只会删除程序确认 safe 的过期转发。")
+      ) {
+        await fetchJSON("/api/cleanup/auto-delete", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: false }),
+        });
+      }
+      await refresh();
+    } catch (error) {
+      showToast(String((error as { message?: string })?.message || error), "error");
+      await refresh();
+    }
+  });
+
+  document.getElementById("auto-delete-run")?.addEventListener("click", () => {
+    startJob("cleanup_auto_delete", {}).catch((error) => {
+      showToast(String((error as { message?: string })?.message || error), "error");
+    });
+  });
+  await refresh();
+}
+
+async function bindAutoCleanupUi(): Promise<void> {
+  await bindAutoCleanupPanel();
 }

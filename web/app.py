@@ -554,6 +554,54 @@ def api_notifications_test(channel: str) -> dict[str, Any]:
     return {"ok": True, "result": result}
 
 
+# ---------- M6：strict-safe 自动安全清理设置 ----------
+
+
+class AutoDeleteEnabledRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/cleanup/auto-delete", tags=["stable"])
+def api_auto_delete_status() -> dict[str, Any]:
+    from src.repost_cleanup import (
+        count_repost_delete_statuses,
+        get_auto_delete_enabled,
+        load_persisted_candidates,
+    )
+    from src.bilibili_auth import require_login
+
+    try:
+        _, uid_int = require_login()
+    except RuntimeError:
+        uid_int = 0
+    uid = str(uid_int)
+    counts = count_repost_delete_statuses(uid) if uid_int else {}
+    safe_candidates = (
+        len([c for c in load_persisted_candidates(uid) if str(c.get("level")) == "safe"])
+        if uid_int
+        else 0
+    )
+    return {
+        "enabled": get_auto_delete_enabled(),
+        "counts": {
+            "delete_pending": int(counts.get("delete_pending") or 0),
+            "unknown": int(counts.get("unknown") or 0),
+            "delete_failed": int(counts.get("delete_failed") or 0),
+            "deleted": int(counts.get("deleted") or 0),
+            "active": int(counts.get("active") or 0),
+        },
+        "safe_candidates": safe_candidates,
+    }
+
+
+@app.put("/api/cleanup/auto-delete", tags=["stable"])
+def api_auto_delete_set(payload: AutoDeleteEnabledRequest) -> dict[str, Any]:
+    from src.repost_cleanup import set_auto_delete_enabled
+
+    enabled = set_auto_delete_enabled(payload.enabled)
+    return {"ok": True, "enabled": enabled}
+
+
 # ---------- 中奖深检（M3） ----------
 
 

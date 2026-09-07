@@ -988,6 +988,7 @@ WRITER_LEASE_ACTIONS = frozenset({
     "participate_triple",
     "cleanup_auto_maintain",
     "scan_expired_reposts",
+    "cleanup_auto_delete",
     "sync_repost_history",
     "winner_deep_scan",
 })
@@ -1466,6 +1467,24 @@ def _run_action_impl(
         )
         _raise_if_cancelled(cancel_event)
         message = str(result.get("message") or "自动维护完成")
+        progress(step=1, total=1, message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+
+    if action == "cleanup_auto_delete":
+        # M6：strict-safe 自动清理（每批 ≤20 自动连续处理 frozen scope）。
+        # 开关默认关闭；0 DELETE 状态/开关关闭时返回原因而非报错。WriterLease 由外层 wrapper 提供。
+        from src.repost_cleanup import auto_cleanup_delete
+
+        if params:
+            raise ValueError("自动安全清理不接受额外参数")
+        _raise_if_cancelled(cancel_event)
+        progress(step=0, total=1, message="正在执行 strict-safe 自动安全清理…")
+        result = auto_cleanup_delete(
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        message = str(result.get("message") or "自动安全清理完成")
         progress(step=1, total=1, message=message, log_append=message)
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 
