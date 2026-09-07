@@ -248,6 +248,8 @@ class AutoScheduler:
         self._done_refresh: set[str] = set()
         self._done_triple: set[str] = set()
         self._done_maintain: set[str] = set()
+        self._done_cleanup: set[str] = set()
+        self._done_winner: set[str] = set()
         self._done_following: set[str] = set()
         self._snapshot_timer: threading.Timer | None = None
         self._last_snapshot_mono = 0.0
@@ -579,12 +581,19 @@ class AutoScheduler:
 
                 # 清理数据自动维护：Scheduler 启动即自动拥有每 2 小时维护资格
                 # （无需用户单独开关；旧 enabled 配置不影响统一 Scheduler）。
-                if now.minute == 0 and now.hour % CLEANUP_MAINTAIN_INTERVAL_HOURS == 0:
-                    key = f"maint-{now:%Y-%m-%d-%H}"
-                    if key not in self._done_maintain:
-                        self._run_maintenance(key)
+                # M8: 中奖深检约每 6 小时（05:04/11:04/17:04/23:04）
+                if now.minute == 4 and now.hour % 6 == 5:
+                    key = f"winner-{now:%Y-%m-%d-%H}"
+                    if key not in self._done_winner:
+                        self._run_winner_scan(key)
                         continue
 
+                # M8: 统一自动维护周期（约每 6 小时：02:05/08:05/14:05/20:05）
+                if now.minute == 5 and now.hour % 6 == 2:
+                    key = f"cleanup-{now:%Y-%m-%d-%H}"
+                    if key not in self._done_cleanup:
+                        self._run_cleanup_cycle(key)
+                        continue
                 if (
                     now.minute == FOLLOWING_FEED_SCAN_MINUTE
                     and now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL
@@ -595,7 +604,17 @@ class AutoScheduler:
                         self._run_following_scan(key)
                         continue
 
-                if now.hour not in REFRESH_HOURS and now.minute in TRIPLE_MINUTES:
+                # 专用分钟排除：following(03)/winner(04)/cleanup(05)同分钟不参与三连
+                dedicated_minute = (
+                    (now.minute == 3 and now.hour % 6 == 1)
+                    or (now.minute == 4 and now.hour % 6 == 5)
+                    or (now.minute == 5 and now.hour % 6 == 2)
+                )
+                if (
+                    now.hour not in REFRESH_HOURS
+                    and now.minute in TRIPLE_MINUTES
+                    and not dedicated_minute
+                ):
                     key = f"{now:%Y-%m-%d-%H-%M}"
                     if key not in self._done_triple:
                         self._run_triple_slot(key)
@@ -812,6 +831,86 @@ class AutoScheduler:
                 self._log("warn", f"自动维护跳过：{exc}")
             self._done_maintain.add(key)
             self._set_phase("等待下一刻度", f"自动维护已跳过：{exc}")
+
+    def _run_winner_scan(self, key: str) -> None:
+        if not _stale_or_slot_guard(self, "winner_scan", key):
+            self._done_winner.add(key)
+            return
+        if not self._remote_stage_allowed():
+            self._done_winner.add(key)
+            return
+        self._set_pipeline(active=False)
+        self._set_phase("中奖深检", f"中奖深检刻度 {key}")
+        self._log("info", f"中奖深检刻度 {key}")
+        try:
+            self._click_and_wait("winner_deep_scan")
+            self._done_winner.add(key)
+            if self._is_stale():
+                return
+            with self._lock:
+                self._status.message = "中奖深检完成"
+            self._mark_remote_stage_finished()
+            self._set_phase("等待下一刻度", "中奖深检完成")
+        except CollisionError:
+            self._log("warn", "中奖深检发现已有任务在运行，本轮跳过。")
+            self._done_winner.add(key)
+        except Exception as exc:
+            if matches_platform_risk(exc):
+                self._pause_all_auto_remote("winner_deep_scan", str(exc) or type(exc).__name__)
+            elif _is_hard_failure(exc):
+                self._fatal(str(exc))
+                return
+            else:
+                self._log("warn", f"中奖深检跳过：{exc}")
+            self._done_winner.add(key)
+            self._set_phase("等待下一刻度", f"中奖深检已跳过：{exc}")
+
+    def _run_cleanup_cycle(self, key: str) -> None:
+        if not _stale_or_slot_guard(self, "cleanup_cycle", key):
+            self._done_cleanup.add(key)
+            return
+        if not self._remote_stage_allowed():
+            self._done_cleanup.add(key)
+            return
+        self._set_pipeline(active=False)
+        self._set_phase("自动维护周期", f"自动维护周期刻度 {key}")
+        from src.repost_cleanup import auto_clear_expired_maintenance_risk, auto_maintenance_paused_state
+
+        paused, pause_reason = auto_maintenance_paused_state()
+        if paused:
+            cleared = auto_clear_expired_maintenance_risk(
+                cooldown_seconds=AUTO_REMOTE_RISK_COOLDOWN_SECONDS
+            )
+            if not cleared:
+                self._log("warn", f"自动维护风控冷却中，本轮跳过且不联网：{pause_reason}")
+                self._done_cleanup.add(key)
+                return
+        self._log("info", f"自动维护周期刻度 {key}")
+        try:
+            self._click_and_wait("cleanup_maintenance_cycle")
+            self._done_cleanup.add(key)
+            if self._is_stale():
+                return
+            with self._lock:
+                self._status.message = "自动维护周期完成"
+            self._mark_remote_stage_finished()
+            self._set_phase("等待下一刻度", "自动维护周期完成")
+            newly_paused, new_reason = auto_maintenance_paused_state()
+            if newly_paused:
+                self._pause_all_auto_remote("cleanup_maintenance_cycle", new_reason or "cleanup 风控暂停")
+        except CollisionError:
+            self._log("warn", "自动维护周期发现已有任务在运行，本轮跳过。")
+            self._done_cleanup.add(key)
+        except Exception as exc:
+            if matches_platform_risk(exc):
+                self._pause_all_auto_remote("cleanup_maintenance_cycle", str(exc) or type(exc).__name__)
+            elif _is_hard_failure(exc):
+                self._fatal(str(exc))
+                return
+            else:
+                self._log("warn", f"自动维护周期跳过：{exc}")
+            self._done_cleanup.add(key)
+            self._set_phase("等待下一刻度", f"自动维护周期已跳过：{exc}")
 
     def _click_and_wait(self, action: str, *, pipeline_index: int | None = None) -> dict[str, Any]:
         if action not in ALLOWED_CLICK_ACTIONS:

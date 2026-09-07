@@ -1239,6 +1239,7 @@ def auto_maintain(
     cancel_check: CancelCheck | None = None,
     now_ts: int | None = None,
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
+    assess: bool = True,
 ) -> dict[str, Any]:
     """低频自动维护：只做增量同步 + 保守评估，绝不删除。
 
@@ -1347,7 +1348,7 @@ def auto_maintain(
     }
     evaluated = 0
     ordered = sorted(pending)
-    if ordered:
+    if ordered and assess:
         # 评估阶段使用全新的 client。首次 NAV 也纳入明确风控持久化暂停。
         with client_factory() as client:
             try:
@@ -2634,6 +2635,7 @@ __all__ = [
     "auto_cleanup_delete",
     "auto_maintain",
     "get_auto_delete_enabled",
+    "cleanup_maintenance_cycle",
     "set_auto_delete_enabled",
     "cleanup_health_check",
     "defer_candidate",
@@ -2644,3 +2646,67 @@ __all__ = [
     "scan_expired_reposts",
     "sync_repost_history",
 ]
+
+
+# ---------------------------------------------------------------------------
+# M8: cleanup_maintenance_cycle（AutoScheduler writer Job）
+# 同一 Job：现有 sync/维护 → M4 连续评估 → 仅当评估干净才进入 M6 strict-safe 自动删除。
+# ---------------------------------------------------------------------------
+
+
+def cleanup_maintenance_cycle(
+    *,
+    on_progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+    now_ts: int | None = None,
+    client_factory: Callable[[], BilibiliClient] = BilibiliClient,
+) -> dict[str, Any]:
+    from src.repost_cleanup import auto_maintain, auto_cleanup_delete, scan_expired_reposts
+
+    steps = ["同步与本地维护", "连续智能评估", "strict-safe 自动删除"]
+    phases: list[dict[str, Any]] = []
+    stage = 0
+
+    def _report(step: int, message: str, log_line: str | None = None) -> None:
+        _progress(on_progress, min(step, len(steps)), len(steps), message, log_line)
+
+    def _run_stage(func, label: str) -> dict[str, Any]:
+        nonlocal stage
+        stage += 1
+        _report(stage, f"{label}…", f"{label}开始")
+        result = func(
+            on_progress=None,
+            cancel_check=cancel_check,
+            now_ts=now_ts,
+            client_factory=client_factory,
+        )
+        phases.append({"stage": label, "result": result})
+        _report(stage, f"{label}完成", f"{label}完成")
+        return result
+
+    try:
+        _check_cancel(cancel_check)
+        stage1 = _run_stage(lambda **kwargs: auto_maintain(assess=False, **kwargs), "同步与本地维护")
+        _check_cancel(cancel_check)
+        stage2 = _run_stage(scan_expired_reposts, "连续智能评估")
+        _check_cancel(cancel_check)
+        # 进入删除的保守条件：评估无 risk/hard/partial 且 backlog 已全部收口
+        scan = stage2
+        blocked = bool(scan.get("rate_limited") or scan.get("stopped_early") or scan.get("stop_reason"))
+        if blocked or int(scan.get("pending_originals") or 0) > 0:
+            stage3 = {
+                "skipped": True,
+                "reason": "assessment_blocked_or_pending",
+                "message": "评估阶段未完全收口，跳过自动删除（0 DELETE）",
+            }
+            phases.append({"stage": "strict-safe 自动删除", "result": stage3})
+            _report(len(steps), "本轮自动删除已跳过（保守条件未满足）", str(stage3["message"]))
+        else:
+            stage3 = _run_stage(auto_cleanup_delete, "strict-safe 自动删除")
+        return {
+            "ok": True,
+            "phases": phases,
+            "message": f"自动维护周期完成：{len(phases)} 阶段",
+        }
+    except Exception:  # noqa: BLE001
+        raise

@@ -44,7 +44,9 @@ def test_allowed_actions_include_cleanup_maintain() -> None:
             "refresh_status",
             "participate_triple",
             "cleanup_auto_maintain",
+            "cleanup_maintenance_cycle",
             "following_feed_scan",
+            "winner_deep_scan",
         }
     )
 
