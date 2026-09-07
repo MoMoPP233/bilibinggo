@@ -76,22 +76,19 @@ def test_one_click_runs_multiple_batches_within_job_budget(isolated_home, monkey
 
 
 def test_job_budget_hard_cap_and_continuation(isolated_home, monkeypatch) -> None:
-    monkeypatch.setattr("src.repost_cleanup.ASSESSMENT_BUDGET_PER_ROUND", 2)
-    monkeypatch.setattr("src.repost_cleanup.MAX_ASSESSMENTS_PER_JOB", 2)
+    # M4：120 只是业务批次大小；单次 Job 自动连续处理整个 frozen backlog。
+    monkeypatch.setattr("src.repost_cleanup.ASSESSMENT_BATCH_SIZE", 2)
     originals = [f"100000000000000000{n}" for n in range(1, 6)]
     _seed(originals, monkeypatch)
 
     first = scan_expired_reposts(now_ts=1_800_000_000, client_factory=lambda: _FakeClient())
-    assert first["evaluated_originals"] == 2
-    assert first["pending_originals"] == 3
+    assert first["evaluated_originals"] == 5
+    assert first["batches_done"] == 3
+    assert first["pending_originals"] == 0
 
     second = scan_expired_reposts(now_ts=1_800_000_001, client_factory=lambda: _FakeClient())
-    assert second["evaluated_originals"] == 2
-    assert second["pending_originals"] == 1
-
-    third = scan_expired_reposts(now_ts=1_800_000_002, client_factory=lambda: _FakeClient())
-    assert third["evaluated_originals"] == 1
-    assert third["pending_originals"] == 0
+    assert second["evaluated_originals"] == 0
+    assert second["pending_originals"] == 0
 
 
 def test_existing_assessment_is_not_reevaluated(isolated_home, monkeypatch) -> None:

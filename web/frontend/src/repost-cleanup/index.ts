@@ -462,7 +462,7 @@ export function renderCandidates(): void {
       repostCandidateSummary.textContent = `已删除 tombstone ${deletedCandidates.length} 条；仅供查看，不提供再次删除。`;
     } else {
       repostCandidateSummary.textContent = pendingEvaluation > 0
-        ? `还有 ${pendingEvaluation} 条原动态待评估，可继续点击“一键智能评估”。`
+        ? `还有 ${pendingEvaluation} 条原动态待评估（下次评估任务将自动继续处理）。`
         : candidates.length
           ? `当前待处理 ${candidates.length} 条；候选默认不勾选，删除前服务端还会再次校验。`
           : "当前没有可展示的清理候选；请先同步并评估历史抽奖。";

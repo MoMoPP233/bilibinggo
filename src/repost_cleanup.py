@@ -66,9 +66,13 @@ DELETE_REPOST_URL = "https://api.bilibili.com/x/dynamic/feed/operate/remove"
 EXPIRY_BUFFER_SECONDS = 3 * 24 * 60 * 60
 ELIGIBLE_LOTTERY_TYPES = frozenset({"互动抽奖", "预约抽奖"})
 ELIGIBLE_BUSINESS_TYPES = {"互动抽奖": 1, "预约抽奖": 10}
-ASSESSMENT_BUDGET_PER_ROUND = 40
+ASSESSMENT_BATCH_SIZE = 120
+ASSESSMENT_MICRO_CHUNK_SIZE = 40
 MAX_IDENTITY_CHECKS_PER_ROUND = 20
-MAX_ASSESSMENTS_PER_JOB = 120
+# 兼容别名：120 只表示“每个业务批次大小”，不再是整个 Job 的总上限；
+# 40 只用于内部请求节流的参考粒度，不再决定 Job 何时结束。
+ASSESSMENT_BUDGET_PER_ROUND = ASSESSMENT_MICRO_CHUNK_SIZE
+MAX_ASSESSMENTS_PER_JOB = ASSESSMENT_BATCH_SIZE
 AUTO_ASSESSMENT_BUDGET = 20
 MANUAL_REVIEW_DEFER_SECONDS = 30 * 24 * 60 * 60
 CONSECUTIVE_FAILURE_LIMIT = 3
@@ -887,15 +891,62 @@ def scan_expired_reposts(
     now_ts: int | None = None,
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
     force_original_ids: object = None,
+    stale_check: Callable[[], object] | None = None,
 ) -> dict[str, Any]:
-    """一键智能评估：串行多批执行，单批 ≤40、单 Job ≤120；风控/取消立即整 Job 停止。"""
+    """一键智能评估（M4：连续批次）。
+
+    - Job 启动时冻结 scope_ids（当时全部可评估 original_dynamic_id）。
+    - 业务批次大小 ASSESSMENT_BATCH_SIZE=120：一批最多 120 条；一批结束后重新查库，
+      继续下一批，直到本次 frozen backlog 全部完成；全程同一个 Job / 同一次调用。
+    - attempted_this_job 在进入网络/LLM 评估前登记：同一 original_id 同一 Job 最多评估一次；
+      retryable_unknown 只允许未来 Job（满足 backoff 语义后）重新进入。
+    - 每批重新查询 assessment 状态；失败来源不伪装空结果。
+    - 停止条件：cancel / 平台风控 / Profile·DB·UID 不一致 / processed=0 /
+      made_progress=0（避免死循环与无限烧 LLM）。
+    - progress_total 固定为 len(scope_ids)；progress_step = 本 Job 已尝试唯一数，单调递增。
+    """
     current = int(now_ts if now_ts is not None else time.time())
     _check_cancel(cancel_check)
     forced = _normalize_force_originals(force_original_ids)
     breaker = _AssessmentBreaker()
+
+    def _semantic(record: object) -> tuple | None:
+        if record is None:
+            return None
+        row = _record_dict(record)
+        return (
+            row.get("assessment_status") or None,
+            row.get("assessment_level") or None,
+            row.get("reason_code") or None,
+            row.get("lottery_type") or None,
+            row.get("lottery_time"),
+            row.get("eligible_after"),
+            row.get("classification_source") or None,
+        )
+
+    def _after_semantic(assessment: CandidateAssessment) -> tuple:
+        return (
+            _assessment_status_for(assessment),
+            assessment.level,
+            assessment.reason_code or None,
+            assessment.lottery_type or None,
+            assessment.lottery_time,
+            assessment.eligible_after,
+            assessment.classification_source or None,
+        )
+
+    def _check_runtime(frozen_uid: str, frozen_profile: str, frozen_db: str) -> None:
+        if get_runtime_profile_id() != frozen_profile:
+            raise RuntimeError("运行期间 Profile 发生变化，已停止")
+        if str(db_path()) != frozen_db:
+            raise RuntimeError("运行期间数据库路径发生变化，已停止")
+        # UID 已在本 Job 开始由 _require_verified_login 冻结；Profile/DB 不变即身份不变。
+
     with client_factory() as client:
         _, uid_int = _require_verified_login(client)
         uid = str(uid_int)
+        frozen_profile = get_runtime_profile_id()
+        frozen_db = str(db_path())
         reposts = list_evaluable_reposts(uid)
         activities_map = {
             str(item.get("dynamic_id") or ""): item
@@ -939,29 +990,62 @@ def scan_expired_reposts(
                 except AssessmentRateLimited:
                     break
 
-        candidate_originals = {record.original_dynamic_id for record in reposts}
-        pending = _build_pending_queue(
-            candidate_originals=candidate_originals,
-            existing=existing,
-            activities_map=activities_map,
+        # 冻结本 Job scope：运行中新产生的记录不进入当前 Job。
+        scope_ids = {record.original_dynamic_id for record in reposts}
+        scope_ids.update(forced)
+        scope_ids = sorted(
+            scope_ids,
+            key=lambda original_id: (
+                0 if original_id in activities_map else 1,
+                original_id,
+            ),
         )
+        scope_total = len(scope_ids)
+        max_batches = max(1, (scope_total + ASSESSMENT_BATCH_SIZE - 1) // ASSESSMENT_BATCH_SIZE) if scope_total else 0
+        attempted_this_job: set[str] = set()
         evaluated = 0
-        total_pending = len(pending)
+        made_progress_total = 0
+        batches_done = 0
+        processed_total = 0
+        stop_reason = ""
         _progress(
             on_progress,
             0,
-            min(MAX_ASSESSMENTS_PER_JOB, max(1, total_pending)),
-            f"待评估原动态 {total_pending} 条，本任务预算 {MAX_ASSESSMENTS_PER_JOB} 条…",
+            max(1, scope_total),
+            f"待评估原动态 {scope_total} 条（已冻结，自动连续分批处理）",
         )
-        while pending and evaluated < MAX_ASSESSMENTS_PER_JOB and not breaker.stopped:
+
+        for batch_no in range(max_batches):
             _check_cancel(cancel_check)
-            batch = pending[:ASSESSMENT_BUDGET_PER_ROUND]
-            pending = pending[ASSESSMENT_BUDGET_PER_ROUND:]
-            batch_size = len(batch)
-            for index, original_id in enumerate(batch, 1):
-                if evaluated >= MAX_ASSESSMENTS_PER_JOB or breaker.stopped:
+            if breaker.stopped:
+                break
+            if stale_check is not None and stale_check() is True:
+                raise RuntimeError("任务已过期（调度换代），已停止")
+            _check_runtime(uid, frozen_profile, frozen_db)
+
+            # 每批开始：重新查库（assessment 状态以最新为准）
+            existing = list_repost_assessments(uid)
+            pending = [
+                original_id
+                for original_id in scope_ids
+                if original_id not in attempted_this_job
+                and (
+                    original_id not in existing
+                    or _record_dict(existing[original_id]).get("assessment_status") == "retryable_unknown"
+                )
+            ]
+            if not pending:
+                break  # 本次 scope 已完成
+            batch = pending[:ASSESSMENT_BATCH_SIZE]
+            processed_batch = 0
+            made_batch = 0
+            for original_id in batch:
+                if breaker.stopped:
                     break
                 _check_cancel(cancel_check)
+                # 关键：任何网络/LLM/_assess_original 之前登记，防止同 Job 重复评估。
+                attempted_this_job.add(original_id)
+                before = _semantic(existing.get(original_id))
                 try:
                     assessment = _assess_original(
                         client,
@@ -980,36 +1064,65 @@ def scan_expired_reposts(
                         "blocked", f"原动态状态无法可靠判断：{exc}",
                         "remote_unknown", classification_source="public_classifier",
                     )
+                except Exception as exc:  # noqa: BLE001 - 识别结构化风控，其余异常向上传播
+                    risk = _risk_code_from_message(exc)
+                    if risk is None:
+                        raise
+                    breaker.rate_limited = True
+                    breaker.stopped = True
+                    breaker.stop_message = (
+                        f"本任务命中平台风控（{risk}），"
+                        "已停止后续评估；已经完成的结果已保存。"
+                    )
+                    break
                 _persist_assessment(uid, original_id, assessment)
+                processed_batch += 1
+                processed_total += 1
                 evaluated += 1
                 breaker.note_success()
+                after = _after_semantic(assessment)
+                if after != before:
+                    made_batch += 1
+                    made_progress_total += 1
                 phase = "本地评估" if original_id in activities_map else "远程分类"
                 _progress(
                     on_progress,
-                    evaluated,
-                    min(MAX_ASSESSMENTS_PER_JOB, max(1, total_pending)),
-                    f"智能评估：本次完成 {evaluated}/{MAX_ASSESSMENTS_PER_JOB}（{phase}）",
+                    len(attempted_this_job),
+                    max(1, scope_total),
+                    f"第{batch_no + 1}批：{processed_batch}/{len(batch)} 累计{len(attempted_this_job)}/{scope_total}（{phase}）",
                     f"{original_id}：{assessment.level}",
                 )
+            batches_done += 1
             if breaker.stopped:
+                break
+            if processed_batch == 0:
+                stop_reason = "NO_PROCESSED_PROGRESS"
+                break
+            if made_batch == 0:
+                # 仍有 pending 但状态无任何语义进展：停止，避免同 Job 无限重试。
+                stop_reason = "NO_STATE_PROGRESS"
                 break
 
     refreshed = list_repost_assessments(uid)
-    remaining = len(
-        {
-            record.original_dynamic_id
-            for record in reposts
-            if record.original_dynamic_id not in refreshed
-            or getattr(refreshed[record.original_dynamic_id], "assessment_status", "final")
-            == "retryable_unknown"
-        }
+    remaining = sum(
+        1
+        for original_id in scope_ids
+        if original_id not in refreshed
+        or _record_dict(refreshed[original_id]).get("assessment_status") == "retryable_unknown"
     )
     if breaker.stop_message:
         message = breaker.stop_message
+    elif stop_reason == "NO_PROCESSED_PROGRESS":
+        message = "本轮无可处理记录，已停止。"
+    elif stop_reason == "NO_STATE_PROGRESS":
+        message = (
+            f"已完成 {evaluated} 条后无状态进展，为避免重复评估已停止；"
+            f"仍有 {remaining} 条待未来评估。"
+        )
     elif remaining:
-        message = f"本次完成 {evaluated} 条，仍有 {remaining} 条待评估，可继续点击一键智能评估。"
+        message = f"本次完成 {evaluated} 条，仍有 {remaining} 条待评估（可在后续任务中继续）。"
     else:
-        message = f"智能评估完成，本次共评估 {evaluated} 条原动态。"
+        message = f"智能评估完成，共处理 {evaluated} 条原动态（{batches_done} 批）。"
     return {
         "uid": uid,
         "history_total": len(reposts),
@@ -1017,8 +1130,14 @@ def scan_expired_reposts(
         "pending_originals": remaining,
         "budget": ASSESSMENT_BUDGET_PER_ROUND,
         "job_budget": MAX_ASSESSMENTS_PER_JOB,
+        "batch_size": ASSESSMENT_BATCH_SIZE,
+        "frozen_scope": len(scope_ids),
+        "batches_done": batches_done,
+        "attempted_this_job": len(attempted_this_job),
+        "made_progress": made_progress_total,
         "rate_limited": breaker.rate_limited,
         "stopped_early": breaker.stopped,
+        "stop_reason": stop_reason,
         "message": message,
         "candidates": load_persisted_candidates(uid),
     }

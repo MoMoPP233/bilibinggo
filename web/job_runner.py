@@ -476,7 +476,9 @@ class JobRunner:
             progress_step = self._status.progress_step
             progress_total = self._status.progress_total
             action_name = self._status.action
-            if progress_total:
+            if progress_total and state == "success":
+                # M4：只有真正完成全 scope 的 success 才补齐 total/total；
+                # cancel/error/risk/中断不得伪装成“已完成”。
                 progress_step = progress_total
 
         db_ok = False

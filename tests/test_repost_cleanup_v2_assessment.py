@@ -134,9 +134,8 @@ def test_non_lottery_is_excluded_not_blocked(isolated_home, monkeypatch) -> None
     assert summary["pending_evaluation"] == 0
 
 
-def test_assessment_uses_budget_and_is_incremental(isolated_home, monkeypatch) -> None:
-    monkeypatch.setattr("src.repost_cleanup.ASSESSMENT_BUDGET_PER_ROUND", 2)
-    monkeypatch.setattr("src.repost_cleanup.MAX_ASSESSMENTS_PER_JOB", 2)
+def test_assessment_continuous_batches_and_incremental(isolated_home, monkeypatch) -> None:
+    monkeypatch.setattr("src.repost_cleanup.ASSESSMENT_BATCH_SIZE", 2)
     upsert_repost_records(
         UID,
         [
@@ -157,12 +156,15 @@ def test_assessment_uses_budget_and_is_incremental(isolated_home, monkeypatch) -
         ),
     )
 
+    # 单次 Job 自动连续完成 frozen backlog（2 + 1 两个业务批），无需用户再次点击。
     first = scan_expired_reposts(now_ts=NOW_TS, client_factory=lambda: _FakeClient())
-    assert first["evaluated_originals"] == 2
-    assert first["pending_originals"] == 1
+    assert first["evaluated_originals"] == 3
+    assert first["batches_done"] == 2
+    assert first["pending_originals"] == 0
+    assert first["message"].startswith("智能评估完成")
 
     second = scan_expired_reposts(now_ts=NOW_TS + 1, client_factory=lambda: _FakeClient())
-    assert second["evaluated_originals"] == 1
+    assert second["evaluated_originals"] == 0
     assert second["pending_originals"] == 0
     assert second["message"].startswith("智能评估完成")
 
