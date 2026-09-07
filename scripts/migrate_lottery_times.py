@@ -26,6 +26,17 @@ def _count_bad_times(activities: list[dict]) -> int:
 
 
 def main() -> int:
+    # M5: writer CLI holds current Profile WriterLease before any Profile write;
+    # busy -> fail-closed exit code 2 before the first write.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:migrate_lottery_times"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     if not ENRICHED_OUTPUT_PATH.exists():
         print("未找到 enriched_latest.json")
         return 1

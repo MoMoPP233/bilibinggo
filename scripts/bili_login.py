@@ -13,6 +13,17 @@ from src.bilibili_login import BilibiliLoginError, COOKIE_PATH, login_with_qrcod
 
 
 def main() -> int:
+    # M5: writer CLI holds the current Profile WriterLease before any write/
+    # Bilibili mutation; fail-closed exit code 2 when busy.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:bili_login"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     try:
         cookie = login_with_qrcode()
     except BilibiliLoginError as exc:

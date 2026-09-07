@@ -37,6 +37,17 @@ def _lookup_lottery_type(dynamic_id: str) -> str:
 
 
 def main() -> int:
+    # M5: writer CLI holds the current Profile WriterLease before any write/
+    # Bilibili mutation; fail-closed exit code 2 when busy.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:participate"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")

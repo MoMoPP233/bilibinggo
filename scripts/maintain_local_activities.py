@@ -51,6 +51,17 @@ def _enrich_one(
 
 
 def main() -> int:
+    # M5: writer CLI holds the current Profile WriterLease before any write/
+    # Bilibili mutation; fail-closed exit code 2 when busy.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:maintain_activities"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     parser = argparse.ArgumentParser(description="治理本地活动库")
     parser.add_argument("--workers", type=int, default=4, help="详情补全并发数")
     parser.add_argument("--skip-enrich", action="store_true", help="仅删除，不补全详情")

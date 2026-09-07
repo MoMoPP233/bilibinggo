@@ -974,7 +974,51 @@ def _update_all_datasources(
     }
 
 
+# M5：写型 Job（会写 DB / Profile 状态 / Bilibili mutation）才需要 Profile WriterLease。
+# 只读性质的 Job 不在此集合中，不会被占用锁而失败。
+WRITER_LEASE_ACTIONS = frozenset({
+    "login",
+    "refresh_all",
+    "refresh_source",
+    "refresh_watch",
+    "refresh_status",
+    "update_all_datasources",
+    "following_feed_scan",
+    "participate",
+    "participate_triple",
+    "cleanup_auto_maintain",
+    "scan_expired_reposts",
+    "sync_repost_history",
+    "winner_deep_scan",
+})
+
+
 def run_action(
+    action: str,
+    params: dict[str, Any] | None = None,
+    *,
+    on_progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """写型 action 在统一入口外层持有 per-Profile WriterLease（只锁最外层一次）。"""
+    if action in WRITER_LEASE_ACTIONS:
+        from src.profile_writer_lease import ProfileWriterLeaseBusy, profile_writer_lease
+
+        try:
+            with profile_writer_lease(owner=f"job:{action}"):
+                return _run_action_impl(
+                    action,
+                    params,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                )
+        except ProfileWriterLeaseBusy as exc:
+            logger.warning("写型 Job 被占用 action=%s (%s)", action, exc)
+            raise RuntimeError("profile_writer_busy: 当前 Profile 正在被另一个写入任务使用，请稍后重试。") from exc
+    return _run_action_impl(action, params, on_progress=on_progress, cancel_event=cancel_event)
+
+
+def _run_action_impl(
     action: str,
     params: dict[str, Any] | None = None,
     *,

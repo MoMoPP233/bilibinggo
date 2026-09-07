@@ -40,6 +40,17 @@ def _confirm_nonempty() -> bool:
 
 
 def main() -> int:
+    # M5: writer CLI holds current Profile WriterLease before any Profile write;
+    # busy -> fail-closed exit code 2 before the first write.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:import_json_to_db"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     parser = argparse.ArgumentParser(description="导入旧 JSON 到 SQLite（零遗漏 + 归档）")
     parser.add_argument(
         "--force",

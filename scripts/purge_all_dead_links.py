@@ -17,6 +17,17 @@ from src.status_refresh import refresh_local_activity_statuses
 
 
 def main() -> int:
+    # M5: writer CLI holds current Profile WriterLease before any Profile write;
+    # busy -> fail-closed exit code 2 before the first write.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:purge_dead_links"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     dynamic_ids = collect_all_local_dynamic_ids()
     if not dynamic_ids:
         print(json.dumps({"ok": True, "message": "本地无活动链接", "total": 0}, ensure_ascii=False))

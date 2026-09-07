@@ -40,6 +40,17 @@ def list_all_enrichable_tasks() -> list[tuple[str, LotteryType]]:
 
 
 def main() -> int:
+    # M5: writer CLI holds current Profile WriterLease before any Profile write;
+    # busy -> fail-closed exit code 2 before the first write.
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease(
+        "cli:rebuild_activity_details"
+    ):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     tasks = list_all_enrichable_tasks()
     if not tasks:
         print(json.dumps({"ok": True, "message": "无可参与的活动", "total": 0}, ensure_ascii=False))
