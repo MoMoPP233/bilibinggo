@@ -602,6 +602,73 @@ def api_auto_delete_set(payload: AutoDeleteEnabledRequest) -> dict[str, Any]:
     return {"ok": True, "enabled": enabled}
 
 
+# ---------- M7: 扫码登录新账号（server-side onboarding） ----------
+
+
+class OnboardingCompleteRequest(BaseModel):
+    onboarding_id: str
+    nickname: str = ""
+
+
+@app.post("/api/accounts/onboarding/start", tags=["stable"])
+def api_onboarding_start() -> dict[str, Any]:
+    from src.login_onboarding import OnboardingError, onboarding_start_remote
+
+    try:
+        result = onboarding_start_remote()
+    except OnboardingError as exc:
+        raise AppError(ErrorCode.INTERNAL, str(exc)) from exc
+    return {"ok": True, "result": result}
+
+
+@app.get("/api/accounts/onboarding/{onboarding_id}/qr", tags=["stable"])
+def api_onboarding_qr(onboarding_id: str):
+    from src.login_onboarding import OnboardingError, onboarding_qr_image_path
+    from fastapi.responses import FileResponse
+
+    try:
+        path = onboarding_qr_image_path(onboarding_id)
+    except OnboardingError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
+    if path is None or not path.exists():
+        raise AppError(ErrorCode.NOT_FOUND, "二维码图片不可用")
+    return FileResponse(str(path), media_type="image/png")
+
+
+@app.get("/api/accounts/onboarding/{onboarding_id}/status", tags=["stable"])
+def api_onboarding_status(onboarding_id: str) -> dict[str, Any]:
+    from src.login_onboarding import OnboardingError, onboarding_status_public
+
+    try:
+        return {"ok": True, "result": onboarding_status_public(onboarding_id)}
+    except OnboardingError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
+
+
+@app.post("/api/accounts/onboarding/{onboarding_id}/poll", tags=["stable"])
+def api_onboarding_poll(onboarding_id: str) -> dict[str, Any]:
+    from src.login_onboarding import OnboardingError, onboarding_poll
+
+    try:
+        return {"ok": True, "result": onboarding_poll(onboarding_id)}
+    except OnboardingError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
+
+
+@app.post("/api/accounts/onboarding/complete", tags=["stable"])
+def api_onboarding_complete(payload: OnboardingCompleteRequest) -> dict[str, Any]:
+    from src.login_onboarding import OnboardingError, onboarding_complete
+
+    try:
+        result = onboarding_complete(payload.onboarding_id, nickname=payload.nickname)
+    except OnboardingError as exc:
+        code = ErrorCode.INTERNAL if exc.code in ("profile_created_not_activated", "session_expired") else ErrorCode.VALIDATION_ERROR
+        raise AppError(code, str(exc)) from exc
+    return {"ok": True, "result": result}
+
+
+
+
 # ---------- 中奖深检（M3） ----------
 
 

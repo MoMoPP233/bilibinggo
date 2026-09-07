@@ -265,6 +265,9 @@ async function deleteProfile(profileId: string): Promise<void> {
 }
 
 export function bindProfiles(): void {
+  onboardingStartBtn?.addEventListener("click", () => {
+    runOnboardingFlow().catch(() => undefined);
+  });
   profileCreate?.addEventListener("click", () => {
     createProfile().catch(() => undefined);
   });
@@ -276,4 +279,105 @@ export function bindProfiles(): void {
     if (activateId) activateProfile(activateId, target).catch(() => undefined);
     if (deleteId) deleteProfile(deleteId).catch(() => undefined);
   });
+}
+
+
+// ---------- M7：扫码登录新账号（server-side onboarding，不再要求先建空 Profile） ----------
+
+const onboardingStartBtn = document.getElementById("profile-onboarding-start") as HTMLButtonElement | null;
+
+function errorMessageOnboarding(error: unknown): string {
+  return String(error && typeof error === "object" && "message" in error ? (error as { message: string }).message : error);
+}
+
+async function sleepOnboarding(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+export async function runOnboardingFlow(): Promise<void> {
+  if (mutating) return;
+  mutating = true;
+  if (onboardingStartBtn) onboardingStartBtn.disabled = true;
+  let onboardingId = "";
+  try {
+    const started = await fetchJSON<{ onboarding_id: string; qr_url: string }>(
+      "/api/accounts/onboarding/start",
+      { method: "POST" },
+    );
+    onboardingId = started.onboarding_id;
+    showToast("请在浏览器中完成扫码", "info");
+    const modal = document.createElement("div");
+    modal.className = "onboarding-qr-modal";
+    modal.style.cssText =
+      "position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:99";
+    modal.innerHTML =
+      `<div class="panel" style="min-width:320px;text-align:center;padding:18px">
+         <h3 class="section-title">扫码登录新账号</h3>
+         <img id="onboarding-qr-img" alt="登录二维码" style="width:220px;height:220px;image-rendering:pixelated" />
+         <p class="caption" id="onboarding-status">等待扫码…</p>
+         <button type="button" class="btn btn-ghost btn-compact btn-pill" id="onboarding-close">取消</button>
+       </div>`;
+    document.body.appendChild(modal);
+    const img = modal.querySelector("#onboarding-qr-img") as HTMLImageElement | null;
+    if (img) img.src = `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/qr`;
+    const statusEl = modal.querySelector("#onboarding-status");
+    modal.querySelector("#onboarding-close")?.addEventListener("click", () => {
+      modal.remove();
+      if (onboardingStartBtn) onboardingStartBtn.disabled = false;
+      mutating = false;
+    });
+
+    // 轮询直到 scanned，再 complete；只使用 onboarding_id，绝不接触 Cookie/UID。
+    let result: { profile_id: string; created_new: boolean; reused_existing: boolean } | null = null;
+    let terminal = false;
+    for (let round = 0; round < 120 && !terminal; round += 1) {
+      await sleepOnboarding(2000);
+      if (!document.body.contains(modal)) break;
+      const poll = await fetchJSON<{ status: string; need_confirm?: boolean }>(
+        `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/poll`,
+        { method: "POST" },
+      );
+      if (poll.status === "scanned") {
+        if (statusEl) statusEl.textContent = "扫码成功，正在确认…";
+        const completed = await fetchJSON<{
+          profile_id: string;
+          created_new: boolean;
+          reused_existing: boolean;
+          display_name: string;
+          uid: string;
+          restart_required: boolean;
+        }>(`/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ onboarding_id: onboardingId }),
+        });
+        result = completed;
+        terminal = true;
+        if (statusEl) {
+          statusEl.textContent = completed.created_new
+            ? "账号登录成功，正在创建独立账号数据…正在切换账号并重启…"
+            : "该 B站账号已经存在，正在更新登录状态并切换…";
+        }
+      } else if (poll.status === "failed" || poll.status === "expired") {
+        terminal = true;
+        if (statusEl) statusEl.textContent = "登录失败或二维码已过期，请重试。";
+        modal.querySelector("#onboarding-qr-img")?.remove();
+      }
+    }
+    window.setTimeout(() => modal.remove(), 2500);
+    if (result) {
+      // 触发现有安全 restart（不热切）；重启后新 runtime 绑定目标 Profile。
+      await fetchJSON(`/api/profiles/${encodeURIComponent(result.profile_id)}/switch`, {
+        method: "POST",
+      }).catch(() => undefined);
+      showToast("账号已就绪，正在切换并重启…", "success");
+      await loadProfiles();
+      window.setTimeout(() => window.location.reload(), 3000);
+    }
+  } catch (error) {
+    showToast(errorMessageOnboarding(error), "error");
+  } finally {
+    mutating = false;
+    if (onboardingStartBtn) onboardingStartBtn.disabled = false;
+  }
 }

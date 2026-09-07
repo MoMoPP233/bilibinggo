@@ -189,3 +189,53 @@ def cli_profile_writer_lease(owner: str, *, profile_id: str | None = None) -> It
     except ProfileWriterLeaseBusy:
         print(WRITER_LOCK_BUSY_MESSAGE, file=sys.stderr)
         raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
+# M7：ProfileRegistryLease（极窄范围：分配 account-N / UID 查重 / 发布 / 更新
+# active pointer）。与 ProfileWriterLease 同一 OS 锁原语；位于 data root 的 shared 目录。
+# 锁顺序恒为 RegistryLease → ProfileWriterLease（反向从未出现，避免死锁）。
+# ---------------------------------------------------------------------------
+
+_REGISTRY_LOCK_NAME = "profile-registry.lock"
+_registry_guard = threading.Lock()
+_registry_active: dict[str, _ProfileWriterLease] = {}
+
+
+def registry_lock_path() -> Path:
+    from src.data_paths import get_data_root
+
+    return get_data_root() / "shared" / _REGISTRY_LOCK_NAME
+
+
+def _registry_key() -> str:
+    path = registry_lock_path()
+    return os.path.normcase(str(path.resolve(strict=False)))
+
+
+@contextmanager
+def profile_registry_lease(*, owner: str = "", wait_seconds: float = 0.0) -> Iterator[None]:
+    """Profile registry 短临界区：跨进程串行化 UID 查重与 profile 发布。"""
+    key = _registry_key()
+    deadline = time.monotonic() + max(0.0, float(wait_seconds or 0.0))
+    while True:
+        with _registry_guard:
+            active = _registry_active.get(key)
+            if active is not None and active.held:
+                raise ProfileWriterLeaseBusy("Profile registry 正在被其它进程使用")
+        lease = _ProfileWriterLease(registry_lock_path(), owner=owner)
+        if lease.acquire():
+            with _registry_guard:
+                _registry_active[key] = lease
+            try:
+                yield
+            finally:
+                with _registry_guard:
+                    if _registry_active.get(key) is lease:
+                        _registry_active.pop(key, None)
+                lease.release()
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    raise ProfileWriterLeaseBusy("Profile registry 正在被其它进程使用")
