@@ -25,6 +25,7 @@ DS_OUTPUTS = {
     "DS-5": DATA_DIR / "output" / "ds5_latest.json",
     "DS-6": DATA_DIR / "output" / "ds6_latest.json",
     "DS-7": DATA_DIR / "output" / "ds7_latest.json",
+    "DS-9": DATA_DIR / "output" / "ds9_topics.json",
     "WATCH": WATCH_OUTPUT_PATH,
 }
 SOURCE_LABELS = {
@@ -35,6 +36,7 @@ SOURCE_LABELS = {
     "DS-5": "互动抽奖娘",
     "DS-6": "糯米是个背包",
     "DS-7": "大锦鲤",
+    "DS-9": "话题发现",
     "WATCH": "监控用户",
 }
 SOURCE_SPACE_URLS = {

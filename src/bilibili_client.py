@@ -435,6 +435,40 @@ class BilibiliClient:
     def get_latest_article(self, mid: int) -> dict:
         return self.get_recent_articles(mid, limit=1)[0]
 
+    def get_topic_new(self, topic_id: str) -> dict:
+        """话题页最新动态（topic/new，一页）。
+
+        返回原始 JSON；业务 code 非 0 由调用方按结构化风控/普通错误区分。
+        风险码（-352/-509）与 HTTP 429 已在统一请求层禁止 retry。
+        """
+        return self.request_json(
+            "https://api.vc.bilibili.com/topic_svr/v1/topic_svr/topic_new",
+            params={"topic_id": str(topic_id)},
+            referer="https://t.bilibili.com/",
+            retries=1,
+        )
+
+    def get_topic_history(
+        self,
+        topic_id: str,
+        *,
+        offset_dynamic_id: str = "",
+        page_size: int = 20,
+    ) -> dict:
+        """话题历史动态页（topic/history）。"""
+        params: dict[str, object] = {
+            "topic_id": str(topic_id),
+            "page_size": page_size,
+        }
+        if offset_dynamic_id:
+            params["offset_dynamic_id"] = offset_dynamic_id
+        return self.request_json(
+            "https://api.vc.bilibili.com/topic_svr/v1/topic_svr/topic_history",
+            params=params,
+            referer="https://t.bilibili.com/",
+            retries=1,
+        )
+
     def get_recent_articles(self, mid: int, *, limit: int = 2) -> list[dict]:
         referer = f"https://space.bilibili.com/{mid}/upload/opus"
         data = self.get_json(

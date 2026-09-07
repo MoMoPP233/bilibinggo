@@ -308,7 +308,7 @@ export const REFRESH_ALL_PIPELINE_SUBSTEPS = 3;
 
 export const REFRESH_WATCH_PIPELINE_SUBSTEPS = 3;
 
-export const REFRESH_ALL_DS_COUNT = 6;
+export const REFRESH_ALL_DS_COUNT = 7;
 
 export const ACTION_LABELS = {
   like: "点赞",

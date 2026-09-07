@@ -1,0 +1,183 @@
+// @ts-nocheck
+/* eslint-disable */
+/** DS9 话题发现面板（数据源页内嵌区块，非一级页面）。 */
+
+import { fetchJSON } from "../api/client";
+import { startJob } from "../jobs/index";
+import { showToast } from "../shell/toast";
+import { escapeHtml } from "../utils/text";
+
+const PANEL_ID = "ds9-topic-panel";
+let bound = false;
+
+function timeText(value) {
+  if (!value) return "—";
+  const date = new Date(Number(value) * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function statusText(topics) {
+  const enabled = topics.filter((item) => item?.enabled);
+  if (enabled.some((item) => item?.last_error)) return "partial";
+  if (enabled.length === 0) return "paused";
+  if (enabled.every((item) => !item?.last_success_at && !item?.last_error)) return "idle";
+  return "ok";
+}
+
+const STATUS_LABELS = {
+  ok: "正常",
+  partial: "部分失败",
+  paused: "已暂停",
+  idle: "未运行",
+};
+
+function renderStatusPill(status) {
+  return `<span class="ds9-status-pill is-${escapeHtml(status)}">${STATUS_LABELS[status] || status}</span>`;
+}
+
+function topicRowHtml(topic) {
+  const kind = topic?.kind === "built-in" ? "内置" : "自定义";
+  const enabled = Boolean(topic?.enabled);
+  return `
+    <li class="ds9-topic-row" data-topic-id="${escapeHtml(String(topic?.topic_id || ""))}">
+      <div class="ds9-topic-main">
+        <strong>${escapeHtml(String(topic?.name || topic?.topic_id || ""))}</strong>
+        <span class="ds9-topic-id">${escapeHtml(String(topic?.topic_id || ""))}</span>
+        <span class="ds9-topic-kind is-${escapeHtml(kind)}">${kind}</span>
+      </div>
+      <div class="ds9-topic-meta">
+        <span class="caption">最近成功：${timeText(topic?.last_success_at)}</span>
+        <span class="caption">最近发现：${Number(topic?.last_found) || 0} 条</span>
+        ${topic?.last_error ? `<span class="caption is-error" title="${escapeHtml(String(topic.last_error))}">最近错误</span>` : ""}
+        <span class="caption">checkpoint：${topic?.fp ? "已推进" : "未运行"}</span>
+      </div>
+      <div class="ds9-topic-actions">
+        <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-toggle>${enabled ? "暂停" : "启用"}</button>
+        ${topic?.kind === "custom" ? `<button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-delete>删除</button>` : ""}
+      </div>
+    </li>`;
+}
+
+function render(state) {
+  const topics = Array.isArray(state?.topics) ? state.topics : [];
+  const summary = state?.summary || {};
+  const builtin = Number(summary.builtin_count) || topics.filter((t) => t?.kind === "built-in").length;
+  const custom = Number(summary.custom_count) || topics.filter((t) => t?.kind === "custom").length;
+  const latest = topics
+    .map((item) => item?.last_scan_at || 0)
+    .reduce((a, b) => Math.max(a, b), 0);
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel) return;
+  panel.querySelector("[data-ds9-status]").outerHTML = renderStatusPill(statusText(topics));
+  panel.querySelector("[data-ds9-builtin]").textContent = String(builtin);
+  panel.querySelector("[data-ds9-custom]").textContent = String(custom);
+  panel.querySelector("[data-ds9-last-scan]").textContent = timeText(latest || null);
+  panel.querySelector("[data-ds9-rows]").innerHTML = topics.map(topicRowHtml).join("");
+}
+
+async function refreshView() {
+  try {
+    const state = await fetchJSON("/api/ds9");
+    render(state);
+  } catch (error) {
+    showToast(String(error?.message || error), "error", "DS9 状态读取失败");
+  }
+}
+
+function handleTopicAction(event) {
+  const button = event.target.closest("[data-ds9-toggle], [data-ds9-delete]");
+  if (!button) return;
+  const row = button.closest("[data-topic-id]");
+  if (!row) return;
+  const topicId = row.dataset.topicId;
+  if (button.hasAttribute("data-ds9-delete")) {
+    if (!window.confirm(`删除自定义话题 ${topicId}？`)) return;
+    fetchJSON(`/api/ds9/topics/${encodeURIComponent(topicId)}`, { method: "DELETE" })
+      .then(() => refreshView())
+      .catch((error) => showToast(String(error?.message || error), "error"));
+    return;
+  }
+  const enabling = button.textContent === "启用";
+  fetchJSON(`/api/ds9/topics/${encodeURIComponent(topicId)}/enabled`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: enabling }),
+  })
+    .then(() => refreshView())
+    .catch((error) => showToast(String(error?.message || error), "error"));
+}
+
+function handleAddTopic(event) {
+  event.preventDefault();
+  const panel = document.getElementById(PANEL_ID);
+  const nameInput = panel?.querySelector("[data-ds9-name]");
+  const idInput = panel?.querySelector("[data-ds9-id]");
+  if (!idInput) return;
+  const name = String(nameInput?.value || "").trim();
+  const topicId = String(idInput.value || "").trim();
+  if (!topicId) {
+    showToast("请输入 topic_id 或话题链接", "info");
+    return;
+  }
+  fetchJSON("/api/ds9/topics", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, topic_id: topicId }),
+  })
+    .then(() => {
+      if (nameInput) nameInput.value = "";
+      idInput.value = "";
+      refreshView();
+    })
+    .catch((error) => showToast(String(error?.message || error), "error"));
+}
+
+function ensurePanel() {
+  const anchor = document.getElementById("watch-panel");
+  if (!anchor || document.getElementById(PANEL_ID)) return;
+  const panel = document.createElement("article");
+  panel.className = "panel ds9-panel";
+  panel.id = PANEL_ID;
+  panel.innerHTML = `
+    <div class="watch-panel-head">
+      <div class="watch-panel-intro">
+        <p class="eyebrow">数据源</p>
+        <h2 class="section-title">DS9 话题发现</h2>
+        <p class="section-desc">扫描 Bilibili 话题内动态，发现新抽奖候选并交给公共活动流水线。</p>
+      </div>
+      <div class="action-row">
+        <span data-ds9-status class="ds9-status-pill is-idle">未运行</span>
+        <button type="button" class="btn btn-primary btn-pill" data-ds9-refresh>刷新 DS9</button>
+      </div>
+    </div>
+    <div class="ds9-summary-row">
+      <span class="caption">默认话题：<b data-ds9-builtin>2</b></span>
+      <span class="caption">自定义话题：<b data-ds9-custom>0</b></span>
+      <span class="caption">最近扫描：<span data-ds9-last-scan>—</span></span>
+    </div>
+    <form class="ds9-add-form action-row" data-ds9-add>
+      <input class="form-control" data-ds9-name placeholder="话题名称（可选）" />
+      <input class="form-control" data-ds9-id placeholder="topic_id 或话题链接" required />
+      <button type="submit" class="btn btn-secondary btn-compact btn-pill">添加话题</button>
+    </form>
+    <ul class="ds9-topic-rows" data-ds9-rows></ul>
+  `;
+  anchor.insertAdjacentElement("afterend", panel);
+}
+
+export function bindDs9Panel() {
+  ensurePanel();
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel || bound) return;
+  bound = true;
+  panel.querySelector("[data-ds9-refresh]")?.addEventListener("click", () => {
+    startJob("refresh_source", { source_id: "DS-9" }).catch((error) => {
+      showToast(String(error?.message || error), "error");
+    });
+  });
+  panel.querySelector("[data-ds9-add]")?.addEventListener("submit", handleAddTopic);
+  panel.querySelector("[data-ds9-rows]")?.addEventListener("click", handleTopicAction);
+  refreshView().catch(() => {});
+}

@@ -10,11 +10,13 @@ def test_all_registries_include_latest_ds_and_watch() -> None:
     merge_ids = [source_id for source_id, _ in SOURCE_OUTPUTS]
     output_ids = sorted(DS_OUTPUTS.keys())
 
-    assert handler_ids == merge_ids[: len(handler_ids)]
+    assert handler_ids[:7] == [f"DS-{n}" for n in range(1, 8)]  # DS1..DS7 前缀顺序保持
     assert "DS-7" in handler_ids
+    assert "DS-9" in handler_ids  # M1：话题发现源进入统一数据源注册
     assert "WATCH" in merge_ids
     assert "WATCH" in output_ids
-    assert len(handler_ids) == 7
+    assert "DS-9" in output_ids
+    assert len(handler_ids) == 8
     assert len(merge_ids) == 8
 
 

@@ -8,6 +8,7 @@ from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -36,6 +37,7 @@ from src.restart_control import (
     RestartUnavailableError,
     restart_control,
 )
+from src.sources.ds9_topics import add_topic, list_topics, remove_topic, set_topic_enabled
 from src.user_settings import (
     DEFAULT_PARTICIPATE_FALLBACK_TEXT,
     DEFAULT_PARTICIPATE_TEXT,
@@ -264,6 +266,7 @@ def _selected_binding_or_none() -> str | None:
 def api_profiles() -> dict[str, Any]:
     runtime_profile_id = _runtime_binding_or_none()
     active_profile_id = _selected_binding_or_none()
+    active_profile_id = _selected_binding_or_none()
     return {
         "runtime_profile_id": runtime_profile_id,
         "active_profile_id": active_profile_id,
@@ -423,6 +426,61 @@ def api_summary() -> dict[str, Any]:
     payload = get_summary()
     payload["job"] = runner.get_status().to_dict()
     return payload
+
+
+@app.get("/api/ds9", tags=["stable"])
+def api_ds9_status() -> dict[str, Any]:
+    """DS9 话题发现：配置/状态视图（0 远程）。"""
+    topics = list_topics()
+    builtin = sum(1 for item in topics if item.get("kind") == "built-in")
+    custom = sum(1 for item in topics if item.get("kind") == "custom")
+    return {
+        "topics": topics,
+        "summary": {
+            "builtin_count": builtin,
+            "custom_count": custom,
+            "enabled_count": sum(1 for item in topics if item.get("enabled")),
+        },
+    }
+
+
+class Ds9TopicCreateRequest(BaseModel):
+    name: str = ""
+    topic_id: str
+
+
+class Ds9TopicEnabledRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/ds9/topics", tags=["stable"])
+def api_ds9_add_topic(payload: Ds9TopicCreateRequest) -> dict[str, Any]:
+    try:
+        topic = add_topic(payload.name, payload.topic_id)
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "topic": topic}
+
+
+@app.delete("/api/ds9/topics/{topic_id}", tags=["stable"])
+def api_ds9_remove_topic(topic_id: str) -> dict[str, bool]:
+    try:
+        remove_topic(topic_id)
+    except ValueError as exc:
+        message = str(exc)
+        code = ErrorCode.NOT_FOUND if "不存在" in message else ErrorCode.VALIDATION_ERROR
+        raise AppError(code, message) from exc
+    return {"ok": True}
+
+
+@app.put("/api/ds9/topics/{topic_id}/enabled", tags=["stable"])
+def api_ds9_set_topic_enabled(topic_id: str, payload: Ds9TopicEnabledRequest) -> dict[str, Any]:
+    try:
+        topic = set_topic_enabled(topic_id, payload.enabled)
+    except ValueError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
+    return {"ok": True, "topic": topic}
+
 
 
 @app.get("/api/activities", tags=["stable"])

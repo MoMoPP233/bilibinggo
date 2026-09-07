@@ -59,6 +59,17 @@ def commit_source_checkpoint(result: CheckResult) -> None:
         title=result.title or None,
         cv_id=result.cv_id,
     )
+    # DS9 等需要“per-目标”状态提交的源：公共流水线成功后由源的提交钩子落盘
+    # 自己的 per-topic checkpoint/fingerprint（先处理后提交）。
+    hook = getattr(result, "ds9_topic_commit", None)
+    if callable(hook):
+        try:
+            hook()
+        except Exception:
+            # 提交失败不能回滚流水线已成功的活动；下次扫描会因 fp 未推进而重试。
+            import logging
+
+            logging.getLogger("sources").exception("DS9 topic checkpoint 提交失败")
 
 
 def opus_link(opus_id: str) -> str:

@@ -27,6 +27,7 @@ from src.sources import (
     ds5_hudong,
     ds6_nuomi,
     ds7_dajinli,
+    ds9_topics,
 )
 from src.sources.common import CheckResult, commit_source_checkpoint, is_valid_dynamic_id
 from src.state_store import set_last_pipeline_persisted, set_watch_last_synced_at
@@ -183,6 +184,8 @@ DS_HANDLERS: list[tuple[str, Callable[..., Any], Callable[[Any], Any]]] = [
     ("DS-5", ds5_hudong.check_update, ds5_hudong.save_result),
     ("DS-6", ds6_nuomi.check_update, ds6_nuomi.save_result),
     ("DS-7", ds7_dajinli.check_update, ds7_dajinli.save_result),
+    # DS9 话题发现：故意没有 DS8；作为统一数据源参与 refresh_all / refresh_source。
+    ("DS-9", ds9_topics.check_update, ds9_topics.save_result),
 ]
 DS_HANDLER_BY_ID: dict[str, tuple[Callable[..., Any], Callable[[Any], Any]]] = {
     source_id: (check_update, save_result)
