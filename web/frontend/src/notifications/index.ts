@@ -31,11 +31,12 @@ const STATUS_LABELS = { sent: "已发送", failed: "失败", delivery_unknown: "
 const EVENT_LABELS = {
   winning_candidate: "疑似中奖候选（M3）",
   winning_confirmed: "中奖确认（M3）",
-  platform_risk: "平台风控",
-  auto_task_error: "自动任务失败",
-  auto_task_completed: "自动任务完成",
+  platform_risk: "平台风控（暂未接入）",
+  auto_task_error: "自动任务失败（暂未接入）",
+  auto_task_completed: "自动任务完成（暂未接入）",
   test: "测试",
 };
+const EVENT_PRODUCER_PENDING = new Set(["platform_risk", "auto_task_error", "auto_task_completed"]);
 
 function timeText(value) {
   if (!value) return "—";
@@ -100,7 +101,7 @@ function renderRoot(state) {
           .map(
             ([event, enabled]) => `
           <label class="ntf-toggle-row">
-            <input type="checkbox" data-ntf-event="${escapeHtml(event)}" ${enabled ? "checked" : ""} />
+            <input type="checkbox" data-ntf-event="${escapeHtml(event)}" ${enabled ? "checked" : ""} ${EVENT_PRODUCER_PENDING.has(event) ? "disabled" : ""} />
             <span>${escapeHtml(EVENT_LABELS[event] || event)}</span>
           </label>`
           )
