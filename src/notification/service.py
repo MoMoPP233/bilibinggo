@@ -26,7 +26,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -64,6 +64,14 @@ _OUTBOX_FILE = "notify_outbox.json"
 
 class NotificationConfigError(ValueError):
     """渠道配置缺失/非法。"""
+
+
+class NotificationLocalError(RuntimeError):
+    """本地投递记录（outbox claim / terminal）无法持久化的硬失败。
+
+    语义：候选已可靠落库但通知侧 durable state 未建立/未完成——
+    不允许发送 HTTP，或已发出的渠道结果无法安全落盘；Source checkpoint 不得推进。
+    """
 
 
 @dataclass(frozen=True)
@@ -330,19 +338,131 @@ def _existing_status(event_id: str, channel: str) -> str | None:
     return None
 
 
-def _append_record(event_id: str, channel: str, status: str, summary: str) -> None:
-    records = _load_outbox()
-    records = [r for r in records if not (r.get("event_id") == event_id and r.get("channel") == channel)]
-    records.append(
-        {
+def _mutate_outbox(mutator: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
+    """outbox read-modify-write：整段处于 per-path 共享锁内（与原子写同一把锁）。"""
+    with get_atomic_path_lock(_outbox_path()):
+        records = _load_outbox()
+        records = mutator(records)
+        _save_outbox(records)
+
+
+def _claim_records(
+    event_id: str, channels: list[str], *, event_type: str | None = None
+) -> None:
+    """HTTP 之前为“本次全部待发渠道”做一次原子 batch claim。
+
+    所有渠道的 dispatching 记录在同一个 per-path 共享锁内一次性写入并只落盘一次：
+    - 成功 → 全部 channel 都有 durable dispatching；
+    - 失败 → 抛 NotificationLocalError 且一个 dispatching 都不落盘（0 HTTP）。
+    绝不存在“Server酱 有、飞书 无”的半批 claim。
+    """
+
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kept = [
+            r
+            for r in records
+            if not (r.get("event_id") == event_id and r.get("channel") in channels)
+        ]
+        now = int(time.time())
+        for channel in channels:
+            record: dict[str, Any] = {
+                "event_id": event_id,
+                "channel": channel,
+                "status": "dispatching",
+                "summary": "",
+                "sent_at": now,
+            }
+            if event_type is not None:
+                record["event_type"] = event_type
+            kept.append(record)
+        return kept
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:  # noqa: BLE001 - 本地 IO 失败归为硬失败
+        raise NotificationLocalError("无法建立通知投递记录（batch claim 写入失败）") from exc
+
+
+def _resolve_stale_claim(event_id: str, channel: str) -> None:
+    """把遗留 dispatching claim 持久化为 delivery_unknown（fail-closed，绝不自动重发）。"""
+
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        changed = False
+        for record in records:
+            if record.get("event_id") == event_id and record.get("channel") == channel:
+                if record.get("status") == "dispatching":
+                    record["status"] = "delivery_unknown"
+                    record["summary"] = "结果未确认（进程中断），不再自动重试"
+                    changed = True
+        if changed:
+            return records
+        record: dict[str, Any] = {
+            "event_id": event_id,
+            "channel": channel,
+            "status": "delivery_unknown",
+            "summary": "结果未确认（进程中断），不再自动重试",
+            "sent_at": int(time.time()),
+        }
+        records.append(record)
+        return records
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:  # noqa: BLE001
+        raise NotificationLocalError("无法落盘 delivery_unknown（进程中断记录）") from exc
+
+
+def _finalize_record(event_id: str, channel: str, status: str, summary: str) -> None:
+    """HTTP 结果落盘（sent/failed/delivery_unknown）；失败时保留 dispatching claim。"""
+
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for record in records:
+            if record.get("event_id") == event_id and record.get("channel") == channel:
+                record["status"] = status
+                record["summary"] = summary
+                record["sent_at"] = int(time.time())
+                return records
+        records.append(
+            {
+                "event_id": event_id,
+                "channel": channel,
+                "status": status,
+                "summary": summary,
+                "sent_at": int(time.time()),
+            }
+        )
+        return records
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:  # noqa: BLE001 - 结果无法持久化：claim 保持 dispatching
+        raise NotificationLocalError("无法落盘通知投递结果") from exc
+
+
+def _append_record(
+    event_id: str, channel: str, status: str, summary: str, *, event_type: str | None = None
+) -> None:
+    # 兼容旧路径：直接写终态记录（无 claim 语义的调用方保留）。
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        records = [
+            r for r in records if not (r.get("event_id") == event_id and r.get("channel") == channel)
+        ]
+        record: dict[str, Any] = {
             "event_id": event_id,
             "channel": channel,
             "status": status,
             "summary": summary,
             "sent_at": int(time.time()),
         }
-    )
-    _save_outbox(records)
+        if event_type is not None:
+            record["event_type"] = event_type
+        records.append(record)
+        return records
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:  # noqa: BLE001
+        raise NotificationLocalError("无法写入通知投递记录") from exc
 
 
 def recent_records(limit: int = 30) -> list[dict[str, Any]]:
@@ -460,17 +580,30 @@ class NotificationService:
         *,
         channels: tuple[str, ...] | list[str] | None = None,
         force: bool = False,
+        event_type: str | None = None,
     ) -> dict[str, dict[str, str]]:
-        if event_id not in EVENT_IDS and not force:
-            raise NotificationConfigError(f"未知通知事件：{event_id}")
+        """event_id 是本次投递实例的唯一稳定标识（同一消息重复扫描得到相同 event_id）。
+
+        event_type 用于事件开关查询与注册校验：不传时退化为 event_id 本身
+        （M2 既有调用语义不变）；传入时 event_id 允许是实例级标识
+        （如 winning_candidate:mention:123），保证不同消息不同 event_id。
+        """
+        event_type = event_type or event_id
+        if event_type not in EVENT_IDS and not force:
+            raise NotificationConfigError(f"未知通知事件：{event_type}")
         config = _load_config()
-        if not config["events"].get(event_id, True):
+        if not config["events"].get(event_type, True):
             return {}
         results: dict[str, dict[str, str]] = {}
         targets = list(channels) if channels else [
             channel for channel in ALL_CHANNELS if config["channels"][channel]["enabled"]
         ]
         summary = body.strip()[:80] if body else title.strip()[:80]
+
+        # 阶段 0：梳理每个渠道的既有状态；终端态直接跳过，遗留 dispatching
+        # （进程在 HTTP 前后死亡留下的 claim）fail-closed 转 delivery_unknown。
+        terminal: dict[str, str] = {}
+        needs_claim: list[str] = []
         for channel in targets:
             entry = config["channels"][channel]
             if not entry.get("enabled"):
@@ -478,11 +611,30 @@ class NotificationService:
                 continue
             existing = _existing_status(event_id, channel)
             if existing in ("sent", "delivery_unknown", "failed"):
-                # sent/unknown 重启后绝不重发；failed 也不后台自动重试
+                terminal[channel] = existing
                 results[channel] = {"status": existing, "summary": "已存在投递记录，不重复发送"}
                 continue
+            if existing == "dispatching":
+                # 进程曾在发送前/中死亡：结果不可知 → delivery_unknown（fail-closed），0 自动重发。
+                _resolve_stale_claim(event_id, channel)
+                results[channel] = {
+                    "status": "delivery_unknown",
+                    "summary": "结果未确认（进程中断），不再自动重试",
+                }
+                terminal[channel] = "delivery_unknown"
+                continue
+            needs_claim.append(channel)
+
+        # 阶段 1：第一个 HTTP 之前，为全部待发渠道做单次原子 batch claim。
+        # 要么所有渠道都有 durable dispatching，要么一个都没有（失败抛硬错误，0 HTTP）。
+        if needs_claim:
+            _claim_records(event_id, needs_claim, event_type=event_type)
+
+        # 阶段 2：逐渠道发送并把结果落盘（每渠道一次；结果独立）。
+        for channel in needs_claim:
+            entry = config["channels"][channel]
             status = _provider_send(channel, entry, title, body)
-            _append_record(event_id, channel, status, summary)
+            _finalize_record(event_id, channel, status, summary)
             results[channel] = {"status": status, "summary": summary}
         return results
 

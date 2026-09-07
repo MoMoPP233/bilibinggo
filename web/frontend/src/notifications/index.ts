@@ -3,6 +3,7 @@
 /** 中奖通知页（M2：通知渠道 / 事件设置 / 测试通知 / 最近发送记录）。 */
 
 import { fetchJSON } from "../api/client";
+import { startJob } from "../jobs/index";
 import { showToast } from "../shell/toast";
 import { escapeHtml } from "../utils/text";
 
@@ -203,9 +204,71 @@ async function refreshView() {
   try {
     const state = await fetchJSON("/api/notifications");
     renderRoot(state);
+    let winner = null;
+    try {
+      winner = await fetchJSON("/api/winner-scan");
+    } catch {
+      winner = null;
+    }
+    if (winner) renderWinner(winner);
   } catch (error) {
     showToast(String(error?.message || error), "error", "通知状态读取失败");
   }
+}
+
+const SOURCE_LABELS_M3 = { mention: "@我的", reply: "回复我的", dm: "未读私信" };
+
+function renderWinner(state) {
+  const root = document.getElementById(ROOT_ID);
+  if (!root) return;
+  const sources = state?.sources || {};
+  const candidates = Array.isArray(state?.candidates) ? state.candidates : [];
+  const panel = document.createElement("article");
+  panel.className = "panel";
+  panel.id = "winner-scan-panel";
+  panel.innerHTML = `
+    <div class="watch-panel-head">
+      <div class="watch-panel-intro">
+        <p class="eyebrow">中奖深检（M3）</p>
+        <h2 class="section-title">疑似中奖记录</h2>
+        <p class="section-desc">只扫描 @我的 / 回复我的 / 未读私信；命中关键词仅标记「疑似中奖」，请人工确认。</p>
+      </div>
+      <button type="button" class="btn btn-primary btn-pill" id="winner-scan-run">立即执行深检</button>
+    </div>
+    <div class="ntf-event-list">
+      ${Object.entries(SOURCE_LABELS_M3)
+        .map(([key, label]) => {
+          const source = sources[key] || {};
+          const cursor = key === "dm" ? "—" : `${source.cursor_id || 0}`;
+          return `<span class="caption"><b>${label}</b> · ${source.last_error ? "最近错误" : source.last_success_at ? "正常" : "未运行"} · cursor ${cursor}</span>`;
+        })
+        .join("")}
+    </div>
+    <table class="ntf-records">
+      <thead><tr><th>时间</th><th>来源</th><th>发送者</th><th>摘要</th><th>状态</th></tr></thead>
+      <tbody>
+        ${candidates
+          .map(
+            (item) => `
+          <tr>
+            <td>${timeText(item.discovered_at)}</td>
+            <td>${escapeHtml(String(item.source_type || ""))}</td>
+            <td>${escapeHtml(String(item.sender?.name || item.sender?.id || ""))}</td>
+            <td>${escapeHtml(String(item.summary || ""))}</td>
+            <td>${escapeHtml(String(item.status || ""))}</td>
+          </tr>`
+          )
+          .join("") || '<tr><td colspan="5" class="caption">暂无疑似中奖线索</td></tr>'}
+      </tbody>
+    </table>`;
+  const previous = document.getElementById("winner-scan-panel");
+  if (previous) previous.remove();
+  root.appendChild(panel);
+  document.getElementById("winner-scan-run")?.addEventListener("click", () => {
+    startJob("winner_deep_scan", {}).catch((error) => {
+      showToast(String(error?.message || error), "error");
+    });
+  });
 }
 
 export function bindNotificationsPage() {

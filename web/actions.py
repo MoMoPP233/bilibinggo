@@ -1219,6 +1219,32 @@ def run_action(
             raise ValueError("一键更新全部数据源不接受额外参数")
         return _update_all_datasources(progress=progress, cancel_event=cancel_event)
 
+    if action == "winner_deep_scan":
+        # M3：中奖深检（@我 / 回复我 / 未读私信）。三类来源独立 checkpoint；
+        # 普通来源失败以 partial 呈现（不伪装空结果），平台风控沿现有风险通道上抛。
+        from src.winner_scan.service import service as winner_scan_service
+
+        if params:
+            raise ValueError("中奖深检不接受额外参数")
+        _raise_if_cancelled(cancel_event)
+        progress(step=0, total=4, message="正在读取 @我的 / 回复我的 / 未读私信…")
+        result = winner_scan_service.run(cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())))
+        _raise_if_cancelled(cancel_event)
+        sources = result.get("sources") or {}
+        found = sum(int(item.get("found") or 0) for item in sources.values())
+        failed = [name for name, item in sources.items() if item.get("status") != "success"]
+        if result.get("partial"):
+            message = f"深检完成（部分来源失败：{','.join(failed)}，本轮新增线索 {found} 条）"
+        else:
+            message = f"中奖深检完成：新增疑似中奖线索 {found} 条"
+        progress(step=4, total=4, message=message, log_append=message)
+        return {
+            "ok": True,
+            "message": message,
+            "result": result,
+            "log": sanitize_log(message),
+        }
+
     if action == "following_feed_scan":
         if params:
             raise ValueError("关注动态补漏不接受额外参数")

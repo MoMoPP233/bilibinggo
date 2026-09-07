@@ -554,6 +554,18 @@ def api_notifications_test(channel: str) -> dict[str, Any]:
     return {"ok": True, "result": result}
 
 
+# ---------- 中奖深检（M3） ----------
+
+
+@app.get("/api/winner-scan", tags=["stable"])
+def api_winner_scan_status() -> dict[str, Any]:
+    """M3：中奖深检状态视图（三来源 cursor 状态 + 疑似中奖线索；0 远程）。"""
+    from src.winner_scan.service import scan_status_view
+
+    return scan_status_view()
+
+
+
 
 
 @app.get("/api/activities", tags=["stable"])
