@@ -38,6 +38,15 @@ from src.restart_control import (
     restart_control,
 )
 from src.sources.ds9_topics import add_topic, list_topics, remove_topic, set_topic_enabled
+from src.notification.service import (
+    NotificationConfigError,
+    get_public_config,
+    recent_records,
+    save_channel_config,
+    service as notification_service,
+    set_channel_enabled,
+    set_event_enabled,
+)
 from src.user_settings import (
     DEFAULT_PARTICIPATE_FALLBACK_TEXT,
     DEFAULT_PARTICIPATE_TEXT,
@@ -480,6 +489,70 @@ def api_ds9_set_topic_enabled(topic_id: str, payload: Ds9TopicEnabledRequest) ->
     except ValueError as exc:
         raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
     return {"ok": True, "topic": topic}
+
+
+# ---------- 通知（M2：Server酱/钉钉/企微机器人/飞书） ----------
+
+
+class NotifyChannelConfigRequest(BaseModel):
+    sendkey: str | None = None
+    token: str | None = None
+    secret: str | None = None
+    key: str | None = None
+    webhook: str | None = None
+
+
+class NotifyEnabledRequest(BaseModel):
+    enabled: bool
+
+
+class NotifyEventEnabledRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/notifications", tags=["stable"])
+def api_notifications_status() -> dict[str, Any]:
+    config = get_public_config()
+    config["records"] = recent_records(30)
+    return config
+
+
+@app.post("/api/notifications/channels/{channel}/config", tags=["stable"])
+def api_notifications_save_channel(channel: str, payload: NotifyChannelConfigRequest) -> dict[str, Any]:
+    values = {key: value for key, value in payload.model_dump().items() if value is not None}
+    try:
+        view = save_channel_config(channel, values)
+    except NotificationConfigError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "channel": view}
+
+
+@app.post("/api/notifications/channels/{channel}/enabled", tags=["stable"])
+def api_notifications_set_enabled(channel: str, payload: NotifyEnabledRequest) -> dict[str, Any]:
+    try:
+        view = set_channel_enabled(channel, payload.enabled)
+    except NotificationConfigError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
+    return {"ok": True, "channel": view}
+
+
+@app.post("/api/notifications/events/{event}/enabled", tags=["stable"])
+def api_notifications_set_event(event: str, payload: NotifyEventEnabledRequest) -> dict[str, Any]:
+    try:
+        set_event_enabled(event, payload.enabled)
+    except NotificationConfigError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/notifications/channels/{channel}/test", tags=["stable"])
+def api_notifications_test(channel: str) -> dict[str, Any]:
+    try:
+        result = notification_service.send_test(channel)
+    except NotificationConfigError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "result": result}
+
 
 
 

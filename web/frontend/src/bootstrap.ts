@@ -22,6 +22,7 @@ import { bindProfiles, loadProfiles } from "./profiles/index";
 import { bindRepostCleanup } from "./repost-cleanup/index";
 import { bindUpdateAllDatasources } from "./sources/update-all";
 import { bindDs9Panel } from "./sources/ds9-panel";
+import { bindNotificationsPage } from "./notifications/index";
 
 /**
  * 单步隔离执行器：只阻断该步自身，不向后续初始化传播异常。
@@ -54,6 +55,7 @@ export async function init() {
   bindRepostCleanup();
   bindUpdateAllDatasources();
   bindDs9Panel();
+  bindNotificationsPage();
   bindOnboardingPanel();
   bindActionButtons();
   bindDiagnosticsExport();
