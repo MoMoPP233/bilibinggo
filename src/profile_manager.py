@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,8 @@ from src.data_paths import (
     initialize_data_layout,
     validate_profile_id,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -113,6 +117,15 @@ def list_profiles() -> list[dict[str, str]]:
 
 
 def create_profile() -> dict[str, str]:
+    # 分配 account-N 属于全局资源：RegistryLease 内串行化 Web create 与 M7
+    # onboarding publish（同一 OS 锁原语），避免两个进程同时分配同一 Profile ID。
+    from src.profile_writer_lease import profile_registry_lease
+
+    with profile_registry_lease(owner="profile:create"):
+        return _create_profile_locked()
+
+
+def _create_profile_locked() -> dict[str, str]:
     profiles_dir = get_profiles_dir()
     profiles_dir.mkdir(parents=True, exist_ok=True)
     existing = _profile_ids()
@@ -162,7 +175,39 @@ def delete_profile(profile_id: str) -> None:
     profile_dir = get_profile_dir(value)
     if not profile_dir.is_dir():
         raise ValueError(f"Profile 不存在：{value}")
-    shutil.rmtree(profile_dir)
+
+    # 目标 Profile 的跨进程 WriterLease：busy → 拒绝删除，绝不 rmtree 正在被写入的目录。
+    from src.profile_writer_lease import (
+        WRITER_LOCK_FILENAME,
+        ProfileWriterLeaseBusy,
+        profile_writer_lease,
+    )
+
+    profiles_dir = get_profiles_dir()
+    tombstone = profiles_dir / (
+        f".deleting-{value}-{os.getpid()}-{int(time.time() * 1000)}"
+    )
+    try:
+        # 锁文件（binggo.writer.lock）位于 Profile 目录内部，Windows 不能删除/重命名
+        # 含打开句柄的目录；因此持锁期间把除锁文件外的全部内容移动到隐藏 tombstone，
+        # 释放锁（锁文件句柄关闭）后删除锁文件与空目录，再删除 tombstone。
+        with profile_writer_lease(owner="profile:delete", profile_id=value):
+            tombstone.mkdir()
+            for child in profile_dir.iterdir():
+                if child.name == WRITER_LOCK_FILENAME:
+                    continue
+                os.rename(str(child), str(tombstone / child.name))
+    except ProfileWriterLeaseBusy as exc:
+        raise ValueError("该账号正在执行任务，请稍后再试。") from exc
+    try:
+        (profile_dir / WRITER_LOCK_FILENAME).unlink(missing_ok=True)
+        profile_dir.rmdir()
+        shutil.rmtree(tombstone)
+    except OSError as exc:  # noqa: BLE001 - 明确失败语义
+        _logger.error("删除 Profile %s：内容已移出但目录清理残留失败：%s", value, exc)
+        raise ValueError(
+            f"Profile {value} 已停用但残留清理失败，残留目录：{tombstone.name}，请手动检查。"
+        ) from exc
 
 
 def update_profile_metadata(

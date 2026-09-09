@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -27,6 +28,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+_logger = logging.getLogger("login_onboarding")
 
 from src.data_paths import (
     get_active_profile_path,
@@ -416,6 +419,12 @@ def onboarding_complete(onboarding_id: str, *, nickname: str = "") -> dict[str, 
         "result": dict(result),
     }
     _atomic_write_text(_session_path(onboarding_id), json.dumps(completed, ensure_ascii=False) + "\n")
+    # complete 成功：QR PNG 不再需要。尽力删除；失败只记录，不影响已成功结果，
+    # 残留会在下次 onboarding_start_remote 的 opportunistic sweep 中清理。
+    try:
+        _session_path(onboarding_id).with_suffix(".png").unlink(missing_ok=True)
+    except OSError:
+        _logger.warning("onboarding complete 后清理 QR PNG 失败：%s", onboarding_id)
     return dict(result)
 
 
@@ -437,6 +446,70 @@ def _cleanup_session_material(onboarding_id: str) -> None:
         _session_path(onboarding_id).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def onboarding_sweep_expired(now: int | None = None) -> list[str]:
+    """Opportunistic 清理过期 onboarding staging（同步、无 thread/timer）。
+
+    - waiting/scanned/committing（含 staged Cookie / qr_url / qr_key）：超过
+      SESSION_TTL_SECONDS 即删除（敏感凭据不留存）；同名 QR PNG 一并删除。
+    - completed/failed sanitized receipt（已无凭据）：保留 RECEIPT_TTL_SECONDS
+      供 duplicate complete 幂等，超龄后删除。
+    - 只清理 shared/onboarding 目录，绝不触碰任何 Profile。
+    返回被清理的 onboarding_id 列表。
+    """
+    now_ts = int(now if now is not None else time.time())
+    try:
+        directory = _onboarding_dir()
+        entries = sorted(directory.glob("*.json"))
+    except OSError:
+        return []
+    removed: list[str] = []
+    for path in entries:
+        onboarding_id = path.stem
+        session: dict[str, Any] = {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            session = raw if isinstance(raw, dict) else {}
+        except (OSError, ValueError):
+            # 无法解析：仅在文件本身已超龄时删除（避免误删正在写入的会话）
+            try:
+                too_old = now_ts - int(path.stat().st_mtime) > SESSION_TTL_SECONDS
+            except OSError:
+                continue
+            if not too_old:
+                continue
+        else:
+            base_ts = int(session.get("completed_at") or session.get("created_at") or 0)
+            if not base_ts:
+                continue
+            has_sensitive = bool(
+                session.get("cookie") or session.get("qr_url") or session.get("qr_key")
+            )
+            ttl = SESSION_TTL_SECONDS if has_sensitive else RECEIPT_TTL_SECONDS
+            if base_ts + ttl >= now_ts:
+                continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        try:
+            path.with_suffix(".png").unlink(missing_ok=True)
+        except OSError:
+            pass
+        removed.append(onboarding_id)
+    # 孤儿 QR PNG（对应 session 已不存在）：一并清理
+    try:
+        directory = _onboarding_dir()
+        for png in directory.glob("*.png"):
+            if not png.with_suffix(".json").exists():
+                try:
+                    png.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed
 
 
 def onboarding_status_public(onboarding_id: str) -> dict[str, Any]:
@@ -461,6 +534,7 @@ def onboarding_start_remote() -> dict[str, Any]:
     """真实流程：请求 Bilibili 二维码并创建未绑定 onboarding session。"""
     from src import bilibili_login as blogin
 
+    onboarding_sweep_expired()
     try:
         qr_url, qr_key = blogin.generate_qrcode()
     except blogin.BilibiliLoginError as exc:

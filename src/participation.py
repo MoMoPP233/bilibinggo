@@ -439,6 +439,7 @@ def _reserve_click(
         params={"csrf": csrf},
         referer=referer,
         raise_on_code=False,
+        retries=0,  # non-idempotent mutation：transport unknown → 绝不自动重发
     )
     code = _api_code(payload)
     if code == 0:

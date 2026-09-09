@@ -993,6 +993,7 @@ WRITER_LEASE_ACTIONS = frozenset({
     "sync_repost_history",
     "sync_assess_repost_history",
     "winner_deep_scan",
+    "delete_expired_reposts",
 })
 
 
