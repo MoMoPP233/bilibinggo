@@ -127,6 +127,17 @@ function countdownTargetUnix(status) {
   return cooldowns.length ? Math.min(...cooldowns) : nextTaskUnix(status);
 }
 
+// 是否值得运行 1s countdown tick：
+// - running（含 00:00 到期确认 fallback）恒为 true；
+// - idle/stopped 只在存在真实未来目标（risk resume_at / next_task）时 tick。
+function hasAutoCountdownTarget(status) {
+  if (String(status?.state || "") === "running") return true;
+  const targetUnix = countdownTargetUnix(status);
+  if (targetUnix == null) return false;
+  const seconds = getAutoCountdownSeconds(targetUnix);
+  return seconds !== null && seconds > 0;
+}
+
 function runningAutoTask(status) {
   return Object.values(status?.tasks || {}).find((task: any) => task?.status === "running") as any;
 }
@@ -297,22 +308,25 @@ export function renderAutoDock(status) {
     autoDockStopBtn.hidden = !running;
   }
 
-  if (running || state.autoDockOpen) {
-    if (state.sseHealthy) {
-      ensureAutoCountdown();
-      // SSE 健康时停 2s 轮询，倒计时仍本地跑
-      if (state.autoPollTimer) {
-        window.clearInterval(state.autoPollTimer);
-        state.autoPollTimer = null;
-      }
-    } else {
-      ensureAutoPolling();
-      ensureAutoCountdown();
+  // 统一 timer 决策：SSE 健康时停 2s REST 轮询；1s countdown 只在
+  // running（含 00:00 到期确认 fallback）或存在真实未来目标时运行；
+  // idle/stopped 且无目标 → 停止空转 tick。同一时刻至多一个 countdown timer。
+  if (state.sseHealthy) {
+    if (state.autoPollTimer) {
+      window.clearInterval(state.autoPollTimer);
+      state.autoPollTimer = null;
     }
-  } else if (!state.sseHealthy) {
-    stopAutoPolling();
+    if (running || hasAutoCountdownTarget(status)) {
+      ensureAutoCountdown();
+    } else {
+      stopAutoCountdownTimer();
+    }
   } else {
-    ensureAutoCountdown();
+    if (running || state.autoDockOpen) {
+      ensureAutoPolling(); // SSE 断开 + 需要展示时的 2s 只读 REST 兜底（内含 countdown 决策）
+    } else {
+      stopAutoPolling();
+    }
   }
   window.dispatchEvent(new CustomEvent("binggo:auto-status", { detail: status }));
 }
@@ -353,6 +367,13 @@ export function ensureAutoCountdown() {
   state.autoCountdownTimer = window.setInterval(tickAutoCountdown, 1000);
 }
 
+export function stopAutoCountdownTimer() {
+  if (state.autoCountdownTimer) {
+    window.clearInterval(state.autoCountdownTimer);
+    state.autoCountdownTimer = null;
+  }
+}
+
 export function ensureAutoPolling() {
   if (state.sseHealthy && state.eventSource) {
     ensureAutoCountdown();
@@ -364,7 +385,17 @@ export function ensureAutoPolling() {
       fetchAutoStatus().catch(() => {});
     }, 2000);
   }
-  ensureAutoCountdown();
+  if (autoCountdownNeeded()) {
+    ensureAutoCountdown();
+  } else {
+    stopAutoCountdownTimer();
+  }
+}
+
+function autoCountdownNeeded() {
+  const status = state.autoScheduler;
+  if (String(status?.state || "") === "running") return true;
+  return hasAutoCountdownTarget(status);
 }
 
 export function stopAutoPolling() {

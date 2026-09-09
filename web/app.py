@@ -113,6 +113,19 @@ def _startup_onboarding_sweep() -> None:
 
 _startup_onboarding_sweep()
 
+
+def _startup_notification_recovery() -> None:
+    """启动时把上一进程崩溃遗留的 dispatching 收敛为 delivery_unknown（0 HTTP/resend）。"""
+    try:
+        from src.notification.service import recover_stale_dispatches_on_startup
+
+        recover_stale_dispatches_on_startup()
+    except Exception:
+        logger.exception("通知 outbox 启动收敛失败（已忽略，不影响启动）")
+
+
+_startup_notification_recovery()
+
 WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = WEB_DIR / "static"
 DIST_DIR = STATIC_DIR / "dist"

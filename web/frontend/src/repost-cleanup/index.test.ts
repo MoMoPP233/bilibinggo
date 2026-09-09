@@ -719,3 +719,118 @@ describe("repost cleanup maintenance health", () => {
     expect(document.getElementById("repost-health-pill")?.getAttribute("data-tone")).toBe("warn");
   });
 });
+
+describe("auto-delete toggle confirmation order", () => {
+  beforeEach(() => {
+    // 该 describe 专用：完整 mock 复位 + 追加 auto-delete 面板节点以启用绑定路径
+    vi.resetModules();
+    fetchJSONMock.mockReset();
+    notifyJobStartErrorMock.mockReset();
+    openAppConfirmMock.mockReset();
+    requireSetupMock.mockReset();
+    showToastMock.mockReset();
+    startJobMock.mockReset();
+    trackCurrentJobMock.mockReset();
+    restoreAccountViewsFromSnapshotMock.mockReset();
+    loadAccountMock.mockReset();
+    requireSetupMock.mockReturnValue(true);
+    openAppConfirmMock.mockResolvedValue(true);
+    fetchJSONMock.mockResolvedValue({ ok: true });
+    trackCurrentJobMock.mockResolvedValue({ state: "running" });
+    restoreAccountViewsFromSnapshotMock.mockReturnValue(true);
+    loadAccountMock.mockResolvedValue({ logged_in: true, expired: false });
+    setupDom();
+    document.body.innerHTML += `
+      <input type="checkbox" id="auto-delete-toggle" />
+      <p id="auto-delete-hint"></p>`;
+  });
+
+  function putCalls() {
+    return fetchJSONMock.mock.calls.filter(
+      ([url, init]) => url === "/api/cleanup/auto-delete" && init?.method === "PUT"
+    );
+  }
+
+  async function boot(enabledBackend: boolean) {
+    // 状态化 mock：GET 反映 backendState；PUT 成功后 backendState 同步更新
+    let backendState = enabledBackend;
+    fetchJSONMock.mockImplementation(async (url: string, init?: any) => {
+      if (url === "/api/cleanup/auto-delete") {
+        if (init?.method === "PUT") {
+          const body = JSON.parse(String(init.body || "{}"));
+          backendState = Boolean(body.enabled);
+        }
+        return { ok: true, enabled: backendState, safe_candidates: 0, counts: { delete_pending: 0, unknown: 0 } };
+      }
+      if (url === "/api/repost-cleanup/health") {
+        return { status: "normal", maintenance: { enabled: backendState, interval_hours: 6 }, counts: {}, issues: [], issue_total: 0, checks: [] };
+      }
+      return { ok: true };
+    });
+    const module = await import("./index");
+    module.bindRepostCleanup();
+    const toggle = document.getElementById("auto-delete-toggle") as HTMLInputElement;
+    await vi.waitFor(() => expect(toggle.checked).toBe(backendState), { timeout: 3000 });
+    return toggle;
+  }
+
+  function flip(toggle: HTMLInputElement, to: boolean) {
+    toggle.checked = to;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  it("A cancelling the confirmation performs 0 PUT and keeps UI off", async () => {
+    openAppConfirmMock.mockResolvedValue(false);
+    const toggle = await boot(false);
+    flip(toggle, true);
+    await vi.waitFor(() => expect(openAppConfirmMock).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(putCalls()).toHaveLength(0);
+    expect(toggle.checked).toBe(false);
+  });
+
+  it("B confirming enables with exactly one PUT true", async () => {
+    openAppConfirmMock.mockResolvedValue(true);
+    const toggle = await boot(false);
+    flip(toggle, true);
+    await vi.waitFor(() => expect(putCalls().length).toBe(1), { timeout: 3000 });
+    expect(putCalls()[0][1].body).toBe(JSON.stringify({ enabled: true }));
+    await vi.waitFor(() => expect(toggle.checked).toBe(true), { timeout: 3000 });
+  });
+
+  it("C failed PUT never leaves a fake-on state", async () => {
+    openAppConfirmMock.mockResolvedValue(true);
+    fetchJSONMock.mockImplementation(async (url: string, init?: any) => {
+      if (url === "/api/cleanup/auto-delete" && init?.method === "PUT") {
+        throw new Error("server rejected");
+      }
+      return { ok: true };
+    });
+    const toggle = document.getElementById("auto-delete-toggle") as HTMLInputElement;
+    const module = await import("./index");
+    module.bindRepostCleanup();
+    await vi.waitFor(() => expect(toggle.checked).toBe(false));
+    flip(toggle, true);
+    await vi.waitFor(() => expect(showToastMock).toHaveBeenCalled());
+    await vi.waitFor(() => expect(toggle.checked).toBe(false), { timeout: 3000 });
+  });
+
+  it("D disabling sends PUT false without a confirmation", async () => {
+    openAppConfirmMock.mockResolvedValue(true);
+    const toggle = await boot(true);
+    openAppConfirmMock.mockClear();
+    flip(toggle, false);
+    await vi.waitFor(() => expect(putCalls().length).toBe(1), { timeout: 3000 });
+    expect(putCalls()[0][1].body).toBe(JSON.stringify({ enabled: false }));
+    expect(openAppConfirmMock).not.toHaveBeenCalled();
+  });
+
+  it("E reopening the page follows the backend state", async () => {
+    openAppConfirmMock.mockResolvedValue(false);
+    const toggle = await boot(true);
+    expect(toggle.checked).toBe(true);
+    flip(toggle, false);
+    await vi.waitFor(() => expect(putCalls().length).toBe(1), { timeout: 3000 });
+    await vi.waitFor(() => expect(toggle.checked).toBe(false), { timeout: 3000 });
+  });
+});

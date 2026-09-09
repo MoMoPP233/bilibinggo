@@ -89,3 +89,83 @@ describe("winner scheduler state", () => {
     expect(fetchJSONMock).toHaveBeenCalledTimes(before);
   });
 });
+
+describe("winner scan auto refresh on job terminal", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    fetchJSONMock.mockReset();
+    showToastMock.mockReset();
+    startJobMock.mockReset();
+    startJobMock.mockResolvedValue(undefined);
+    document.body.innerHTML = '<div id="notifications-root"></div>';
+  });
+
+  function winnerScanCalls() {
+    return fetchJSONMock.mock.calls.filter(([url]) => url === "/api/winner-scan").length;
+  }
+
+  async function setupPage() {
+    fetchJSONMock.mockImplementation(async (url: string) => {
+      if (url === "/api/notifications") return { channels: [], events: {}, records: [] };
+      if (url === "/api/winner-scan") return { sources: {}, candidates: [] };
+      if (url === "/api/auto/status") return { state: "running", tasks: { winner: { status: "completed" } } };
+      return {};
+    });
+    const module = await import("./index");
+    module.bindNotificationsPage();
+    await vi.waitFor(() => expect(document.getElementById("winner-scheduler-state")).not.toBeNull());
+    return module;
+  }
+
+  it("manual winner job terminal triggers a candidate refresh (one GET batch)", async () => {
+    await setupPage();
+    const before = winnerScanCalls();
+    window.dispatchEvent(new CustomEvent("binggo:job-completed", {
+      detail: { action: "winner_deep_scan", state: "completed" },
+    }));
+    await vi.waitFor(() => expect(winnerScanCalls()).toBe(before + 1));
+  });
+
+  it("same terminal event repeated does not cause unbounded refreshes", async () => {
+    await setupPage();
+    const before = winnerScanCalls();
+    for (let i = 0; i < 5; i += 1) {
+      window.dispatchEvent(new CustomEvent("binggo:job-completed", {
+        detail: { action: "winner_deep_scan", state: "completed" },
+      }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(winnerScanCalls()).toBeLessThanOrEqual(before + 1);
+  });
+
+  it("terminal of another job does not refresh winner candidates", async () => {
+    await setupPage();
+    const before = winnerScanCalls();
+    window.dispatchEvent(new CustomEvent("binggo:job-completed", {
+      detail: { action: "refresh_all", state: "completed" },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(winnerScanCalls()).toBe(before);
+  });
+
+  it("no periodic polling timer is created by the refresh listener", async () => {
+    await setupPage();
+    window.dispatchEvent(new CustomEvent("binggo:job-completed", {
+      detail: { action: "winner_deep_scan", state: "completed" },
+    }));
+    await vi.waitFor(() => expect(winnerScanCalls()).toBeGreaterThan(0));
+    const before = winnerScanCalls();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(winnerScanCalls()).toBe(before); // 只触发一次 GET，无 interval 持续刷新
+  });
+
+  it("hidden tab does not trigger refresh while panel hidden", async () => {
+    await setupPage();
+    const before = winnerScanCalls();
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(winnerScanCalls()).toBe(before);
+    Object.defineProperty(document, "hidden", { configurable: true, value: false });
+  });
+});

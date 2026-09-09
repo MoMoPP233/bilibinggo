@@ -29,7 +29,12 @@ const CHANNEL_FIELDS = {
   ],
 };
 
-const STATUS_LABELS = { sent: "已发送", failed: "失败", delivery_unknown: "结果未知" };
+const STATUS_LABELS = {
+  sent: "已发送",
+  failed: "失败",
+  delivery_unknown: "结果未知",
+  dispatching: "结果未知", // 崩溃遗留已在启动收敛为 delivery_unknown；在途显示亦不误导为“发送中”
+};
 const EVENT_LABELS = {
   winning_candidate: "疑似中奖候选（M3）",
   winning_confirmed: "中奖确认（M3）",
@@ -319,6 +324,17 @@ function renderWinner(state) {
   });
 }
 
+let lastWinnerRefreshAt = 0;
+
+// winner_deep_scan terminal 后 / 页面恢复可见时触发一次轻量刷新（2s 节流防重复）。
+// 复用一次 GET（/api/winner-scan + /api/auto/status），不新增任何 polling timer。
+function refreshWinnerState() {
+  const now = Date.now();
+  if (now - lastWinnerRefreshAt < 2000) return;
+  lastWinnerRefreshAt = now;
+  refreshView().catch(() => {});
+}
+
 export function bindNotificationsPage() {
   if (!document.getElementById(ROOT_ID)) return;
   if (bound) return;
@@ -329,5 +345,21 @@ export function bindNotificationsPage() {
   window.addEventListener("binggo:auto-tick", ((event: CustomEvent<any>) => {
     renderWinnerSchedulerTask(event.detail?.tasks?.winner || null, event.detail);
   }) as EventListener);
+  // 手动 / Scheduler 的 winner job terminal → 刷新候选列表；页面恢复可见 → 一次轻量刷新。
+  // 监听器只在 window 上注册一次（跨模块热载/重绑定不重复），避免同一事件触发多次 GET。
+  const globalWindow = window as unknown as { __binggoWinnerJobBound?: boolean };
+  if (!globalWindow.__binggoWinnerJobBound) {
+    globalWindow.__binggoWinnerJobBound = true;
+    window.addEventListener("binggo:job-completed", ((event: CustomEvent<any>) => {
+      if (String((event.detail || {}).action || "") === "winner_deep_scan") {
+        refreshWinnerState();
+      }
+    }) as EventListener);
+    document.addEventListener("visibilitychange", () => {
+      const panel = document.getElementById("winner-scan-panel");
+      if (document.hidden || !panel || panel.offsetParent === null) return;
+      refreshWinnerState();
+    });
+  }
   refreshView().catch(() => {});
 }

@@ -470,6 +470,32 @@ def recent_records(limit: int = 30) -> list[dict[str, Any]]:
     return records[-limit:][::-1]
 
 
+def recover_stale_dispatches_on_startup() -> int:
+    """进程启动时把上一进程崩溃遗留的 dispatching 安全转为 delivery_unknown。
+
+    前提：本进程刚启动、尚无任何在途 dispatch，outbox 中所有 dispatching 必然来自
+    已退出/崩溃的旧进程 → 0 HTTP、0 resend。返回被转换的记录条数。
+    """
+    if not any(record.get("status") == "dispatching" for record in _load_outbox()):
+        return 0
+    converted = 0
+
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        nonlocal converted
+        for record in records:
+            if record.get("status") == "dispatching":
+                record["status"] = "delivery_unknown"
+                record["summary"] = "结果未确认（进程中断），不再自动重试"
+                converted += 1
+        return records
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:  # noqa: BLE001
+        raise NotificationLocalError("无法落盘启动期 delivery_unknown 收敛") from exc
+    return converted
+
+
 # ---------------------------------------------------------------------------
 # 通知 HTTP（与 Bilibili HTTP 完全隔离）
 # ---------------------------------------------------------------------------

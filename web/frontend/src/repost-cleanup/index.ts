@@ -1412,30 +1412,40 @@ async function bindAutoCleanupPanel(): Promise<void> {
     }
   };
 
-  const toggle = document.getElementById("auto-delete-toggle");
+  const toggle = document.getElementById("auto-delete-toggle") as HTMLInputElement | null;
   toggle?.addEventListener("change", async (event) => {
     const enabled = Boolean((event.target as HTMLInputElement).checked);
+    // 开启前必须先确认；取消 → 0 PUT、0 backend mutation、UI 保持原状态
+    if (enabled) {
+      const confirmed = await openAppConfirm({
+        eyebrow: "自动删除",
+        title: "开启自动删除？",
+        desc: "开启后，后台只删除「明确评估为 safe 的过期抽奖转发」；删除不可恢复。",
+        bullets: [
+          "严格白名单：manual_review / blocked / excluded / deferred / unknown / delete_pending 永不自动删除",
+          "每条 DELETE 前都会再次复核 Profile、UID、动态与转发关系",
+          "遇风控或结果未知：自动停止整个任务并保持 0 DELETE barrier",
+        ],
+        confirmLabel: "确认开启自动删除",
+        cancelLabel: "取消",
+        danger: true,
+      });
+      if (!confirmed) {
+        toggle.checked = false; // 取消：0 PUT，UI 保持原状态
+        return;
+      }
+    }
     try {
       await fetchJSON("/api/cleanup/auto-delete", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled }),
       });
-      if (
-        enabled
-        && !window.confirm("确认开启自动安全清理？只会删除程序确认 safe 的过期转发。")
-      ) {
-        await fetchJSON("/api/cleanup/auto-delete", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: false }),
-        });
-      }
-      await refresh();
     } catch (error) {
-      showToast(String((error as { message?: string })?.message || error), "error");
-      await refresh();
+      toggle.checked = !enabled; // 失败立即回退视觉状态，不显示假开启
+      showToast(String((error as { message?: string })?.message || error), "error", "自动删除设置失败");
     }
+    await refresh(); // 无论成败都以后端真实状态为准（重新打开页面同理）
   });
 
   document.getElementById("auto-delete-run")?.addEventListener("click", () => {
