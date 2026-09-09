@@ -2688,6 +2688,31 @@ def cleanup_maintenance_cycle(
         _check_cancel(cancel_check)
         stage1 = _run_stage(lambda **kwargs: auto_maintain(assess=False, **kwargs), "同步与本地维护")
         _check_cancel(cancel_check)
+        # stage1 门控：auto_maintain 对风险/失败是"捕获→落盘暂停→优雅返回"，
+        # 必须读取其返回结果；未安全完成同步 → 0 assessment、0 DELETE。
+        stage1_blocked = bool(
+            stage1.get("rate_limited")
+            or stage1.get("stopped_early")
+            or stage1.get("stop_reason")
+            or stage1.get("synced") is not True
+        )
+        if stage1_blocked:
+            reason = "pre_maintenance_blocked"
+            skip_message = "前置维护未安全完成（风控/失败），本轮 0 assessment、0 DELETE。"
+            stage2 = {"skipped": True, "reason": reason, "message": skip_message}
+            stage3 = {"skipped": True, "reason": reason, "message": "前置维护未安全完成，自动删除未执行：0 DELETE。"}
+            phases.append({"stage": "连续智能评估", "result": stage2})
+            phases.append({"stage": "strict-safe 自动删除", "result": stage3})
+            _report(
+                len(steps),
+                "前置维护未安全完成，已跳过评估与自动删除",
+                str(stage1.get("message") or "stage1 未安全完成"),
+            )
+            return {
+                "ok": True,
+                "phases": phases,
+                "message": skip_message,
+            }
         stage2 = _run_stage(scan_expired_reposts, "连续智能评估")
         _check_cancel(cancel_check)
         # 进入删除的保守条件：评估无 risk/hard/partial 且 backlog 已全部收口

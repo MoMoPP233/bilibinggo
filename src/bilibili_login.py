@@ -229,6 +229,60 @@ def _sync_profile_mid(cookies: dict[str, str]) -> None:
         logger.warning("登录成功，但写入 Profile MID 失败", exc_info=True)
 
 
+def _uid_from_login_cookies(cookies: dict[str, str]) -> str:
+    return str(cookies.get("DedeUserID") or "").strip()
+
+
+def _bound_uid_of_current_profile() -> str:
+    try:
+        from src.data_paths import get_runtime_profile_id
+        from src.profile_manager import get_profile_metadata
+
+        metadata = get_profile_metadata(get_runtime_profile_id())
+    except (OSError, ValueError, RuntimeError):
+        return ""
+    return str(metadata.get("mid") or "").strip()
+
+
+def _other_profile_for_uid(uid: str) -> str | None:
+    try:
+        from src.profile_manager import list_profiles
+
+        for metadata in list_profiles():
+            if str(metadata.get("mid") or "").strip() == uid:
+                return str(metadata.get("profile_id") or "")
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return None
+
+
+def verify_login_uid_for_current_profile(cookies: dict[str, str]) -> str:
+    """扫码成功后、任何持久化之前校验身份，禁止把当前 Profile 换成其它 UID。
+
+    - 当前 Profile 未绑定 UID（全新）：允许本次登录完成首次绑定。
+    - 已绑定：扫码 UID 必须一致，否则拒绝；该 UID 已属其它 Profile 同样拒绝。
+    """
+    scanned_uid = _uid_from_login_cookies(cookies)
+    bound_uid = _bound_uid_of_current_profile()
+    if not bound_uid:
+        return scanned_uid
+    if not scanned_uid:
+        raise BilibiliLoginError(
+            "无法从扫码结果获取账号 UID，为防止身份漂移已取消登录，请重试。"
+        )
+    if scanned_uid == bound_uid:
+        return scanned_uid
+    other = _other_profile_for_uid(scanned_uid)
+    if other:
+        raise BilibiliLoginError(
+            f"该扫码账号（UID {scanned_uid}）已绑定其它 Profile（{other}），"
+            "请勿在当前 Profile 重复登录。"
+        )
+    raise BilibiliLoginError(
+        "扫码账号与当前 Profile 不一致，请使用「扫码登录新账号」添加该账号。"
+    )
+
+
 def _request_json(
     client: httpx.Client,
     url: str,
@@ -394,6 +448,7 @@ def login_with_qrcode(
                 cookies = _collect_login_cookies(client, poll, body)
                 if "SESSDATA" not in cookies or "bili_jct" not in cookies:
                     raise BilibiliLoginError("登录未完成，请重新扫码")
+                verify_login_uid_for_current_profile(cookies)
                 essential = {k: v for k, v in cookies.items() if k in ESSENTIAL_KEYS}
                 cookie_str = cookies_to_header(essential or cookies)
                 save_cookies(cookie_str)

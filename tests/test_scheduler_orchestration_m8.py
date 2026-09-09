@@ -180,7 +180,8 @@ def test_cycle_calls_auto_maintain_without_assessment_then_single_scan() -> None
     def fake_maintain(**kwargs):
         calls["maintain"] += 1
         assert kwargs.get("assess") is False
-        return {"synced": False, "evaluated_originals": 0}
+        # 与生产 auto_maintain 正常返回 contract 一致：synced=True 才表示安全完成
+        return {"synced": True, "rate_limited": False, "evaluated_originals": 0}
 
     def fake_scan(**kwargs):
         calls["scan"] += 1
@@ -225,3 +226,100 @@ def test_cycle_pre_maintenance_risk_blocks_assessment_and_delete() -> None:
         except RuntimeError as exc:
             assert "API error -352" in str(exc)
     assert calls == {"scan": 0, "delete": 0}
+
+
+def test_cycle_stage1_rate_limited_return_blocks_scan_and_delete() -> None:
+    """真实语义：auto_maintain 命中风控时不抛异常，而是落盘暂停后返回 rate_limited。"""
+    import unittest.mock as um
+
+    import src.repost_cleanup as rc
+
+    calls = {"scan": 0, "delete": 0}
+
+    def rate_limited_maintain(**kwargs):
+        return {
+            "uid": "1",
+            "synced": False,
+            "evaluated_originals": 0,
+            "rate_limited": True,
+            "message": "自动维护因平台限制已暂停，请稍后手动恢复。",
+        }
+
+    def fake_scan(**kwargs):
+        calls["scan"] += 1
+        return {}
+
+    def fake_delete(**kwargs):
+        calls["delete"] += 1
+        return {}
+
+    with um.patch.object(rc, "auto_maintain", rate_limited_maintain), um.patch.object(
+        rc, "scan_expired_reposts", fake_scan
+    ), um.patch.object(rc, "auto_cleanup_delete", fake_delete):
+        result = rc.cleanup_maintenance_cycle()
+    assert calls == {"scan": 0, "delete": 0}
+    assert result["ok"] is True
+    assert any(
+        phase.get("stage") == "连续智能评估" and phase.get("result", {}).get("skipped")
+        for phase in result["phases"]
+    )
+
+
+@pytest.mark.parametrize(
+    "stage1_result",
+    [
+        {"synced": False, "rate_limited": False, "stopped_early": True, "message": "stopped"},
+        {"synced": False, "rate_limited": False, "stop_reason": "hard_error", "message": "hard"},
+        {"synced": False, "rate_limited": False, "message": "自动维护同步失败"},
+    ],
+)
+def test_cycle_stage1_stopped_or_failure_blocks_scan_and_delete(stage1_result) -> None:
+    import unittest.mock as um
+
+    import src.repost_cleanup as rc
+
+    calls = {"scan": 0, "delete": 0}
+
+    def stopped_maintain(**kwargs):
+        return stage1_result
+
+    def fake_scan(**kwargs):
+        calls["scan"] += 1
+        return {}
+
+    def fake_delete(**kwargs):
+        calls["delete"] += 1
+        return {}
+
+    with um.patch.object(rc, "auto_maintain", stopped_maintain), um.patch.object(
+        rc, "scan_expired_reposts", fake_scan
+    ), um.patch.object(rc, "auto_cleanup_delete", fake_delete):
+        result = rc.cleanup_maintenance_cycle()
+    assert calls == {"scan": 0, "delete": 0}
+    assert result["ok"] is True
+
+
+def test_cycle_stage2_risk_blocks_delete() -> None:
+    import unittest.mock as um
+
+    import src.repost_cleanup as rc
+
+    calls = {"scan": 0, "delete": 0}
+
+    def safe_maintain(**kwargs):
+        return {"synced": True, "rate_limited": False}
+
+    def risky_scan(**kwargs):
+        calls["scan"] += 1
+        return {"rate_limited": True, "stopped_early": True, "stop_reason": "", "pending_originals": 0}
+
+    def fake_delete(**kwargs):
+        calls["delete"] += 1
+        return {}
+
+    with um.patch.object(rc, "auto_maintain", safe_maintain), um.patch.object(
+        rc, "scan_expired_reposts", risky_scan
+    ), um.patch.object(rc, "auto_cleanup_delete", fake_delete):
+        result = rc.cleanup_maintenance_cycle()
+    assert calls == {"scan": 1, "delete": 0}
+    assert result["ok"] is True
