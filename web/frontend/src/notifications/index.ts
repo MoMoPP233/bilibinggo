@@ -32,8 +32,8 @@ const CHANNEL_FIELDS = {
 const STATUS_LABELS = {
   sent: "已发送",
   failed: "失败",
-  delivery_unknown: "结果未知",
-  dispatching: "结果未知", // 崩溃遗留已在启动收敛为 delivery_unknown；在途显示亦不误导为“发送中”
+  delivery_unknown: "结果未知", // 崩溃遗留/超时等无法确认 → 绝不自动重发
+  dispatching: "发送中", // 当前进程真实在途发送（短暂）
 };
 const EVENT_LABELS = {
   winning_candidate: "疑似中奖候选（M3）",
@@ -53,7 +53,7 @@ function timeText(value) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function statusBadge(status) {
+export function statusBadge(status) {
   return `<span class="ntf-status is-${escapeHtml(status)}">${STATUS_LABELS[status] || escapeHtml(status)}</span>`;
 }
 

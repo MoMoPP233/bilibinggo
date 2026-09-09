@@ -2320,7 +2320,7 @@ def auto_cleanup_delete(
     - 启动或每批存在 delete_pending/unknown → 0 DELETE（barrier）；
     - 只有 final+safe+开奖时间可靠+eligible_after<=now 且无 defer 的候选可处理；
     - 每条 DELETE 前重新验证 strict-safe + 身份 + safe 复核 + participation_guard；
-    - claim_delete_pending 成功后才允许发送 DELETE（claim 失败 → 整 Job 停止，0 DELETE）；
+    - claim_delete_pending 成功后才发出 DELETE；claim 失败只跳过该条并记录（该条 0 DELETE），批间 barrier 兜底；绝不无 claim 发 DELETE。
     - DELETE retries=0；transport/响应不可确认 → unknown durable + 整 Job 立即停止；
     - 明确业务拒绝 → delete_failed durable + 整 Job 停止；
     - 平台成功且本地 deleted durable 才计 deleted_success，然后才下一条；

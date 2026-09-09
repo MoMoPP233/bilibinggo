@@ -33,6 +33,7 @@ from src.lottery_classifier import (
     migrate_stored_charging_lotteries,
 )
 from src.participation_store import ParticipationRecord, load_participations
+from src.platform_risk import risk_code_of
 from src.lottery_time import migrate_stored_lottery_times
 from src.sources.common import load_previous_output
 from src.state_store import DATA_DIR
@@ -219,6 +220,9 @@ def _enrich_one(
         except DynamicDeletedError:
             raise
         except Exception as exc:
+            # 明确结构化平台风控（-352/-509/HTTP 429）：立即停止，0 后续 retry
+            if risk_code_of(exc) is not None:
+                raise
             last_error = exc
             if attempt < ENRICH_RETRY_ATTEMPTS - 1:
                 time.sleep(1.2 * (attempt + 1))

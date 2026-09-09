@@ -172,13 +172,23 @@ def scan_status_view() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _source_entry_key(source_type: str, entry: MessageEntry) -> str:
+def _source_entry_key(source_type: str, entry: MessageEntry) -> str | None:
+    """构造候选/事件去重键；缺少真实稳定平台 ID 时返回 None（fail-closed，避免空 key 碰撞）。
+
+    稳定字段缺失时绝不回退到时间/随机/索引——那会让同一条消息在不同扫描生成
+    不同 key 并造成重复通知。缺失项由调用方记录 malformed 并跳过（不影响其它项）。
+    """
     if source_type == "dm":
         talker_id = int(entry.talker_id or 0)
         raw = entry.raw or {}
-        seqno = str(raw.get("msg_seqno") or entry.id or "0")
+        seqno = str(raw.get("msg_seqno") or "").strip() or str(entry.id or "").strip()
+        if talker_id <= 0 or not seqno or seqno == "0":
+            return None
         return f"dm:{talker_id}:{seqno}"
-    return f"{source_type}:{entry.id}"
+    item_id = str(entry.id or "").strip()
+    if not item_id or item_id == "0":
+        return None
+    return f"{source_type}:{item_id}"
 
 
 def _source_url(entry: MessageEntry) -> str:
@@ -223,6 +233,9 @@ class WinnerScanService:
             if not judge_keywords(text):
                 continue
             key = _source_entry_key(source_type, entry)
+            if key is None:
+                self._record_malformed(state, source_type, entry)
+                continue
             existing_record = existing.get(key)
             if existing_record is not None:
                 continue
@@ -242,6 +255,22 @@ class WinnerScanService:
             newly_saved += 1
             found_keys.append(key)
         return newly_saved, found_keys
+
+    def _record_malformed(self, state: dict[str, Any], source_type: str, entry: MessageEntry) -> None:
+        """命中关键词但缺少稳定平台 ID 的条目：记录本地 skip 原因（有界），不建 candidate。
+
+        该条目无法被稳定引用，本轮跳过；不影响同批其它成功项，也不推进任何错误状态。
+        """
+        skipped = state.setdefault("malformed_skipped", [])
+        skipped.append(
+            {
+                "ts": int(time.time()),
+                "source_type": source_type,
+                "reason": "条目缺少稳定平台 ID，已跳过（避免空 key 碰撞 / 随机 key 重复通知）",
+                "summary": str(entry.text or entry.title or "")[:80],
+            }
+        )
+        state["malformed_skipped"] = skipped[-20:]
 
     def _scan_dm_source(
         self,
@@ -269,6 +298,9 @@ class WinnerScanService:
                 if not judge_keywords(text):
                     continue
                 key = _source_entry_key("dm", entry)
+                if key is None:
+                    self._record_malformed(state, "dm", entry)
+                    continue
                 if existing.get(key) is not None:
                     continue
                 event_id = f"winning_candidate:{key}"
