@@ -4,7 +4,9 @@ from __future__ import annotations
 
 REFRESH_HOURS = frozenset({0, 3, 6, 9, 12, 15, 18, 21})
 TRIPLE_MINUTES = frozenset(range(5, 60, 5))
-CLEANUP_MAINTAIN_INTERVAL_HOURS = 2
+# 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（h%6==2 的 :05，
+# 即 02:05/08:05/14:05/20:05，约每 6 小时一次）。切勿用作调度驱动值。
+CLEANUP_MAINTAIN_INTERVAL_HOURS = 6
 
 ALLOWED_CLICK_ACTIONS = frozenset(
     {

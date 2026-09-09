@@ -33,6 +33,13 @@ def video_url(bvid: str) -> str:
 
 
 def main() -> None:
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease("cli:rollback_ds_containers"):
+        _main_impl()
+
+
+def _main_impl() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     with BilibiliClient() as client:
         for source_id, cfg in SOURCES.items():

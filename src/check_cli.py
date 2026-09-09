@@ -18,6 +18,29 @@ def run_check(
     save_result: Callable[[CheckResult], Path | None],
     output_path: Path,
 ) -> int:
+    """CLI 最外层 writer：整个 workflow 持一把 ProfileWriterLease（busy → 退出码 2）。"""
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease("cli:check_ds"):
+        return _run_check_impl(
+            description=description,
+            force_help=force_help,
+            no_update_label=no_update_label,
+            check_update=check_update,
+            save_result=save_result,
+            output_path=output_path,
+        )
+
+
+def _run_check_impl(
+    *,
+    description: str,
+    force_help: str,
+    no_update_label: str,
+    check_update: Callable[..., CheckResult],
+    save_result: Callable[[CheckResult], Path | None],
+    output_path: Path,
+) -> int:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--force", action="store_true", help=force_help)
     args = parser.parse_args()

@@ -40,7 +40,7 @@ from src.data_paths import (
     get_profiles_dir,
     read_active_profile_pointer_state,
 )
-from src.profile_manager import get_profile_metadata
+from src.profile_manager import get_profile_metadata, sweep_stale_creating_profiles
 from src.profile_writer_lease import (
     ProfileWriterLeaseBusy,
     profile_registry_lease,
@@ -191,6 +191,7 @@ def _update_active_pointer(profile_id: str) -> None:
 def _publish_new_profile(*, uid: str, nickname: str, cookie_str: str, attempt_id: str) -> str:
     profiles_dir = get_profiles_dir()
     profiles_dir.mkdir(parents=True, exist_ok=True)
+    sweep_stale_creating_profiles()
     number = _next_account_number()
     profile_id = f"account-{number}"
     staging = profiles_dir / f".creating-{profile_id}-{attempt_id}"

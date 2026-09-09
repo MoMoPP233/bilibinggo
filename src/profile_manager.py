@@ -26,6 +26,40 @@ from src.data_paths import (
 
 _logger = logging.getLogger(__name__)
 
+# .creating-* 孤儿安全 TTL：正常创建流程只需数秒，1 小时可防时钟偏差误删
+CREATING_ORPHAN_TTL_SECONDS = 3600
+
+
+def sweep_stale_creating_profiles(now: int | None = None) -> list[str]:
+    """Opportunistic 清理崩溃遗留的 .creating-* 孤儿（无 thread/timer）。
+
+    - 必须在 ProfileRegistryLease 保护下调用（create_profile / onboarding publish
+      已持锁），与正在进行的创建流程天然互斥。
+    - 只删除 mtime 超过 CREATING_ORPHAN_TTL_SECONDS 的目录；新鲜/正在创建的绝不删。
+    - 单目录清理失败：记录并保留，不影响其它 Profile（fail-safe）。
+    """
+    now_ts = int(now if now is not None else time.time())
+    removed: list[str] = []
+    profiles_dir = get_profiles_dir()
+    if not profiles_dir.is_dir():
+        return removed
+    for directory in profiles_dir.iterdir():
+        if not directory.name.startswith(".creating-"):
+            continue
+        try:
+            mtime = int(directory.stat().st_mtime)
+        except OSError:
+            continue
+        if now_ts - mtime <= CREATING_ORPHAN_TTL_SECONDS:
+            continue
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            _logger.error("清理 .creating-* 孤儿失败，保留 %s：%s", directory.name, exc)
+            continue
+        removed.append(directory.name)
+    return removed
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
@@ -128,6 +162,7 @@ def create_profile() -> dict[str, str]:
 def _create_profile_locked() -> dict[str, str]:
     profiles_dir = get_profiles_dir()
     profiles_dir.mkdir(parents=True, exist_ok=True)
+    sweep_stale_creating_profiles()
     existing = _profile_ids()
     if not existing:
         initialize_data_layout()
@@ -237,5 +272,6 @@ __all__ = [
     "get_profile_metadata",
     "list_profiles",
     "set_active_profile",
+    "sweep_stale_creating_profiles",
     "update_profile_metadata",
 ]

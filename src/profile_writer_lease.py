@@ -92,14 +92,20 @@ class _ProfileWriterLease:
         except OSError:
             return False  # fail-closed：目录/权限异常时不假定独占
         try:
-            if handle.tell() == 0:
-                handle.write("binggo\n")
-                handle.flush()
-        except OSError:
-            pass
-        if not _try_lock(handle):
+            if not _try_lock(handle):
+                handle.close()
+                return False
+            # 成功持锁后才初始化空锁文件：单行有界内容，绝不 append 增长
+            # （锁字节范围在偏移 0，初始化写入仅在文件为空时发生一次）。
+            try:
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write("binggo\n")
+                    handle.flush()
+            except OSError:
+                pass
+        except BaseException:
             handle.close()
-            return False
+            raise
         self._handle = handle
         return True
 

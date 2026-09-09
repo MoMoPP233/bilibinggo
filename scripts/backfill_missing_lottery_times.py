@@ -15,6 +15,13 @@ from src.status_refresh import backfill_missing_lottery_times, refresh_local_act
 
 
 def main() -> int:
+    from src.profile_writer_lease import cli_profile_writer_lease
+
+    with cli_profile_writer_lease("cli:backfill_missing_lottery_times"):
+        return _main_impl()
+
+
+def _main_impl() -> int:
     if not ENRICHED_OUTPUT_PATH.exists():
         print("未找到 enriched_latest.json")
         return 1

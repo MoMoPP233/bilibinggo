@@ -97,8 +97,21 @@ try:
 
     log_config_health()
 except Exception:
-    logger.exception("配置自检失败（已忽略，不阻断启动）")
+    logger.exception("�����Լ�ʧ�ܣ��Ѻ��ԣ������������")
 runner.recover_on_startup()
+
+
+def _startup_onboarding_sweep() -> None:
+    """启动时执行一次 onboarding expired staging 清理；失败只记录，不阻塞服务启动。"""
+    try:
+        from src.login_onboarding import onboarding_sweep_expired
+
+        onboarding_sweep_expired()
+    except Exception:
+        logger.exception("onboarding staging 启动清理失败（已忽略，不影响启动）")
+
+
+_startup_onboarding_sweep()
 
 WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = WEB_DIR / "static"

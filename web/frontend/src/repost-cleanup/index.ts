@@ -785,7 +785,7 @@ export function renderHealth(data: RepostHealthResponse): void {
   if (repostHealthLines) {
     const maintenance = data?.maintenance || {};
     const enabled = Boolean(maintenance.enabled);
-    const intervalHours = Math.max(1, Number(maintenance.interval_hours) || 2);
+    const intervalHours = Math.max(1, Number(maintenance.interval_hours) || 6);
     const toggleLine = enabled
       ? `自动维护：开启（每 ${intervalHours} 小时一次；只同步与评估，从不自动删除）`
       : "自动维护：关闭（不会自动联网）";

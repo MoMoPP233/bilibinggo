@@ -655,7 +655,7 @@ describe("repost cleanup maintenance health", () => {
       status: "normal",
       status_text: "维护状态正常",
       counts: { all_total: 6, history_total: 3, deleted: 1, delete_pending: 1, delete_failed: 1, unknown: 1 },
-      maintenance: { enabled: true, interval_hours: 2, risk_paused: false, risk_reason: null },
+      maintenance: { enabled: true, interval_hours: 6, risk_paused: false, risk_reason: null },
       issues: [],
       issue_total: 0,
       checks: [{ key: "ok", tone: "ok", text: "没有需要人工检查的删除记录。" }],
@@ -670,6 +670,8 @@ describe("repost cleanup maintenance health", () => {
     expect(document.getElementById("repost-health-unknown")?.textContent).toBe("1");
     const lines = document.getElementById("repost-health-lines")?.textContent || "";
     expect(lines).toContain("自动维护：开启");
+    expect(lines).toContain("每 6 小时");
+    expect(lines).not.toContain("每 2 小时");
     expect(lines).toContain("没有需要人工检查");
     expect(document.getElementById("repost-health-issues")?.hasAttribute("hidden")).toBe(true);
   });
@@ -680,7 +682,7 @@ describe("repost cleanup maintenance health", () => {
       status: "normal",
       status_text: "维护状态正常",
       counts: {},
-      maintenance: { enabled: false, interval_hours: 2 },
+      maintenance: { enabled: false, interval_hours: 6 },
       issues: [],
       issue_total: 0,
       checks: [],
@@ -695,7 +697,7 @@ describe("repost cleanup maintenance health", () => {
       status: "review_needed",
       status_text: "需要人工检查",
       counts: { all_total: 3, delete_pending: 1, delete_failed: 1, unknown: 1 },
-      maintenance: { enabled: true, interval_hours: 2, risk_paused: false },
+      maintenance: { enabled: true, interval_hours: 6, risk_paused: false },
       issue_total: 2,
       issues: [
         { repost_dynamic_id: "91001", original_dynamic_id: "81001", delete_status: "delete_pending", last_error: null, delete_requested_at: 1_750_000_000 },

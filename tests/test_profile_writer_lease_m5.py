@@ -351,7 +351,10 @@ def test_read_only_script_unaffected_by_writer_busy(data_root: Path) -> None:
     lease = pwl.profile_writer_acquire(profile_id="account-1", owner="web-job")
     try:
         proc = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "check_ds1.py"), "--help"],
+            # discover_watch_users 是只读 CLI（只写仓库级 config/watch_users.json，
+            # 不写 Profile），不应因 WriterLease 占用而失败；check_ds* 属写型 CLI
+            # （写 output + commit checkpoint），不受本用例约束。
+            [sys.executable, str(ROOT / "scripts" / "discover_watch_users.py"), "--help"],
             capture_output=True,
             text=True,
             env=_env(data_root),

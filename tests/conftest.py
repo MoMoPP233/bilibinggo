@@ -41,6 +41,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _reset_runtime_profile_after_each_test():
+    """每个测试结束后清空 data_paths 冻结的 runtime/布局缓存。
+
+    消除“前一个测试改了 BINGGO_DATA_ROOT 却没在 teardown 复位”导致的模块顺序依赖
+    （如 test_profile_api 在 test_login_onboarding_m7 之后运行时
+    get_runtime_profile_id 因进程内 root 与当前 env 不一致而抛错）。
+    各测试自身仍需自足 setup；本 fixture 只兜底清理跨测试状态。
+    """
+    yield
+    from src import data_paths
+
+    data_paths.reset_runtime_profile_for_tests()
+
+
 @pytest.fixture
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """隔离用户数据目录与 SQLite 引擎，供依赖 DB 的测试使用。"""
