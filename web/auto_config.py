@@ -1,4 +1,4 @@
-"""定时点击调度器配置（仅允许 4 个按钮 action）。"""
+"""定时点击调度器配置。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,9 @@ ACTION_LABELS = {
     "refresh_status": "刷新任务状态",
     "participate_triple": "三连参与",
     "cleanup_auto_maintain": "清理数据自动维护",
+    "cleanup_maintenance_cycle": "清理维护",
     "following_feed_scan": "关注动态补漏扫描",
+    "winner_deep_scan": "中奖深探",
 }
 
 _CLEANUP_MAINTAIN_ENABLED = False

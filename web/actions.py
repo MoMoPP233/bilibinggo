@@ -989,7 +989,9 @@ WRITER_LEASE_ACTIONS = frozenset({
     "cleanup_auto_maintain",
     "scan_expired_reposts",
     "cleanup_auto_delete",
+    "cleanup_maintenance_cycle",
     "sync_repost_history",
+    "sync_assess_repost_history",
     "winner_deep_scan",
 })
 
@@ -1455,6 +1457,35 @@ def _run_action_impl(
         progress(step=1, total=1, message=message, log_append=message)
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 
+    if action == "sync_assess_repost_history":
+        # 页面主流程：同一个 Job、同一层 WriterLease 内先同步，再运行 M4 唯一评估引擎。
+        # 保留独立 sync / assessment action 作为兼容入口，但不从前端要求用户点两次。
+        from src.repost_cleanup import scan_expired_reposts, sync_repost_history
+
+        if params:
+            raise ValueError("同步/评估转发历史不接受额外参数")
+        _raise_if_cancelled(cancel_event)
+        progress(step=0, total=2, message="正在同步转发历史…", log_append="同步转发历史开始")
+        synced = sync_repost_history(
+            on_progress=None,
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        progress(step=1, total=2, message="同步完成，正在连续智能评估…", log_append="同步转发历史完成；智能评估开始")
+        assessed = scan_expired_reposts(
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        message = str(assessed.get("message") or "同步/评估转发历史完成")
+        progress(step=2, total=2, message=message, log_append=message)
+        return {
+            "ok": True,
+            "message": message,
+            "result": {"sync": synced, "assessment": assessed},
+            "log": sanitize_log(f"同步转发历史完成\n{message}"),
+        }
+
     if action == "cleanup_auto_maintain":
         from src.repost_cleanup import auto_maintain
 
@@ -1486,6 +1517,21 @@ def _run_action_impl(
         _raise_if_cancelled(cancel_event)
         message = str(result.get("message") or "自动安全清理完成")
         progress(step=1, total=1, message=message, log_append=message)
+        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+
+    if action == "cleanup_maintenance_cycle":
+        # AutoScheduler 的 M8 单 Job 编排入口；直接调用核心函数，绝不嵌套 run_action/WriterLease。
+        from src.repost_cleanup import cleanup_maintenance_cycle
+
+        if params:
+            raise ValueError("清理维护周期不接受额外参数")
+        _raise_if_cancelled(cancel_event)
+        result = cleanup_maintenance_cycle(
+            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+        )
+        _raise_if_cancelled(cancel_event)
+        message = str(result.get("message") or "清理维护周期完成")
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 
     if action == "scan_expired_reposts":

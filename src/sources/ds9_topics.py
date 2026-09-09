@@ -38,6 +38,8 @@ from src.sources.common import CheckResult, is_valid_dynamic_id, opus_link
 
 SOURCE_ID = "DS-9"
 TOPIC_HISTORY_MAX_PAGES = 3
+TOPIC_PAGE_SIZE = 20
+TOPIC_SORT_BY_LATEST = 3
 _TOPIC_ID_RE = re.compile(r"^\d{1,12}$")
 _URL_TOPIC_ID_RE = re.compile(r"topic_id=(\d{1,12})")
 
@@ -274,7 +276,8 @@ def normalize_topic_entry(entry: dict) -> tuple[str | None, str | None]:
         return orig_id, outer_id
     if outer_id is None:
         return None, None
-    if str(desc.get("type")) == "1":
+    entry_type = str(entry.get("type") or desc.get("type") or "")
+    if entry_type in {"1", "DYNAMIC_TYPE_FORWARD"}:
         return None, outer_id
     return outer_id, outer_id
 
@@ -313,7 +316,17 @@ def fingerprint_of_topic(outer_ids: list[str]) -> str:
 
 
 def _raise_on_structured_risk(payload: object) -> None:
-    code = risk_code_of(payload)
+    code = None
+    if isinstance(payload, dict):
+        raw_code = payload.get("code")
+        try:
+            parsed = int(raw_code)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed in (-352, -509, 429):
+            code = parsed
+    if code is None:
+        code = risk_code_of(payload)
     if code is None:
         return
     message = ""
@@ -330,20 +343,52 @@ def _api_error(payload: dict) -> RuntimeError | None:
     return RuntimeError(f"话题接口返回异常（code={code}：{message}）")
 
 
-def _fetch_topic_new(client: BilibiliClient, topic_id: str) -> list[dict]:
-    payload = client.get_topic_new(topic_id)
+def _fetch_topic_page(
+    client: BilibiliClient,
+    topic_id: str,
+    *,
+    offset: str = "",
+) -> tuple[list[dict], str, bool]:
+    payload = client.get_topic_feed(
+        topic_id,
+        offset=offset,
+        page_size=TOPIC_PAGE_SIZE,
+        sort_by=TOPIC_SORT_BY_LATEST,
+        source="Web",
+    )
     _raise_on_structured_risk(payload)
     error = _api_error(payload)
     if error is not None:
         raise error
-    return _payload_topic_entries(payload)
+    return _payload_topic_page(payload)
 
 
-def _payload_topic_entries(payload: dict) -> list[dict]:
+def _payload_topic_page(payload: dict) -> tuple[list[dict], str, bool]:
     data = payload.get("data")
     data = data if isinstance(data, dict) else {}
     entries: list[dict] = []
     seen: set[str] = set()
+    topic_cards = data.get("topic_card_list")
+    if isinstance(topic_cards, dict):
+        for wrapper in topic_cards.get("items") or []:
+            if not isinstance(wrapper, dict):
+                continue
+            item = wrapper.get("dynamic_card_item")
+            if not isinstance(item, dict):
+                continue
+            outer = _entry_dynamic_id({}, item)
+            if outer is not None:
+                if outer in seen:
+                    continue
+                seen.add(outer)
+            entries.append(item)
+        return (
+            entries,
+            str(topic_cards.get("offset") or ""),
+            bool(topic_cards.get("has_more")),
+        )
+
+    # 兼容历史 fixture/响应，仅用于容错；DS9 主请求已固定走现代 feed/topic。
     for key in ("cards", "items", "hot_list"):
         for item in data.get(key) or []:
             if not isinstance(item, dict):
@@ -355,29 +400,33 @@ def _payload_topic_entries(payload: dict) -> list[dict]:
                     continue
                 seen.add(outer)
             entries.append(item)
-    return entries
+    return entries, str(data.get("offset") or ""), bool(data.get("has_more"))
 
 
 def _fetch_topic_history_pages(
     client: BilibiliClient,
     topic_id: str,
     *,
-    max_pages: int = TOPIC_HISTORY_MAX_PAGES,
+    first_offset: str,
+    first_has_more: bool,
+    max_pages: int = TOPIC_HISTORY_MAX_PAGES - 1,
 ) -> list[dict]:
     entries: list[dict] = []
-    offset = ""
+    offset = str(first_offset or "")
+    has_more = bool(first_has_more)
+    seen_offsets: set[str] = set()
     for _ in range(max_pages):
-        payload = client.get_topic_history(topic_id, offset_dynamic_id=offset)
-        _raise_on_structured_risk(payload)
-        error = _api_error(payload)
-        if error is not None:
-            raise error
-        page_entries = _payload_topic_entries(payload)
+        if not has_more or not offset or offset in seen_offsets:
+            break
+        seen_offsets.add(offset)
+        page_entries, next_offset, has_more = _fetch_topic_page(
+            client,
+            topic_id,
+            offset=offset,
+        )
         if not page_entries:
             break
         entries.extend(page_entries)
-        data = payload.get("data")
-        next_offset = str((data if isinstance(data, dict) else {}).get("offset") or "")
         if not next_offset:
             break
         offset = next_offset
@@ -443,13 +492,18 @@ def check_update(*, force: bool = False) -> CheckResult:
             prev_fp = record.get("fp")
             prev_incomplete = list(record.get("incomplete") or [])
             try:
-                new_entries = _fetch_topic_new(client, topic_id)
+                new_entries, first_offset, first_has_more = _fetch_topic_page(client, topic_id)
                 resolved, incomplete, outers = normalize_topic_entries(new_entries)
                 fp = fingerprint_of_topic(outers)
                 needs = force or fp != prev_fp or bool(prev_incomplete)
                 if needs:
-                    # 有限历史补抓（≤3 页/话题），用于发现头部变化窗口外的候选。
-                    history = _fetch_topic_history_pages(client, topic_id)
+                    # 现代话题 Feed：最新页 + 最多 2 个 offset 历史页，总计 ≤3 页/话题。
+                    history = _fetch_topic_history_pages(
+                        client,
+                        topic_id,
+                        first_offset=first_offset,
+                        first_has_more=first_has_more,
+                    )
                     resolved_h, incomplete_h, outers_h = normalize_topic_entries(history)
                     for item in incomplete_h:
                         if item not in incomplete:
@@ -462,6 +516,12 @@ def check_update(*, force: bool = False) -> CheckResult:
                     for item in resolved_h:
                         if item not in resolved:
                             resolved.append(item)
+                    # 旧 incomplete 若已不在有限窗口内，继续保留；若本轮重新看到且
+                    # 已得到结构化 orig，则自然移除，避免因滑出三页窗口永久丢失。
+                    visible_outers = set(outers)
+                    for item in prev_incomplete:
+                        if item not in visible_outers and item not in incomplete:
+                            incomplete.append(item)
                 if not needs:
                     # 无变化且无未完成项：本轮无产出（仍更新扫描时间元数据）。
                     record["last_scan_at"] = now

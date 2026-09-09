@@ -26,6 +26,8 @@ function setupDom() {
     <span id="auto-dock-countdown"></span>
     <span id="auto-dock-scheduler"></span>
     <span id="auto-dock-job"></span>
+    <div id="auto-task-status-list"></div>
+    <pre id="auto-log"></pre>
     <p id="auto-following-info"></p>
     <div id="auto-dock-panel"></div>
     <button id="auto-dock-start"></button>
@@ -107,5 +109,66 @@ describe("scheduler start/stop async race", () => {
     await stopStatus.promise;
 
     expect(document.getElementById("auto-dock-status")?.textContent).toBe("调度运行中");
+  });
+
+  it("renders backend task state and never leaves an expired countdown at 00:00", async () => {
+    const mod = await import("./index");
+    const now = Math.floor(Date.now() / 1000);
+
+    mod.renderAutoDock({
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "清理维护", minutes: 0, at_unix: now - 1 },
+      tasks: {
+        cleanup: {
+          label: "清理维护",
+          status: "waiting",
+          last_result: "尚未执行",
+          next_run_at: now - 1,
+        },
+      },
+      logs: [],
+    });
+
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在确认状态…");
+    expect(document.getElementById("auto-task-status-list")?.textContent).toContain("正在确认状态…");
+
+    mod.renderAutoDock({
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 3, at_unix: now + 180 },
+      tasks: {
+        cleanup: {
+          label: "清理维护",
+          status: "running",
+          last_result: "清理维护开始",
+          next_run_at: now + 21600,
+        },
+      },
+      logs: [],
+    });
+
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在执行");
+    expect(document.getElementById("auto-task-status-list")?.textContent).toContain("运行中");
+  });
+
+  it("renders only the newest 100 sanitized scheduler log lines", async () => {
+    const mod = await import("./index");
+    const logs = Array.from({ length: 105 }, (_, index) => ({
+      ts: `2026-09-08 12:00:${String(index % 60).padStart(2, "0")}`,
+      level: "info",
+      message: index === 104
+        ? "GET https://api.example.test/feed?topic_id=123&csrf=secret SESSDATA=cookie-secret"
+        : `日志 ${index}`,
+    }));
+
+    mod.renderAutoLogs(logs);
+
+    const text = document.getElementById("auto-log")?.textContent || "";
+    expect(text.split("\n")).toHaveLength(100);
+    expect(text).not.toContain("日志 0");
+    expect(text).not.toContain("topic_id=123");
+    expect(text).not.toContain("cookie-secret");
+    expect(text).toContain("[查询参数已隐藏]");
   });
 });

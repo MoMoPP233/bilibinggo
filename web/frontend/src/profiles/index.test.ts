@@ -47,7 +47,6 @@ const targetPayload = {
 
 function setupProfileDom(): void {
   document.body.innerHTML = `
-    <button type="button" id="profile-create">新建账号</button>
     <div id="profile-restart-notice" hidden></div>
     <div id="profile-current"></div>
     <div id="profile-list"></div>`;

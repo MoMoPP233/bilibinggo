@@ -20,6 +20,7 @@ ALLOWED_JOB_ACTIONS = frozenset(
         "scan_expired_reposts",
         "cleanup_auto_delete",
         "sync_repost_history",
+        "sync_assess_repost_history",
     }
 )
 

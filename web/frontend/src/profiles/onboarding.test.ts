@@ -3,6 +3,7 @@
 // M7 前端 onboarding 主流程：不先建空 Profile、不调用旧 login、无 Cookie 进出。
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 const mocks = vi.hoisted(() => ({
   fetchJSON: vi.fn(),
@@ -14,7 +15,6 @@ vi.mock("../shell/toast", () => ({ showToast: mocks.showToast }));
 
 function setupDom(): void {
   document.body.innerHTML = `
-    <button id="profile-create"></button>
     <button id="profile-onboarding-start">扫码登录新账号</button>
     <div id="profile-current"></div>
     <div id="profile-list"></div>
@@ -40,6 +40,12 @@ afterEach(() => {
 });
 
 describe("profiles onboarding main flow", () => {
+  it("keeps QR onboarding as the only account creation button in the shipped HTML", () => {
+    const html = readFileSync("index.html", "utf-8");
+    expect(html).toContain('id="profile-onboarding-start"');
+    expect(html).not.toContain('id="profile-create"');
+  });
+
   it("starts onboarding without create_profile and shows QR", async () => {
     const mod = await load();
     mocks.fetchJSON

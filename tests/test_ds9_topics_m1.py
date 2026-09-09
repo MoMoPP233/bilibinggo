@@ -58,13 +58,13 @@ def _entry(outer: str, *, orig: str | None = None, dtype: int = 0) -> dict:
 
 
 class _FakeTopicClient:
-    """可编程 fake：每话题 topic_new 数据 + 可选的每话题异常/风险。"""
+    """可编程 fake：每话题现代 feed/topic 数据 + 可选异常/offset 页。"""
 
     def __init__(self, *, data_by_topic=None, errors_by_topic=None, history_by_topic=None):
         self.data_by_topic = dict(data_by_topic or {})
         self.errors_by_topic = dict(errors_by_topic or {})
         self.history_by_topic = dict(history_by_topic or {})
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, str]] = []
         self.history_calls: list[tuple[str, str]] = []
 
     def __enter__(self):
@@ -76,27 +76,64 @@ class _FakeTopicClient:
     def _cards(self, ids):
         return {"code": 0, "data": {"hot_list": [{"desc": {"dynamic_id": did}} for did in ids]}}
 
-    def get_topic_new(self, topic_id: str) -> dict:
-        self.calls.append(("new", topic_id))
-        error = self.errors_by_topic.get(topic_id)
+    def get_topic_feed(
+        self,
+        topic_id: str,
+        *,
+        offset: str = "",
+        page_size: int = 20,
+        sort_by: int = 3,
+        source: str = "Web",
+    ) -> dict:
+        self.calls.append(("feed", topic_id, offset))
+        error = self.errors_by_topic.get(f"history:{topic_id}" if offset else topic_id)
         if error is not None:
             raise error
-        payload = self.data_by_topic.get(topic_id, {"code": 0, "data": {}})
-        return payload
-
-    def get_topic_history(self, topic_id: str, *, offset_dynamic_id: str = "", page_size: int = 20) -> dict:
-        self.history_calls.append((topic_id, offset_dynamic_id or ""))
-        error = self.errors_by_topic.get(f"history:{topic_id}")
-        if error is not None:
-            raise error
-        payload = self.history_by_topic.get(topic_id)
-        if payload is None:
-            return {"code": 0, "data": {}}
+        if offset:
+            self.history_calls.append((topic_id, offset))
+            payload = self.history_by_topic.get(topic_id, {"code": 0, "data": {}})
+        else:
+            payload = self.data_by_topic.get(topic_id, {"code": 0, "data": {}})
         return payload
 
 
 def _original_payload(outer: str) -> dict:
     return {"code": 0, "data": {"hot_list": [_entry(outer)]}}
+
+
+def _modern_payload(entries: list[dict], *, offset: str = "", has_more: bool = False) -> dict:
+    return {
+        "code": 0,
+        "message": "0",
+        "data": {
+            "related_topics": [],
+            "topic_card_list": {
+                "has_more": has_more,
+                "offset": offset,
+                "items": [
+                    {"dynamic_card_item": entry, "topic_type": "DYNAMIC"}
+                    for entry in entries
+                ],
+            },
+        },
+    }
+
+
+def _modern_entry(outer: str, *, author_mid: str, orig: str | None = None) -> dict:
+    entry = {
+        "id_str": outer,
+        "type": "DYNAMIC_TYPE_FORWARD" if orig else "DYNAMIC_TYPE_DRAW",
+        "modules": {"module_author": {"mid": int(author_mid)}},
+        "visible": True,
+    }
+    if orig:
+        entry["orig"] = {
+            "id_str": orig,
+            "type": "DYNAMIC_TYPE_DRAW",
+            "modules": {"module_author": {"mid": 99999}},
+            "visible": True,
+        }
+    return entry
 
 
 def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeTopicClient) -> None:
@@ -308,22 +345,33 @@ def test_fingerprint_no_change_skips_duplicate_work(state_path: Path, monkeypatc
 
 
 def test_fingerprint_same_with_unresolved_still_retries(state_path: Path, monkeypatch) -> None:
-    payload_outer = {"code": 0, "data": {"hot_list": [_entry(DID3, dtype=1)]}}
-    client = _FakeTopicClient(data_by_topic={TOPIC_A: payload_outer})
+    payload_outer = _modern_payload(
+        [_modern_entry(DID3, author_mid="10001") | {"type": "DYNAMIC_TYPE_FORWARD"}],
+        offset="page-2",
+        has_more=True,
+    )
+    empty_history = _modern_payload([], has_more=False)
+    client = _FakeTopicClient(
+        data_by_topic={TOPIC_A: payload_outer},
+        history_by_topic={TOPIC_A: empty_history},
+    )
     _install_client(monkeypatch, client)
     result = ds9.check_update()
     assert result.updated is True
     commit_source_checkpoint(result)
 
     # 第二轮内容相同（fp 不变）但上轮 incomplete 仍存在 → 必须重试该话题
-    client2 = _FakeTopicClient(data_by_topic={TOPIC_A: payload_outer})
+    client2 = _FakeTopicClient(
+        data_by_topic={TOPIC_A: payload_outer},
+        history_by_topic={TOPIC_A: empty_history},
+    )
     _install_client(monkeypatch, client2)
     result2 = ds9.check_update()
     assert result2.updated is True  # 仍产出（允许重试 incomplete）
     assert client2.history_calls  # 有限历史补抓被重新触发
 
     # 第三轮 orig 补全后：canonical 进入候选且 incomplete 清空
-    resolved = {"code": 0, "data": {"hot_list": [_entry(DID3, orig=DID1, dtype=1)]}}
+    resolved = _modern_payload([_modern_entry(DID3, author_mid="10001", orig=DID1)])
     client3 = _FakeTopicClient(data_by_topic={TOPIC_A: resolved})
     _install_client(monkeypatch, client3)
     result3 = ds9.check_update()
@@ -374,8 +422,8 @@ def test_structured_risk_stops_all_topic_requests(state_path: Path, monkeypatch,
     with pytest.raises((RuntimeError, httpx.HTTPStatusError)):
         ds9.check_update()
     # 0 retry：每话题 topic_new 最多一次；风险话题后续请求 0
-    assert client.calls.count(("new", TOPIC_A)) == 1
-    assert client.calls.count(("new", TOPIC_B)) == 0  # 后续话题不再发起远程请求
+    assert client.calls.count(("feed", TOPIC_A, "")) == 1
+    assert client.calls.count(("feed", TOPIC_B, "")) == 0  # 后续话题不再发起远程请求
     assert client.history_calls == []
     record = {t["topic_id"]: t for t in ds9.list_topics()}
     assert record[TOPIC_A]["fp"] is None  # 不推进
@@ -389,6 +437,68 @@ def test_ds9_registered_in_unified_ds_handlers() -> None:
 
     assert any(source_id == "DS-9" for source_id, _, _ in actions.DS_HANDLERS)
     assert "DS-9" in actions.DS_HANDLER_BY_ID
+
+
+def test_modern_topic_fixture_parses_multiple_authors_original_and_repost() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "ds9_topic_feed_modern.json"
+    payload = __import__("json").loads(fixture.read_text(encoding="utf-8"))
+    entries, offset, has_more = ds9._payload_topic_page(payload)
+
+    assert len(entries) == 3
+    assert offset == "574748481266496"
+    assert has_more is True
+    authors = {str(item["modules"]["module_author"]["mid"]) for item in entries}
+    assert authors == {"10001", "20002", "30003"}  # 同一 topic 下多个不同 UP 主
+    resolved, incomplete, outers = ds9.normalize_topic_entries(entries)
+    assert resolved == [DID1, DID2, DID4]
+    assert incomplete == []
+    assert outers == [DID1, DID3, DID4]
+
+
+def test_modern_topic_offset_pagination_is_bounded(state_path: Path, monkeypatch) -> None:
+    first = _modern_payload(
+        [_modern_entry(DID1, author_mid="10001")],
+        offset="page-2",
+        has_more=True,
+    )
+    second = _modern_payload(
+        [_modern_entry(DID3, author_mid="20002", orig=DID2)],
+        offset="",
+        has_more=False,
+    )
+    client = _FakeTopicClient(
+        data_by_topic={TOPIC_A: first},
+        history_by_topic={TOPIC_A: second},
+    )
+    _install_client(monkeypatch, client)
+
+    result = ds9.check_update()
+
+    assert result.activity_links == [
+        f"https://www.bilibili.com/opus/{DID1}",
+        f"https://www.bilibili.com/opus/{DID2}",
+    ]
+    assert client.history_calls == [(TOPIC_A, "page-2")]
+
+
+@pytest.mark.parametrize("code", [-352, -509, 429])
+def test_raw_modern_payload_risk_stops_without_second_topic(
+    state_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    code: int,
+) -> None:
+    client = _FakeTopicClient(
+        data_by_topic={
+            TOPIC_A: {"code": code, "message": "risk", "data": {}},
+            TOPIC_B: _modern_payload([_modern_entry(DID2, author_mid="20002")]),
+        }
+    )
+    _install_client(monkeypatch, client)
+
+    with pytest.raises(RuntimeError, match=f"API error {code}"):
+        ds9.check_update()
+
+    assert client.calls == [("feed", TOPIC_A, "")]
 
 
 def test_ds9_failure_does_not_rollback_other_ds(isolated_home: Path, monkeypatch) -> None:

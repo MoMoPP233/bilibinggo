@@ -4,8 +4,10 @@
 
 import { fetchJSON } from "../api/client";
 import { startJob } from "../jobs/index";
+import { state as appState } from "../state";
 import { showToast } from "../shell/toast";
-import { escapeHtml } from "../utils/text";
+import { formatAutoCountdown } from "../utils/format";
+import { escapeHtml, sanitizeUserText } from "../utils/text";
 
 const ROOT_ID = "notifications-root";
 let bound = false;
@@ -211,7 +213,13 @@ async function refreshView() {
     } catch {
       winner = null;
     }
-    if (winner) renderWinner(winner);
+    let auto = null;
+    try {
+      auto = await fetchJSON("/api/auto/status");
+    } catch {
+      auto = null;
+    }
+    if (winner) renderWinner({ ...winner, scheduler_task: auto?.tasks?.winner || null, scheduler: auto });
   } catch (error) {
     showToast(String(error?.message || error), "error", "通知状态读取失败");
   }
@@ -219,11 +227,49 @@ async function refreshView() {
 
 const SOURCE_LABELS_M3 = { mention: "@我的", reply: "回复我的", dm: "未读私信" };
 
+function winnerSchedulerHtml(task, scheduler) {
+  const statusLabels = {
+    waiting: "等待",
+    running: "运行中",
+    completed: "完成",
+    skipped_busy: "本轮跳过（任务占用）",
+    risk_paused: "风控暂停",
+    error: "错误",
+  };
+  const status = String(task?.status || "waiting");
+  const next = Number(status === "risk_paused" ? task?.resume_at : task?.next_run_at) || 0;
+  const expired = String(scheduler?.state || "") === "running"
+    && next > 0
+    && Math.floor((Date.now() + Number(appState.autoServerSkewMs || 0)) / 1000) >= next;
+  const countdown = status === "running"
+    ? "正在执行"
+    : expired
+      ? "正在确认状态…"
+      : formatAutoCountdown(next || null);
+  return `<div class="winner-scheduler-state" id="winner-scheduler-state" data-status="${escapeHtml(status)}">
+    <strong>自动调度：${escapeHtml(statusLabels[status] || status)}</strong>
+    <span>上次 ${escapeHtml(String(task?.last_started_at || "—"))}</span>
+    <span>下次 ${next ? escapeHtml(new Date(next * 1000).toLocaleString("zh-CN", { hour12: false })) : "—"}</span>
+    <span>倒计时 ${escapeHtml(countdown)}</span>
+    <small>${escapeHtml(sanitizeUserText(task?.last_result || ""))}</small>
+  </div>`;
+}
+
+function renderWinnerSchedulerTask(task, scheduler) {
+  const current = document.getElementById("winner-scheduler-state");
+  if (!current) return;
+  const holder = document.createElement("div");
+  holder.innerHTML = winnerSchedulerHtml(task, scheduler);
+  current.replaceWith(holder.firstElementChild!);
+}
+
 function renderWinner(state) {
   const root = document.getElementById(ROOT_ID);
   if (!root) return;
   const sources = state?.sources || {};
   const candidates = Array.isArray(state?.candidates) ? state.candidates : [];
+  const scheduler = state?.scheduler || appState.autoScheduler || null;
+  const schedulerTask = state?.scheduler_task || scheduler?.tasks?.winner || null;
   const panel = document.createElement("article");
   panel.className = "panel";
   panel.id = "winner-scan-panel";
@@ -236,6 +282,7 @@ function renderWinner(state) {
       </div>
       <button type="button" class="btn btn-primary btn-pill" id="winner-scan-run">立即执行深检</button>
     </div>
+    ${winnerSchedulerHtml(schedulerTask, scheduler)}
     <div class="ntf-event-list">
       ${Object.entries(SOURCE_LABELS_M3)
         .map(([key, label]) => {
@@ -276,5 +323,11 @@ export function bindNotificationsPage() {
   if (!document.getElementById(ROOT_ID)) return;
   if (bound) return;
   bound = true;
+  window.addEventListener("binggo:auto-status", ((event: CustomEvent<any>) => {
+    renderWinnerSchedulerTask(event.detail?.tasks?.winner || null, event.detail);
+  }) as EventListener);
+  window.addEventListener("binggo:auto-tick", ((event: CustomEvent<any>) => {
+    renderWinnerSchedulerTask(event.detail?.tasks?.winner || null, event.detail);
+  }) as EventListener);
   refreshView().catch(() => {});
 }

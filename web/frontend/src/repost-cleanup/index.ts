@@ -1003,7 +1003,23 @@ export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<
   try {
     // 全局任务管理器不会盲目重新启用 data-job-control；按本页选择状态恢复。
     renderSelectionState();
-    if (job.action === "sync_repost_history") {
+    if (job.action === "sync_assess_repost_history") {
+      // 单 Job 主流程完成后统一从本地 durable 状态重建页面；不由前端串联第二个 Job。
+      await loadRepostHistory(1).catch(() => {});
+      await loadPersistedCandidates().catch(() => {});
+      await loadRepostHealth().catch(() => {});
+      if (job.state === "success") {
+        const result = (job.result || {}) as Record<string, unknown>;
+        const assessment = (result.assessment || {}) as Record<string, unknown>;
+        showToast(
+          "同步/评估转发历史完成",
+          "success",
+          String(assessment.message || job.message || "本次 backlog 已处理完成"),
+        );
+      } else if (job.state === "cancelled") {
+        showToast("同步/评估已停止", "info", "已完成结果已保存，未完成部分将在下次继续。");
+      }
+    } else if (job.action === "sync_repost_history") {
       if (job.state === "success") {
         const result = (job.result || {}) as Record<string, unknown>;
         const reconciliation = (result.guard_reconciliation || {}) as Record<string, unknown>;
@@ -1094,14 +1110,14 @@ async function handlePaginationClick(event: Event): Promise<void> {
   });
 }
 
-type CleanupStartAction = "sync_repost_history" | "scan_expired_reposts";
+type CleanupStartAction = "sync_assess_repost_history" | "scan_expired_reposts";
 
 const CLEANUP_ACTION_LABELS: Record<CleanupStartAction, string> = {
-  sync_repost_history: "同步我的转发历史",
+  sync_assess_repost_history: "同步/评估转发历史",
   scan_expired_reposts: "一键智能评估",
 };
 const CLEANUP_ACTION_STARTING: Record<CleanupStartAction, string> = {
-  sync_repost_history: "正在启动同步任务…",
+  sync_assess_repost_history: "正在启动同步/评估任务…",
   scan_expired_reposts: "正在启动智能评估…",
 };
 
@@ -1116,7 +1132,7 @@ function cleanupRunningJob(): JobStatus | null {
 function cleanupCancellableJob(): JobStatus | null {
   const job = cleanupRunningJob();
   if (!job) return null;
-  return job.action === "sync_repost_history" || job.action === "scan_expired_reposts" ? job : null;
+  return job.action === "sync_assess_repost_history" || job.action === "scan_expired_reposts" ? job : null;
 }
 
 function waitForNextFrame(): Promise<void> {
@@ -1130,10 +1146,8 @@ function waitForNextFrame(): Promise<void> {
 }
 
 function setRepostStartButtonsDisabled(disabled: boolean): void {
-  const sync = document.getElementById("repost-sync-btn");
-  const scan = document.getElementById("repost-scan-btn");
-  if (sync instanceof HTMLButtonElement) sync.disabled = disabled;
-  if (scan instanceof HTMLButtonElement) scan.disabled = disabled;
+  const combined = document.getElementById("repost-sync-assess-btn");
+  if (combined instanceof HTMLButtonElement) combined.disabled = disabled;
 }
 
 function setRepostStopDisabled(disabled: boolean): void {
@@ -1176,7 +1190,7 @@ async function requestCleanupStart(
 
   // 同步置锁并立即绘制 loading / 弹窗 / disabled，再发后端请求。
   cleanupStartBusy = action;
-  if (action === "scan_expired_reposts") {
+  if (action === "scan_expired_reposts" || action === "sync_assess_repost_history") {
     setCandidates([]);
     if (repostEvalStatus) repostEvalStatus.textContent = "智能评估进行中…";
     if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行分批评估历史抽奖…";
@@ -1241,12 +1255,10 @@ export function bindRepostCleanup(): void {
   if (bound) return;
   bound = true;
   bindAutoCleanupUi().catch(() => {});
-  // 同步 / 评估按钮由本页自管（立即 loading、逻辑锁、即时反馈）；
+  // 同步/评估按钮由本页自管（立即 loading、逻辑锁、即时反馈）；
   // 标记 dataset.bound 避免全局 bindActionButtons 再绑一次造成重复提交。
-  const syncStartBtn = document.getElementById("repost-sync-btn");
-  const scanStartBtn = document.getElementById("repost-scan-btn");
-  if (syncStartBtn) syncStartBtn.dataset.bound = "true";
-  if (scanStartBtn) scanStartBtn.dataset.bound = "true";
+  const combinedStartBtn = document.getElementById("repost-sync-assess-btn");
+  if (combinedStartBtn) combinedStartBtn.dataset.bound = "true";
   repostCandidatesBody?.addEventListener("change", handleCandidateChange);
   repostCandidatesBody?.addEventListener("click", (event) => {
     const target = event.target as Element | null;
@@ -1313,11 +1325,8 @@ export function bindRepostCleanup(): void {
   repostStopBtn?.addEventListener("click", () => {
     requestCleanupStop().catch(() => {});
   });
-  document.getElementById("repost-sync-btn")?.addEventListener("click", () => {
-    requestCleanupStart("sync_repost_history").catch(() => {});
-  });
-  document.getElementById("repost-scan-btn")?.addEventListener("click", () => {
-    requestCleanupStart("scan_expired_reposts").catch(() => {});
+  document.getElementById("repost-sync-assess-btn")?.addEventListener("click", () => {
+    requestCleanupStart("sync_assess_repost_history").catch(() => {});
   });
   repostCandidatePagination?.addEventListener("click", handlePaginationClick);
   repostHistoryPagination?.addEventListener("click", handlePaginationClick);
@@ -1360,7 +1369,7 @@ export function bindRepostCleanup(): void {
 
 // Exported for focused UI tests; production actions still flow through the normal Job API.
 export async function startCleanupJob(
-  action: "sync_repost_history" | "scan_expired_reposts",
+  action: "sync_assess_repost_history" | "scan_expired_reposts",
   params: Record<string, unknown> = {},
 ): Promise<void> {
   try {
@@ -1374,30 +1383,7 @@ export async function startCleanupJob(
 // ---------- M6：strict-safe 自动安全清理 ----------
 
 async function bindAutoCleanupPanel(): Promise<void> {
-  const stack = document.querySelector(".repost-cleanup-stack");
-  if (!stack || document.getElementById("auto-cleanup-panel")) return;
-  const panel = document.createElement("article");
-  panel.className = "panel";
-  panel.id = "auto-cleanup-panel";
-  panel.innerHTML = `
-    <div class="panel-head-row">
-      <div>
-        <p class="eyebrow">Auto Cleanup</p>
-        <h2 class="section-title">自动安全清理</h2>
-        <p class="section-desc">只会自动删除程序确认 safe 的过期转发；结果未知时立即停机且绝不自动重试。</p>
-      </div>
-      <div class="action-row">
-        <label class="ntf-toggle"><input type="checkbox" id="auto-delete-toggle" /> 自动删除：关闭</label>
-        <button type="button" class="btn btn-primary btn-pill" id="auto-delete-run">立即执行安全清理</button>
-      </div>
-    </div>
-    <div class="auto-cleanup-meta">
-      <span class="caption">safe 候选：<b id="auto-delete-safe">0</b></span>
-      <span class="caption">delete_pending：<b id="auto-delete-pending">0</b></span>
-      <span class="caption">unknown：<b id="auto-delete-unknown">0</b></span>
-      <span class="caption" id="auto-delete-hint"></span>
-    </div>`;
-  stack.appendChild(panel);
+  if (!document.getElementById("auto-delete-toggle")) return;
 
   const refresh = async () => {
     try {
@@ -1405,7 +1391,7 @@ async function bindAutoCleanupPanel(): Promise<void> {
       const toggle = document.getElementById("auto-delete-toggle") as HTMLInputElement | null;
       if (toggle) {
         toggle.checked = Boolean(state && state.enabled);
-        const label = toggle.parentElement as HTMLElement | null;
+        const label = document.getElementById("auto-delete-toggle-label");
         if (label) label.textContent = "自动删除：" + (state && state.enabled ? "已开启" : "关闭");
       }
       const set = (id: string, value: unknown) => {

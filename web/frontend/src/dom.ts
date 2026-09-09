@@ -338,6 +338,7 @@ export const LOGIN_REQUIRED_ACTIONS = new Set([
   "participate",
   "participate_triple",
   "sync_repost_history",
+  "sync_assess_repost_history",
   "scan_expired_reposts",
   "delete_expired_reposts",
 ]);

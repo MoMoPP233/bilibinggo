@@ -5,6 +5,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from src.repost_history import RepostHistoryRecord, RepostSyncCheckpoint
+from web import actions
 from web.app import app
 
 
@@ -85,6 +86,57 @@ def test_cleanup_job_rejects_extra_params_before_start() -> None:
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
     start_mock.assert_not_called()
+
+
+def test_combined_sync_assess_action_runs_both_phases_in_one_job(monkeypatch) -> None:
+    calls: list[str] = []
+    progress: list[dict] = []
+
+    def fake_sync(*, on_progress, cancel_check):
+        calls.append("sync")
+        assert on_progress is None
+        assert cancel_check() is False
+        return {"found_reposts": 4, "imported_count": 2}
+
+    def fake_scan(*, on_progress, cancel_check):
+        calls.append("assess")
+        assert callable(on_progress)
+        assert cancel_check() is False
+        return {"message": "连续评估完成", "pending_originals": 0}
+
+    monkeypatch.setattr("src.repost_cleanup.sync_repost_history", fake_sync)
+    monkeypatch.setattr("src.repost_cleanup.scan_expired_reposts", fake_scan)
+
+    payload = actions._run_action_impl(
+        "sync_assess_repost_history",
+        {},
+        on_progress=lambda **event: progress.append(event),
+    )
+
+    assert calls == ["sync", "assess"]
+    assert payload["ok"] is True
+    assert payload["result"]["sync"]["imported_count"] == 2
+    assert payload["result"]["assessment"]["pending_originals"] == 0
+    assert progress[0]["step"] == 0
+    assert progress[-1]["step"] == progress[-1]["total"] == 2
+
+
+def test_scheduler_cleanup_action_dispatches_existing_maintenance_cycle(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_cycle(*, on_progress, cancel_check):
+        calls.append("cycle")
+        assert callable(on_progress)
+        assert cancel_check() is False
+        return {"message": "维护完成", "phases": []}
+
+    monkeypatch.setattr("src.repost_cleanup.cleanup_maintenance_cycle", fake_cycle)
+
+    payload = actions._run_action_impl("cleanup_maintenance_cycle", {})
+
+    assert calls == ["cycle"]
+    assert payload["ok"] is True
+    assert payload["message"] == "维护完成"
 
 
 def test_delete_requires_explicit_confirmation() -> None:

@@ -37,7 +37,6 @@ const PROFILE_RESTART_TIMEOUT_MS = 60000;
 const PROFILE_RESTART_POLL_INTERVAL_MS = 650;
 const PROFILE_RESTART_PROBE_TIMEOUT_MS = 2000;
 
-const profileCreate = document.getElementById("profile-create") as HTMLButtonElement | null;
 const profileCurrent = document.getElementById("profile-current");
 const profileList = document.getElementById("profile-list");
 const profileRestartNotice = document.getElementById("profile-restart-notice");
@@ -177,24 +176,6 @@ export async function syncProfilesAfterLoginJob(job: JobSnapshot): Promise<boole
   return true;
 }
 
-async function createProfile(): Promise<void> {
-  if (mutating) return;
-  mutating = true;
-  if (profileCreate) profileCreate.disabled = true;
-  try {
-    const result = await fetchJSON<{ profile: Profile }>("/api/profiles", {
-      method: "POST",
-    });
-    await loadProfiles();
-    showToast(`已创建 ${result.profile.profile_id}`, "success", "切换后重启 Binggo 即可登录新账号");
-  } catch (error) {
-    showToast(errorMessage(error), "error");
-  } finally {
-    mutating = false;
-    if (profileCreate) profileCreate.disabled = false;
-  }
-}
-
 async function activateProfile(
   profileId: string,
   button: HTMLButtonElement | null,
@@ -267,9 +248,6 @@ async function deleteProfile(profileId: string): Promise<void> {
 export function bindProfiles(): void {
   onboardingStartBtn?.addEventListener("click", () => {
     runOnboardingFlow().catch(() => undefined);
-  });
-  profileCreate?.addEventListener("click", () => {
-    createProfile().catch(() => undefined);
   });
   profileList?.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("button") : null;

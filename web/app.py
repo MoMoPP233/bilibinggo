@@ -148,6 +148,7 @@ _JOB_REQUIRES_LOGIN = frozenset(
         "cleanup_auto_maintain",
         "scan_expired_reposts",
         "sync_repost_history",
+        "sync_assess_repost_history",
     }
 )
 _JOB_REQUIRES_LLM = frozenset(
@@ -912,7 +913,7 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
     if request.action in _JOB_REQUIRES_LLM:
         require_llm_ready()
     params = request.params or {}
-    if request.action == "sync_repost_history" and params:
+    if request.action in {"sync_repost_history", "sync_assess_repost_history"} and params:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
     if request.action == "update_all_datasources" and params:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")

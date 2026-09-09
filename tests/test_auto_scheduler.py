@@ -71,6 +71,50 @@ def test_cleanup_maintenance_paused_tick_never_starts_remote_job(monkeypatch) ->
     assert "2026-09-02-maintain" in scheduler._done_maintain
 
 
+def test_task_status_rejects_stale_scheduler_generation() -> None:
+    scheduler = AutoScheduler(job_runner=JobRunner())
+    scheduler._generation = 2
+    scheduler._ctx.generation = 1
+
+    scheduler._set_task_status("winner", "running", "旧代不应写入")
+
+    assert scheduler._status.tasks["winner"]["status"] == "waiting"
+    assert scheduler._status.tasks["winner"]["last_result"] == "尚未执行"
+
+
+def test_stop_releases_visible_running_task_without_cancelling_job() -> None:
+    runner = MagicMock()
+    runner.get_status.return_value.to_dict.return_value = {
+        "state": "running",
+        "action": "cleanup_maintenance_cycle",
+        "message": "仍由 JobRunner 执行",
+    }
+    scheduler = AutoScheduler(job_runner=runner)
+    scheduler._status.state = "running"
+    scheduler._status.tasks["cleanup"]["status"] = "running"
+
+    status = scheduler.stop()
+
+    assert status["tasks"]["cleanup"]["status"] == "waiting"
+    assert "不会被取消" in status["tasks"]["cleanup"]["last_result"]
+    runner.cancel.assert_not_called()
+
+
+def test_scheduler_log_is_sanitized_before_sse_or_snapshot() -> None:
+    scheduler = AutoScheduler(job_runner=JobRunner())
+
+    scheduler._log(
+        "info",
+        "GET https://api.example.test/feed?topic_id=123&csrf=topsecret SESSDATA=cookie-secret",
+    )
+
+    message = scheduler._logs[-1].message
+    assert "topic_id=123" not in message
+    assert "topsecret" not in message
+    assert "cookie-secret" not in message
+    assert "[查询参数已隐藏]" in message
+
+
 def test_click_rejects_forbidden_action() -> None:
     scheduler = AutoScheduler(job_runner=JobRunner())
     with pytest.raises(ValueError, match="禁止的操作"):
@@ -255,10 +299,10 @@ def test_next_slot_before_refresh() -> None:
     assert slot["at_unix"]
 
 
-def test_next_slot_triple_minute() -> None:
+def test_next_slot_participate_minute() -> None:
     now = datetime(2026, 7, 17, 2, 50, tzinfo=timezone(timedelta(hours=8)))
     slot = _next_slot(now)
-    assert slot["kind"] == "triple"
+    assert slot["kind"] == "participate"
     assert slot["minute"] == 55
     assert slot["action"] == "participate_triple"
     assert slot["action_label"] == "三连参与"
@@ -279,13 +323,19 @@ def test_next_auto_task_following_at_1258() -> None:
     assert task["minutes"] == 5
 
 
-def test_next_auto_task_participate_shortly() -> None:
+def test_next_auto_task_cleanup_uses_real_0205_slot() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 2, 2)))
-    assert task["label"] == "自动参与"
+    assert task["label"] == "清理维护"
     assert task["minutes"] == 3
 
 
-def test_next_auto_task_cleanup_after_refresh_hour() -> None:
+def test_next_auto_task_participate_after_refresh_hour() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 10)))
-    assert task["label"] == "清理维护"
-    assert task["minutes"] == 50
+    assert task["label"] == "自动参与"
+    assert task["minutes"] == 55
+
+
+def test_next_auto_task_winner_uses_real_0504_slot() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 5, 2)))
+    assert task["label"] == "中奖深探"
+    assert task["minutes"] == 2

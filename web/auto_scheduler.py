@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -59,7 +60,7 @@ REFRESH_STEPS = (
     {"action": "refresh_status", "label": "刷新任务状态"},
 )
 _AUTO_SNAPSHOT_MIN_INTERVAL_SEC = 0.5
-_AUTO_SNAPSHOT_LOG_LIMIT = 30
+_AUTO_SNAPSHOT_LOG_LIMIT = 100
 
 _SLOT_STATE_FILE = "scheduler_slots.json"
 _SLOT_STATE_MAX_TASKS = 8
@@ -200,6 +201,7 @@ class SchedulerStatus:
     server_now: str = ""
     server_now_unix: int = 0
     logs: list[dict[str, str]] = field(default_factory=list)
+    tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -221,6 +223,7 @@ class SchedulerStatus:
             "server_now": self.server_now,
             "server_now_unix": self.server_now_unix,
             "logs": list(self.logs),
+            "tasks": {key: dict(value) for key, value in self.tasks.items()},
             "next_task": next_auto_task(),
             "schedule": {
                 "refresh_hours": sorted(REFRESH_HOURS),
@@ -244,7 +247,26 @@ class AutoScheduler:
         self._ctx = threading.local()
         self._thread: threading.Thread | None = None
         self._logs: deque[LogEntry] = deque(maxlen=200)
-        self._status = SchedulerStatus(refresh_pipeline=_idle_pipeline())
+        self._status = SchedulerStatus(
+            refresh_pipeline=_idle_pipeline(),
+            tasks={
+                key: {
+                    "label": label,
+                    "status": "waiting",
+                    "last_started_at": None,
+                    "last_finished_at": None,
+                    "last_result": "尚未执行",
+                    "next_run_at": None,
+                }
+                for key, label in {
+                    "refresh": "刷新批次",
+                    "winner": "中奖深探",
+                    "cleanup": "清理维护",
+                    "following": "关注补漏",
+                    "participate": "自动参与",
+                }.items()
+            },
+        )
         self._done_refresh: set[str] = set()
         self._done_triple: set[str] = set()
         self._done_maintain: set[str] = set()
@@ -278,15 +300,28 @@ class AutoScheduler:
         now = datetime.now(CN_TZ)
         slot = _next_slot(now)
         probe = _probe_job(self._runner)
+        next_runs = _next_runs_by_task(now)
+        risk_view = risk_pause_state()
         with self._lock:
             self._status.logs = [
-                {"ts": e.ts, "level": e.level, "message": e.message} for e in list(self._logs)[-80:]
+                {"ts": e.ts, "level": e.level, "message": e.message} for e in list(self._logs)[-100:]
             ]
             self._status.next_slot = slot
             self._status.next_hint = slot.get("hint") or ""
             self._status.job_probe = probe
             self._status.server_now = _now_iso()
             self._status.server_now_unix = int(now.timestamp())
+            for key, task in self._status.tasks.items():
+                task["next_run_at"] = next_runs.get(key)
+                if risk_view.get("paused") and task.get("status") != "running":
+                    task["status"] = "risk_paused"
+                    task["last_result"] = str(
+                        risk_view.get("reason") or risk_view.get("code") or "平台风控冷却中"
+                    )
+                    task["resume_at"] = risk_view.get("paused_until")
+                elif task.get("status") == "risk_paused" and not risk_view.get("paused"):
+                    task["status"] = "waiting"
+                    task.pop("resume_at", None)
             if not self._status.refresh_pipeline:
                 self._status.refresh_pipeline = _idle_pipeline()
             return self._status.to_dict()
@@ -320,7 +355,7 @@ class AutoScheduler:
                     daemon=True,
                 )
                 self._thread.start()
-        self._log("info", "调度器已启动（按计划投递自动任务：刷新 / 参与 / 清理维护 / 关注补漏）")
+        self._log("info", "调度器已启动（按计划投递自动任务：刷新 / 参与 / 清理维护 / 关注补漏 / 中奖深探）")
         self._schedule_auto_snapshot(force=True)
         return self.get_status()
 
@@ -336,6 +371,11 @@ class AutoScheduler:
                 self._status.stopped_at = _now_iso()
                 self._status.current_phase = ""
                 self._status.refresh_pipeline = _idle_pipeline()
+                for task in self._status.tasks.values():
+                    if task.get("status") == "running":
+                        task["status"] = "waiting"
+                        task["last_finished_at"] = self._status.stopped_at
+                        task["last_result"] = "调度已停止；已投递 Job 不会被取消"
         self._log("warn", f"调度器已停止：{reason}")
         self._schedule_auto_snapshot(force=True)
         return self.get_status()
@@ -360,10 +400,48 @@ class AutoScheduler:
         self._schedule_auto_snapshot(force=True)
 
     def _log(self, level: str, message: str) -> None:
-        entry = LogEntry(ts=_now_iso(), level=level, message=message)
+        from web.user_messages import sanitize_log
+
+        safe_message = sanitize_log(str(message or "")) or "状态已更新"
+        safe_message = re.sub(
+            r"(https?://[^\s?]+)\?[^\s]+",
+            r"\1?[查询参数已隐藏]",
+            safe_message,
+            flags=re.IGNORECASE,
+        )
+        entry = LogEntry(ts=_now_iso(), level=level, message=safe_message)
         with self._lock:
             self._logs.append(entry)
         self._publish_auto_log(entry)
+
+    def _set_task_status(self, task: str, status: str, result: object = "") -> None:
+        """只更新现有 Scheduler 的观察状态；不投递 Job、不触发远程请求。"""
+        if self._is_stale():
+            return
+        now = _now_iso()
+        with self._lock:
+            entry = self._status.tasks.setdefault(
+                task,
+                {
+                    "label": task,
+                    "status": "waiting",
+                    "last_started_at": None,
+                    "last_finished_at": None,
+                    "last_result": "尚未执行",
+                    "next_run_at": None,
+                },
+            )
+            entry["status"] = status
+            if status == "running":
+                entry["last_started_at"] = now
+                entry["last_finished_at"] = None
+            elif status in {"completed", "skipped_busy", "risk_paused", "error"}:
+                entry["last_finished_at"] = now
+            if result:
+                from web.user_messages import sanitize_log
+
+                entry["last_result"] = sanitize_log(str(result)) or status
+        self._schedule_auto_snapshot(force=True)
 
     def _set_phase(self, phase: str, message: str | None = None) -> None:
         # 旧代线程的过期阶段更新不得污染新一代调度器的状态展示。
@@ -579,8 +657,8 @@ class AutoScheduler:
                         self._run_refresh_batch(key)
                         continue
 
-                # 清理数据自动维护：Scheduler 启动即自动拥有每 2 小时维护资格
-                # （无需用户单独开关；旧 enabled 配置不影响统一 Scheduler）。
+                # 清理维护调度随 Scheduler 启动；其中自动 DELETE 仍由 per-Profile
+                # auto_delete_enabled 独立授权，默认关闭，维护调度绝不隐式开启它。
                 # M8: 中奖深检约每 6 小时（05:04/11:04/17:04/23:04）
                 if now.minute == 4 and now.hour % 6 == 5:
                     key = f"winner-{now:%Y-%m-%d-%H}"
@@ -638,6 +716,7 @@ class AutoScheduler:
             self._done_refresh.add(key)
             return
         self._set_phase("刷新批次", f"开始刷新批次 {key}")
+        self._set_task_status("refresh", "running", "刷新批次开始")
         self._log("info", f"刷新批次开始 {key}：一键更新 → 监控动态 → 刷新状态")
         self._set_pipeline(active=True, step_index=0, waiting=False)
         actions = ("refresh_all", "refresh_watch", "refresh_status")
@@ -658,6 +737,7 @@ class AutoScheduler:
                     )
                     self._done_refresh.add(key)
                     self._set_pipeline(active=False)
+                    self._set_task_status("refresh", "skipped_busy", "本轮跳过（任务占用）")
                     return
                 except Exception as exc:
                     if matches_platform_risk(exc):
@@ -666,6 +746,7 @@ class AutoScheduler:
                         )
                         self._done_refresh.add(key)
                         self._set_pipeline(active=False)
+                        self._set_task_status("refresh", "risk_paused", str(exc))
                         return
                     if _is_hard_failure(exc):
                         raise
@@ -675,6 +756,7 @@ class AutoScheduler:
                 self._status.refresh_batch_key = key
             self._mark_remote_stage_finished()
             self._log("info", f"刷新批次完成 {key}")
+            self._set_task_status("refresh", "completed", "刷新批次完成")
             self._set_pipeline(active=False)
             self._set_phase("等待下一刻度", "刷新批次已完成")
         except CollisionError:
@@ -682,14 +764,18 @@ class AutoScheduler:
             self._log("warn", f"刷新批次检测到任务撞车，本轮已跳过：{key}")
             self._done_refresh.add(key)
             self._set_pipeline(active=False)
+            self._set_task_status("refresh", "skipped_busy", "本轮跳过（任务占用）")
         except Exception as exc:
             if matches_platform_risk(exc):
                 self._pause_all_auto_remote("refresh_batch", str(exc) or type(exc).__name__)
+                self._set_task_status("refresh", "risk_paused", str(exc))
             elif _is_hard_failure(exc):
+                self._set_task_status("refresh", "error", str(exc))
                 self._fatal(str(exc))
                 return
             else:
                 self._log("error", f"刷新批次中断 {key}：{exc}")
+                self._set_task_status("refresh", "error", str(exc))
             self._done_refresh.add(key)
             self._set_pipeline(active=False)
             self._set_phase("等待下一刻度", f"刷新批次异常已跳过：{exc}")
@@ -703,6 +789,7 @@ class AutoScheduler:
             return
         self._set_pipeline(active=False)
         self._set_phase("关注动态补漏", f"关注动态补漏 {key}")
+        self._set_task_status("following", "running", "关注动态补漏开始")
         self._log("info", f"关注动态补漏刻度 {key}")
         try:
             self._click_and_wait("following_feed_scan")
@@ -713,18 +800,23 @@ class AutoScheduler:
             with self._lock:
                 self._status.message = "关注动态补漏完成"
             self._mark_remote_stage_finished()
+            self._set_task_status("following", "completed", "关注动态补漏完成")
             self._set_phase("等待下一刻度", "关注动态补漏完成")
         except CollisionError:
             self._log("warn", "关注动态补漏发现已有任务在运行，本轮跳过。")
+            self._set_task_status("following", "skipped_busy", "本轮跳过（任务占用）")
             self._done_following.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
                 self._pause_all_auto_remote("following_feed_scan", str(exc) or type(exc).__name__)
+                self._set_task_status("following", "risk_paused", str(exc))
             elif _is_hard_failure(exc):
+                self._set_task_status("following", "error", str(exc))
                 self._fatal(str(exc))
                 return
             else:
                 self._log("warn", f"关注动态补漏跳过：{exc}")
+                self._set_task_status("following", "error", str(exc))
             self._done_following.add(key)
             self._set_phase("等待下一刻度", f"关注动态补漏已跳过：{exc}")
 
@@ -737,6 +829,7 @@ class AutoScheduler:
             return
         self._set_pipeline(active=False)
         self._set_phase("三连参与", f"触发三连参与 {key}")
+        self._set_task_status("participate", "running", "三连参与开始")
         self._log("info", f"三连参与刻度 {key}")
         try:
             outcome = self._click_and_wait("participate_triple")
@@ -750,20 +843,26 @@ class AutoScheduler:
             if outcome and outcome.get("skipped"):
                 msg = str(outcome.get("message") or "当前没有可参与活动，已跳过")
                 self._log("info", f"三连参与已跳过：{msg}")
+                self._set_task_status("participate", "completed", msg)
                 self._set_phase("等待下一刻度", msg)
             else:
+                self._set_task_status("participate", "completed", "三连参与完成")
                 self._set_phase("等待下一刻度", "三连参与已完成")
         except CollisionError:
             self._log("warn", "三连参与发现已有任务在运行，本轮跳过。")
+            self._set_task_status("participate", "skipped_busy", "本轮跳过（任务占用）")
             self._done_triple.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
                 self._pause_all_auto_remote("participate_triple", str(exc) or type(exc).__name__)
+                self._set_task_status("participate", "risk_paused", str(exc))
             elif _is_hard_failure(exc):
+                self._set_task_status("participate", "error", str(exc))
                 self._fatal(str(exc))
                 return
             else:
                 self._log("info", f"三连参与已跳过：{exc}")
+                self._set_task_status("participate", "error", str(exc))
             self._done_triple.add(key)
             self._set_phase("等待下一刻度", f"已跳过：{exc}")
 
@@ -841,27 +940,35 @@ class AutoScheduler:
             return
         self._set_pipeline(active=False)
         self._set_phase("中奖深检", f"中奖深检刻度 {key}")
-        self._log("info", f"中奖深检刻度 {key}")
+        self._set_task_status("winner", "running", "中奖深探开始")
+        self._log("info", "中奖深探开始")
         try:
-            self._click_and_wait("winner_deep_scan")
+            outcome = self._click_and_wait("winner_deep_scan")
             self._done_winner.add(key)
             if self._is_stale():
                 return
             with self._lock:
                 self._status.message = "中奖深检完成"
             self._mark_remote_stage_finished()
+            final_message = str((outcome or {}).get("message") or "中奖深探完成")
+            self._set_task_status("winner", "completed", final_message)
+            self._log("info", final_message)
             self._set_phase("等待下一刻度", "中奖深检完成")
         except CollisionError:
             self._log("warn", "中奖深检发现已有任务在运行，本轮跳过。")
+            self._set_task_status("winner", "skipped_busy", "本轮跳过（任务占用）")
             self._done_winner.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
                 self._pause_all_auto_remote("winner_deep_scan", str(exc) or type(exc).__name__)
+                self._set_task_status("winner", "risk_paused", str(exc))
             elif _is_hard_failure(exc):
+                self._set_task_status("winner", "error", str(exc))
                 self._fatal(str(exc))
                 return
             else:
                 self._log("warn", f"中奖深检跳过：{exc}")
+                self._set_task_status("winner", "error", str(exc))
             self._done_winner.add(key)
             self._set_phase("等待下一刻度", f"中奖深检已跳过：{exc}")
 
@@ -874,6 +981,7 @@ class AutoScheduler:
             return
         self._set_pipeline(active=False)
         self._set_phase("自动维护周期", f"自动维护周期刻度 {key}")
+        self._set_task_status("cleanup", "running", "清理维护开始")
         from src.repost_cleanup import auto_clear_expired_maintenance_risk, auto_maintenance_paused_state
 
         paused, pause_reason = auto_maintenance_paused_state()
@@ -883,32 +991,40 @@ class AutoScheduler:
             )
             if not cleared:
                 self._log("warn", f"自动维护风控冷却中，本轮跳过且不联网：{pause_reason}")
+                self._set_task_status("cleanup", "risk_paused", pause_reason or "风控暂停")
                 self._done_cleanup.add(key)
                 return
-        self._log("info", f"自动维护周期刻度 {key}")
+        self._log("info", "清理维护开始")
         try:
-            self._click_and_wait("cleanup_maintenance_cycle")
+            outcome = self._click_and_wait("cleanup_maintenance_cycle")
             self._done_cleanup.add(key)
             if self._is_stale():
                 return
             with self._lock:
                 self._status.message = "自动维护周期完成"
             self._mark_remote_stage_finished()
+            final_message = str((outcome or {}).get("message") or "清理维护完成")
+            self._set_task_status("cleanup", "completed", final_message)
+            self._log("info", final_message)
             self._set_phase("等待下一刻度", "自动维护周期完成")
             newly_paused, new_reason = auto_maintenance_paused_state()
             if newly_paused:
                 self._pause_all_auto_remote("cleanup_maintenance_cycle", new_reason or "cleanup 风控暂停")
         except CollisionError:
             self._log("warn", "自动维护周期发现已有任务在运行，本轮跳过。")
+            self._set_task_status("cleanup", "skipped_busy", "本轮跳过（任务占用）")
             self._done_cleanup.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
                 self._pause_all_auto_remote("cleanup_maintenance_cycle", str(exc) or type(exc).__name__)
+                self._set_task_status("cleanup", "risk_paused", str(exc))
             elif _is_hard_failure(exc):
+                self._set_task_status("cleanup", "error", str(exc))
                 self._fatal(str(exc))
                 return
             else:
                 self._log("warn", f"自动维护周期跳过：{exc}")
+                self._set_task_status("cleanup", "error", str(exc))
             self._done_cleanup.add(key)
             self._set_phase("等待下一刻度", f"自动维护周期已跳过：{exc}")
 
@@ -987,6 +1103,7 @@ class AutoScheduler:
         self._set_phase(f"等待结束：{label}", f"已点击「{label}」，等待抽奖端自行结束…")
         time.sleep(0.8)
         last: dict[str, Any] = {}
+        last_detail = ""
         while not self._is_stale():
             if time.monotonic() > deadline:
                 raise RuntimeError(f"等待「{label}」超时（超过 {int(JOB_POLL_TIMEOUT_SEC)} 秒）")
@@ -1000,6 +1117,9 @@ class AutoScheduler:
             detail = str(job.get("progress_message") or job.get("message") or "")
             if detail:
                 self._set_phase(f"等待结束：{label}", detail)
+                if detail != last_detail:
+                    self._log("info", f"{label} · {detail}")
+                    last_detail = detail
             self._active_stop_event().wait(JOB_POLL_INTERVAL_SEC)
         return last
 
@@ -1063,40 +1183,30 @@ def _now_iso() -> str:
 
 
 def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]]:
-    """按 AutoScheduler 真实 cadence 计算最近各候选任务的下一到期时刻。
-
-    优先级 = 顺序（与 _loop 判定顺序一致）：刷新批次 → 清理维护 → 关注补漏 → 自动参与。
-    """
+    """按 ``_loop`` 的真实 cadence 枚举未来 24 小时任务（纯只读）。"""
     candidates: list[tuple[str, str, datetime]] = []
-    for day_offset in range(0, 2):
-        base_day = (now + timedelta(days=day_offset)).replace(second=0, microsecond=0)
-
-        for hour in sorted(REFRESH_HOURS):
-            cand = base_day.replace(hour=hour, minute=0)
-            if cand > now:
-                candidates.append(("refresh", "刷新批次", cand))
-
-        for hour in range(0, 24, CLEANUP_MAINTAIN_INTERVAL_HOURS):
-            cand = base_day.replace(hour=hour, minute=0)
-            if cand > now:
-                candidates.append(("cleanup", "清理维护", cand))
-
-        for hour in range(0, 24):
-            if hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL != FOLLOWING_FEED_SCAN_HOUR_OFFSET:
-                continue
-            cand = base_day.replace(hour=hour, minute=FOLLOWING_FEED_SCAN_MINUTE)
-            if cand > now:
-                candidates.append(("following", "关注补漏", cand))
-
-        for hour in range(0, 24):
-            if hour in REFRESH_HOURS:
-                continue
-            for minute in sorted(TRIPLE_MINUTES):
-                cand = base_day.replace(hour=hour, minute=minute)
-                if cand > now:
-                    candidates.append(("participate", "自动参与", cand))
-        if candidates:
-            break
+    base = now.replace(second=0, microsecond=0)
+    for offset_min in range(1, 24 * 60 + 1):
+        candidate = base + timedelta(minutes=offset_min)
+        h, m = candidate.hour, candidate.minute
+        if h in REFRESH_HOURS and m == 0:
+            candidates.append(("refresh", "刷新批次", candidate))
+        if m == 4 and h % 6 == 5:
+            candidates.append(("winner", "中奖深探", candidate))
+        if m == 5 and h % 6 == 2:
+            candidates.append(("cleanup", "清理维护", candidate))
+        if (
+            m == FOLLOWING_FEED_SCAN_MINUTE
+            and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+        ):
+            candidates.append(("following", "关注补漏", candidate))
+        dedicated = (
+            (m == 3 and h % 6 == 1)
+            or (m == 4 and h % 6 == 5)
+            or (m == 5 and h % 6 == 2)
+        )
+        if h not in REFRESH_HOURS and m in TRIPLE_MINUTES and not dedicated:
+            candidates.append(("participate", "自动参与", candidate))
     return candidates
 
 
@@ -1119,44 +1229,55 @@ def next_auto_task(now: datetime | None = None) -> dict[str, Any]:
     }
 
 
-_AUTO_TASK_ORDER = {"refresh": 0, "cleanup": 1, "following": 2, "participate": 3}
+_AUTO_TASK_ORDER = {
+    "refresh": 0,
+    "winner": 1,
+    "cleanup": 2,
+    "following": 3,
+    "participate": 4,
+}
+
+
+def _next_runs_by_task(now: datetime) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for task, _label, due in _next_occurrence_candidates(now):
+        result.setdefault(task, int(due.timestamp()))
+        if len(result) == len(_AUTO_TASK_ORDER):
+            break
+    return result
 
 
 def _next_slot(now: datetime) -> dict[str, Any]:
-    for offset_min in range(1, 24 * 60 + 1):
-        candidate = now.replace(second=0, microsecond=0) + timedelta(minutes=offset_min)
-        h, m = candidate.hour, candidate.minute
-        if h in REFRESH_HOURS and m == 0:
-            return {
-                "kind": "refresh",
-                "label": "刷新批次",
-                "action": "refresh_all",
-                "action_label": ACTION_LABELS["refresh_all"],
-                "actions": [
-                    {"action": item["action"], "label": item["label"]}
-                    for item in REFRESH_STEPS
-                ],
-                "at": candidate.strftime("%Y-%m-%d %H:%M:%S"),
-                "at_unix": int(candidate.timestamp()),
-                "hour": h,
-                "minute": m,
-                "hint": f"下次刷新批次约 {h:02d}:00（一键更新→监控→状态）",
-            }
-        if h not in REFRESH_HOURS and m in TRIPLE_MINUTES:
-            return {
-                "kind": "triple",
-                "label": "三连参与",
-                "action": "participate_triple",
-                "action_label": ACTION_LABELS["participate_triple"],
-                "actions": [
-                    {"action": "participate_triple", "label": ACTION_LABELS["participate_triple"]}
-                ],
-                "at": candidate.strftime("%Y-%m-%d %H:%M:%S"),
-                "at_unix": int(candidate.timestamp()),
-                "hour": h,
-                "minute": m,
-                "hint": f"下次三连参与约 {h:02d}:{m:02d}",
-            }
+    task = next_auto_task(now)
+    at_unix = task.get("at_unix")
+    if at_unix:
+        candidate = datetime.fromtimestamp(int(at_unix), CN_TZ)
+        kind = str(task.get("action") or "")
+        action_by_kind = {
+            "refresh": "refresh_all",
+            "winner": "winner_deep_scan",
+            "cleanup": "cleanup_maintenance_cycle",
+            "following": "following_feed_scan",
+            "participate": "participate_triple",
+        }
+        action = action_by_kind[kind]
+        actions = (
+            [{"action": item["action"], "label": item["label"]} for item in REFRESH_STEPS]
+            if kind == "refresh"
+            else [{"action": action, "label": ACTION_LABELS[action]}]
+        )
+        return {
+            "kind": kind,
+            "label": task.get("label"),
+            "action": action,
+            "action_label": ACTION_LABELS[action],
+            "actions": actions,
+            "at": candidate.strftime("%Y-%m-%d %H:%M:%S"),
+            "at_unix": int(at_unix),
+            "hour": candidate.hour,
+            "minute": candidate.minute,
+            "hint": f"下次{task.get('label')}约 {candidate:%H:%M}",
+        }
     return {
         "kind": "none",
         "label": "暂无",

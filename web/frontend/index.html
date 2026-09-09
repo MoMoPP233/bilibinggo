@@ -145,10 +145,12 @@
         </div>
         <div class="auto-schedule-list">
           <p class="caption auto-dock-schedule-note">自动参与：按既定三连时间执行</p>
-          <p class="caption auto-dock-schedule-note">清理维护：每 2 小时自动执行</p>
+          <p class="caption auto-dock-schedule-note">中奖深探：05:04 / 11:04 / 17:04 / 23:04</p>
+          <p class="caption auto-dock-schedule-note">清理维护：02:05 / 08:05 / 14:05 / 20:05</p>
           <p class="caption auto-dock-schedule-note">关注补漏：每 6 小时自动执行</p>
           <p class="caption auto-dock-schedule-note" id="auto-next-task">—</p>
         </div>
+        <div class="auto-task-status-list" id="auto-task-status-list" aria-live="polite"></div>
         <p class="caption auto-following-info" id="auto-following-info" hidden></p>
         <div class="auto-dock-actions">
           <button type="button" class="btn btn-primary btn-pill auto-dock-action-btn" id="auto-dock-start">启动调度</button>
@@ -181,6 +183,9 @@
         <p class="log-dock-message" id="job-message">暂无任务</p>
       </div>
       <div class="log-dock-body" id="log-dock-body">
+        <p class="caption log-dock-section-label">自动调度日志（最近 100 条）</p>
+        <pre class="log-box scheduler-log-box" id="auto-log">暂无自动调度日志</pre>
+        <p class="caption log-dock-section-label">当前任务日志</p>
         <pre class="log-box" id="job-log"></pre>
         <span class="log-dock-pin-hint" id="log-dock-pin-hint" hidden>已跟随最新日志</span>
       </div>
@@ -311,7 +316,6 @@
                   <h2 class="section-title">多账号数据隔离</h2>
                   <p class="section-desc">每个 Profile 独立保存账号 Cookie、活动与参与状态。</p>
                 </div>
-                <button type="button" class="btn btn-secondary btn-compact btn-pill" id="profile-create" hidden>新建账号</button>
                 <button type="button" class="btn btn-primary btn-pill" id="profile-onboarding-start">扫码登录新账号</button>
               </div>
               <div class="profile-restart-notice" id="profile-restart-notice" role="status" hidden>
@@ -653,17 +657,24 @@
                 <div>
                   <p class="eyebrow">Cleanup Center</p>
                   <h2 class="section-title">抽奖转发清理中心</h2>
-                  <p class="section-desc">先同步转发历史，再点击“一键智能评估”。safe 可勾选删除；manual_review 需人工核对后强确认删除；deferred 暂缓；blocked 不可删除。页面打开/刷新/切换均为 0 远程请求。</p>
+                  <p class="section-desc">一次同步并连续评估全部当前 backlog。safe 可勾选删除；manual_review 需人工核对后强确认删除；deferred 暂缓；blocked 不可删除。页面打开/刷新/切换均为 0 远程请求。</p>
                 </div>
                 <div class="action-row repost-cleanup-actions">
-                  <button type="button" class="btn btn-secondary btn-pill" id="repost-sync-btn" data-action="sync_repost_history">同步我的转发历史</button>
-                  <button type="button" class="btn btn-primary btn-pill" id="repost-scan-btn" data-action="scan_expired_reposts">一键智能评估</button>
+                  <button type="button" class="btn btn-primary btn-pill" id="repost-sync-assess-btn" data-action="sync_assess_repost_history">同步/评估转发历史</button>
+                  <button type="button" class="btn btn-secondary btn-pill" id="auto-delete-run">立即执行安全清理</button>
+                  <label class="ntf-toggle"><input type="checkbox" id="auto-delete-toggle" /> <span id="auto-delete-toggle-label">自动删除：关闭</span></label>
                   <button type="button" class="btn btn-ghost btn-pill" id="repost-stop-btn" disabled>停止评估</button>
                 </div>
               </div>
+              <div class="auto-cleanup-meta">
+                <span class="caption">safe 候选：<b id="auto-delete-safe">0</b></span>
+                <span class="caption">delete_pending：<b id="auto-delete-pending">0</b></span>
+                <span class="caption">unknown：<b id="auto-delete-unknown">0</b></span>
+                <span class="caption" id="auto-delete-hint"></span>
+              </div>
               <div class="repost-cleanup-safety" role="note">
                 <strong>严格安全边界</strong>
-                <span>只有你主动点击同步 / 智能评估 / 定向重评 / 删除时才允许远程请求；命中平台限流立即停止并保存已完成结果，不自动继续、不绕过限制。</span>
+                <span>只有你主动点击同步/评估、定向重评或删除时才允许远程请求；命中平台限流立即停止并保存已完成结果，不自动继续、不绕过限制。</span>
               </div>
               <p class="repost-eval-status" id="repost-eval-status" aria-live="polite">尚未开始智能评估</p>
               <div class="repost-cleanup-metrics" aria-live="polite">

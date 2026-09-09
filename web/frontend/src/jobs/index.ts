@@ -1261,6 +1261,7 @@ export function updateProgressUI(job) {
       update_all_datasources: "全部数据源更新",
       refresh_watch: "监控扫描",
       sync_repost_history: "转发同步",
+      sync_assess_repost_history: "转发同步/评估",
       scan_expired_reposts: "智能评估",
       delete_expired_reposts: "转发删除",
       login: "登录任务",

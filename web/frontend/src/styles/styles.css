@@ -6000,6 +6000,76 @@ body.modal-open {
   border: 1px solid color-mix(in srgb, var(--border-soft) 80%, transparent);
 }
 
+.log-dock-section-label {
+  margin: 10px 0 6px;
+  font-weight: 700;
+}
+
+.log-dock-section-label:first-child {
+  margin-top: 0;
+}
+
+.log-dock-body .scheduler-log-box {
+  max-height: 180px;
+  white-space: pre-wrap;
+}
+
+.auto-task-status-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.auto-task-status-row {
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.auto-task-status-row > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.auto-task-status-row p,
+.auto-task-status-row small {
+  display: block;
+  margin: 4px 0 0;
+  color: var(--foreground-muted);
+  line-height: 1.35;
+}
+
+.auto-task-status-row[data-status="running"] {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+}
+
+.auto-task-status-row[data-status="risk_paused"],
+.auto-task-status-row[data-status="error"] {
+  border-color: color-mix(in srgb, var(--danger-alt) 42%, var(--border-soft));
+}
+
+.winner-scheduler-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface-soft);
+}
+
+.winner-scheduler-state small {
+  flex-basis: 100%;
+  color: var(--foreground-muted);
+}
+
+.repost-cleanup-actions .ntf-toggle {
+  align-self: center;
+}
+
 .log-dock-pin-hint {
   position: absolute;
   right: 10px;

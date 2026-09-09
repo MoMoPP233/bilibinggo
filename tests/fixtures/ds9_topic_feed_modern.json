@@ -1,0 +1,54 @@
+{
+  "code": 0,
+  "message": "0",
+  "data": {
+    "related_topics": [],
+    "topic_card_list": {
+      "has_more": true,
+      "offset": "574748481266496",
+      "topic_sort_by_conf": {
+        "all_sort_by": [
+          {"sort_by": 2, "sort_name": "热门"},
+          {"sort_by": 3, "sort_name": "最新"}
+        ],
+        "default_sort_by": 2,
+        "show_sort_by": 3
+      },
+      "items": [
+        {
+          "topic_type": "DYNAMIC",
+          "dynamic_card_item": {
+            "id_str": "2000000000000000001",
+            "type": "DYNAMIC_TYPE_DRAW",
+            "modules": {"module_author": {"mid": 10001}},
+            "visible": true
+          }
+        },
+        {
+          "topic_type": "DYNAMIC",
+          "dynamic_card_item": {
+            "id_str": "2000000000000000003",
+            "type": "DYNAMIC_TYPE_FORWARD",
+            "modules": {"module_author": {"mid": 20002}},
+            "orig": {
+              "id_str": "2000000000000000002",
+              "type": "DYNAMIC_TYPE_DRAW",
+              "modules": {"module_author": {"mid": 90009}},
+              "visible": true
+            },
+            "visible": true
+          }
+        },
+        {
+          "topic_type": "DYNAMIC",
+          "dynamic_card_item": {
+            "id_str": "2000000000000000004",
+            "type": "DYNAMIC_TYPE_WORD",
+            "modules": {"module_author": {"mid": 30003}},
+            "visible": true
+          }
+        }
+      ]
+    }
+  }
+}

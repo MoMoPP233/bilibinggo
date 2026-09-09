@@ -448,6 +448,31 @@ class BilibiliClient:
             retries=1,
         )
 
+    def get_topic_feed(
+        self,
+        topic_id: str,
+        *,
+        offset: str = "",
+        page_size: int = 20,
+        sort_by: int = 3,
+        source: str = "Web",
+    ) -> dict:
+        """现代 Web 话题动态 Feed；返回原始 JSON 供 DS9 做结构化错误处理。"""
+        params: dict[str, object] = {
+            "topic_id": str(topic_id),
+            "page_size": max(1, min(int(page_size), 50)),
+            "sort_by": int(sort_by),
+            "source": str(source),
+        }
+        if offset:
+            params["offset"] = str(offset)
+        return self.request_json(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/topic",
+            params=params,
+            referer=f"https://www.bilibili.com/v/topic/detail?topic_id={topic_id}",
+            retries=1,
+        )
+
     def get_topic_history(
         self,
         topic_id: str,

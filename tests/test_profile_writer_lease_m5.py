@@ -283,6 +283,8 @@ def test_writer_action_classification() -> None:
     assert "participate_triple" in actions.WRITER_LEASE_ACTIONS
     assert "update_all_datasources" in actions.WRITER_LEASE_ACTIONS
     assert "scan_expired_reposts" in actions.WRITER_LEASE_ACTIONS
+    assert "sync_assess_repost_history" in actions.WRITER_LEASE_ACTIONS
+    assert "cleanup_maintenance_cycle" in actions.WRITER_LEASE_ACTIONS
     # 不存在只读 action 误加锁的清单成员
     for read_only in ("not_an_action", "health_check", "list_activities"):
         assert read_only not in actions.WRITER_LEASE_ACTIONS

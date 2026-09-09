@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 const {
   fetchJSONMock,
@@ -52,8 +53,7 @@ const candidate = {
 
 function setupDom(): void {
   document.body.innerHTML = `
-    <button id="repost-sync-btn" data-action="sync_repost_history">同步历史</button>
-    <button id="repost-scan-btn" data-action="scan_expired_reposts">扫描</button>
+    <button id="repost-sync-assess-btn" data-action="sync_assess_repost_history">同步/评估转发历史</button>
     <button id="repost-stop-btn" data-job-control disabled>停止评估</button>
     <p id="repost-eval-status">尚未开始智能评估</p>
     <span id="repost-history-total">—</span>
@@ -117,6 +117,20 @@ async function selectOnlyCandidate(module: Awaited<ReturnType<typeof loadModule>
 }
 
 describe("repost cleanup UI", () => {
+  it("ships one combined main action beside safe cleanup and the auto-delete switch", () => {
+    const html = readFileSync("index.html", "utf-8");
+    const combined = html.indexOf('id="repost-sync-assess-btn"');
+    const safeCleanup = html.indexOf('id="auto-delete-run"');
+    const autoDelete = html.indexOf('id="auto-delete-toggle"');
+
+    expect(combined).toBeGreaterThan(0);
+    expect(safeCleanup).toBeGreaterThan(combined);
+    expect(autoDelete).toBeGreaterThan(safeCleanup);
+    expect(autoDelete - combined).toBeLessThan(1800);
+    expect(html).not.toContain('id="repost-sync-btn"');
+    expect(html).not.toContain('id="repost-scan-btn"');
+  });
+
   beforeEach(() => {
     vi.resetModules();
     fetchJSONMock.mockReset();
@@ -526,36 +540,29 @@ describe("repost cleanup UI", () => {
     expect(fetchJSONMock).not.toHaveBeenCalled();
   });
 
-  it("sync start locks buttons instantly and an ultra-fast second click is ignored", async () => {
+  it("combined sync/assess start locks instantly and an ultra-fast second click is ignored", async () => {
     const module = await loadModule();
     module.bindRepostCleanup();
-    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
-    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
-    expect(syncBtn.disabled).toBe(false);
+    const combinedBtn = document.getElementById("repost-sync-assess-btn") as HTMLButtonElement;
+    expect(combinedBtn.disabled).toBe(false);
 
-    syncBtn.click();
-    expect(syncBtn.disabled).toBe(true);
-    expect(scanBtn.disabled).toBe(true);
+    combinedBtn.click();
+    expect(combinedBtn.disabled).toBe(true);
 
-    syncBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    combinedBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await vi.waitFor(() => expect(startJobMock).toHaveBeenCalledTimes(1));
-    expect(startJobMock).toHaveBeenCalledWith("sync_repost_history", {});
+    expect(startJobMock).toHaveBeenCalledWith("sync_assess_repost_history", {});
   });
 
-  it("evaluate start locks instantly and ignores ultra-fast double click", async () => {
+  it("retryable row still starts a targeted smart assessment", async () => {
     const module = await loadModule();
     module.bindRepostCleanup();
-    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
-    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
-
-    scanBtn.click();
-    expect(scanBtn.disabled).toBe(true);
-    expect(syncBtn.disabled).toBe(true);
-    expect(document.getElementById("repost-eval-status")?.textContent).toBe("智能评估进行中…");
-
-    scanBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    module.setCandidates([
+      { ...candidate, level: "blocked", assessment_status: "retryable_unknown", reason: "临时失败" },
+    ]);
+    document.querySelector<HTMLButtonElement>("[data-repost-reeval='80001']")!.click();
     await vi.waitFor(() => expect(startJobMock).toHaveBeenCalledTimes(1));
-    expect(startJobMock).toHaveBeenCalledWith("scan_expired_reposts", {});
+    expect(startJobMock).toHaveBeenCalledWith("scan_expired_reposts", { force_original_ids: ["80001"] });
   });
 
   it("stop request sends exactly one cancel even under rapid double click", async () => {
@@ -583,14 +590,12 @@ describe("repost cleanup UI", () => {
     startJobMock.mockRejectedValueOnce(new Error("网络异常"));
     const module = await loadModule();
     module.bindRepostCleanup();
-    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
-    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
+    const combinedBtn = document.getElementById("repost-sync-assess-btn") as HTMLButtonElement;
 
-    syncBtn.click();
+    combinedBtn.click();
     await vi.waitFor(() => expect(notifyJobStartErrorMock).toHaveBeenCalled());
 
-    expect(syncBtn.disabled).toBe(false);
-    expect(scanBtn.disabled).toBe(false);
+    expect(combinedBtn.disabled).toBe(false);
     expect(startJobMock).toHaveBeenCalledTimes(1);
   });
 
@@ -600,20 +605,18 @@ describe("repost cleanup UI", () => {
       (freshState.state as unknown as { currentJob: unknown }).currentJob = {
         id: 77,
         state: "running",
-        action: "sync_repost_history",
+        action: "sync_assess_repost_history",
         source: "ui",
       };
     });
     const module = await loadModule();
     module.bindRepostCleanup();
-    const syncBtn = document.getElementById("repost-sync-btn") as HTMLButtonElement;
-    const scanBtn = document.getElementById("repost-scan-btn") as HTMLButtonElement;
+    const combinedBtn = document.getElementById("repost-sync-assess-btn") as HTMLButtonElement;
     const stopBtn = document.getElementById("repost-stop-btn") as HTMLButtonElement;
 
-    syncBtn.click();
+    combinedBtn.click();
     await vi.waitFor(() => expect(startJobMock).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(syncBtn.disabled).toBe(true));
-    expect(scanBtn.disabled).toBe(true);
+    await vi.waitFor(() => expect(combinedBtn.disabled).toBe(true));
     expect(stopBtn.disabled).toBe(false);
   });
 

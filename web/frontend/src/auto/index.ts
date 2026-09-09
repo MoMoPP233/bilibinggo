@@ -115,11 +115,82 @@ function nextTaskUnix(status) {
   return Number.isFinite(unix) ? unix : null;
 }
 
+function runningAutoTask(status) {
+  return Object.values(status?.tasks || {}).find((task: any) => task?.status === "running") as any;
+}
+
+function safeAutoLogText(value) {
+  let text = sanitizeUserText(value);
+  text = text.replace(/\b(SESSDATA|bili_jct|SendKey|token|secret|webhook)\b\s*[:=]\s*[^\s,;]+/gi, "$1=[已隐藏]");
+  text = text.replace(/(https?:\/\/[^\s?]+)\?[^\s]+/gi, "$1?[查询参数已隐藏]");
+  return text;
+}
+
+function formatTaskTime(value) {
+  if (!value) return "—";
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(String(value).replace(" ", "T") + "+08:00");
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+export function renderAutoTaskStatuses(status) {
+  const root = document.getElementById("auto-task-status-list");
+  if (!root) return;
+  const rows = status?.tasks || {};
+  const labels = {
+    waiting: "等待",
+    running: "运行中",
+    completed: "完成",
+    skipped_busy: "本轮跳过（任务占用）",
+    risk_paused: "风控暂停",
+    error: "错误",
+  };
+  root.innerHTML = ["winner", "cleanup", "following", "refresh", "participate"]
+    .filter((key) => rows[key])
+    .map((key) => {
+      const task: any = rows[key] || {};
+      const taskStatus = String(task.status || "waiting");
+      const next = taskStatus === "risk_paused" ? task.resume_at : task.next_run_at;
+      const countdownSeconds = getAutoCountdownSeconds(Number(next) || null);
+      const countdown = taskStatus === "running"
+        ? "正在执行"
+        : String(status?.state || "") === "running" && countdownSeconds === 0
+          ? "正在确认状态…"
+          : formatAutoCountdown(Number(next) || null);
+      return `<div class="auto-task-status-row" data-status="${escapeHtml(taskStatus)}">
+        <div><strong>${escapeHtml(task.label || key)}</strong><span>${escapeHtml(labels[taskStatus] || taskStatus)}</span></div>
+        <p>上次 ${escapeHtml(formatTaskTime(task.last_started_at))} · 下次 ${escapeHtml(formatTaskTime(next))} · ${escapeHtml(countdown)}</p>
+        <small>${escapeHtml(safeAutoLogText(task.last_result || ""))}</small>
+      </div>`;
+    })
+    .join("");
+}
+
+export function renderAutoLogs(logs) {
+  const output = document.getElementById("auto-log");
+  if (!output) return;
+  const rows = Array.isArray(logs) ? logs.slice(-100) : [];
+  output.textContent = rows.length
+    ? rows.map((row) => {
+        const rawTime = String(row?.ts || "");
+        const time = rawTime.length >= 19 ? rawTime.slice(11, 19) : rawTime;
+        return `${time || "--:--:--"} ${safeAutoLogText(row?.message || "状态已更新")}`;
+      }).join("\n")
+    : "暂无自动调度日志";
+  output.scrollTop = output.scrollHeight;
+}
+
 export function updateAutoCollapsedMeta(status) {
   if (!autoDockToggleMeta) return;
   const schedulerState = String(status?.state || "idle");
   if (schedulerState === "running") {
-    const countdown = formatAutoCountdown(nextTaskUnix(status));
+    const runningTask = runningAutoTask(status);
+    const seconds = getAutoCountdownSeconds(nextTaskUnix(status));
+    const countdown = runningTask
+      ? "正在执行"
+      : seconds === 0
+        ? "正在确认状态…"
+        : formatAutoCountdown(nextTaskUnix(status));
     autoDockToggleMeta.hidden = false;
     autoDockToggleMeta.textContent = countdown === "—" ? "…" : countdown;
     return;
@@ -202,6 +273,8 @@ export function renderAutoDock(status) {
   }
   tickAutoCountdown();
   renderAutoPipeline(status.refresh_pipeline);
+  renderAutoTaskStatuses(status);
+  renderAutoLogs(status.logs);
   updateAutoCollapsedMeta(status);
   renderNextAutoTask(status);
 
@@ -245,19 +318,27 @@ export function renderAutoDock(status) {
   } else {
     ensureAutoCountdown();
   }
+  window.dispatchEvent(new CustomEvent("binggo:auto-status", { detail: status }));
 }
 
 export function tickAutoCountdown() {
   const status = state.autoScheduler;
   if (!autoDockCountdown) return;
   const targetUnix = nextTaskUnix(status);
-  autoDockCountdown.textContent = formatAutoCountdown(targetUnix);
   const countdownSec = getAutoCountdownSeconds(targetUnix);
   const running = String(status?.state || "") === "running";
+  const activeTask = runningAutoTask(status);
+  autoDockCountdown.textContent = activeTask
+    ? "正在执行"
+    : running && countdownSec === 0
+      ? "正在确认状态…"
+      : formatAutoCountdown(targetUnix);
   const urgent = running && countdownSec !== null && countdownSec > 0 && countdownSec < 60;
   autoDockCountdown.classList.toggle("is-urgent", urgent);
   document.querySelector(".auto-dock-hero")?.classList.toggle("is-urgent", urgent);
+  renderAutoTaskStatuses(status);
   updateAutoCollapsedMeta(status);
+  window.dispatchEvent(new CustomEvent("binggo:auto-tick", { detail: status }));
 }
 
 export function ensureAutoCountdown() {
@@ -408,5 +489,5 @@ export function mergeAutoLogs(existing, incoming) {
     if (!row) continue;
     map.set(autoLogKey(row), row);
   }
-  return Array.from(map.values()).slice(-80);
+  return Array.from(map.values()).slice(-100);
 }
