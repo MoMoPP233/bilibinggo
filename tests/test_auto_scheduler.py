@@ -65,10 +65,10 @@ def test_cleanup_maintenance_paused_tick_never_starts_remote_job(monkeypatch) ->
         lambda: (True, "-352 风控暂停"),
     )
 
-    scheduler._run_maintenance("2026-09-02-maintain")
+    scheduler._run_cleanup_cycle("cleanup-2026-09-02")
 
     runner.try_start.assert_not_called()
-    assert "2026-09-02-maintain" in scheduler._done_maintain
+    assert "cleanup-2026-09-02" in scheduler._done_cleanup
 
 
 def test_task_status_rejects_stale_scheduler_generation() -> None:

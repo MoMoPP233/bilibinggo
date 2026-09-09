@@ -269,7 +269,6 @@ class AutoScheduler:
         )
         self._done_refresh: set[str] = set()
         self._done_triple: set[str] = set()
-        self._done_maintain: set[str] = set()
         self._done_cleanup: set[str] = set()
         self._done_winner: set[str] = set()
         self._done_following: set[str] = set()
@@ -865,71 +864,6 @@ class AutoScheduler:
                 self._set_task_status("participate", "error", str(exc))
             self._done_triple.add(key)
             self._set_phase("等待下一刻度", f"已跳过：{exc}")
-
-    def _run_maintenance(self, key: str) -> None:
-        if not _stale_or_slot_guard(self, "maintain", key):
-            self._done_maintain.add(key)
-            return
-        if not self._remote_stage_allowed():
-            self._done_maintain.add(key)
-            return
-        self._set_pipeline(active=False)
-        self._set_phase("清理维护", f"自动维护刻度 {key}")
-        from src.repost_cleanup import auto_maintenance_paused_state
-
-        paused, pause_reason = auto_maintenance_paused_state()
-        if paused:
-            from src.repost_cleanup import auto_clear_expired_maintenance_risk
-
-            cleared = auto_clear_expired_maintenance_risk(
-                cooldown_seconds=AUTO_REMOTE_RISK_COOLDOWN_SECONDS
-            )
-            if not cleared:
-                self._log(
-                    "warn",
-                    f"自动维护风控冷却中，本轮跳过且不联网：{pause_reason}",
-                )
-                self._done_maintain.add(key)
-                with self._lock:
-                    self._status.message = "自动维护风控冷却中，冷却结束后等下一次正常调度。"
-                self._set_phase(
-                    "等待下一刻度",
-                    "自动维护风控冷却中，冷却结束后等下一次正常调度。",
-                )
-                return
-            self._log(
-                "info",
-                "自动维护风控冷却已到期，已本地恢复调度资格（不立即联网）。",
-            )
-        self._log("info", f"清理数据自动维护刻度 {key}")
-        try:
-            self._click_and_wait("cleanup_auto_maintain")
-            self._done_maintain.add(key)
-            if self._is_stale():
-                # 停止/换代：Job 自行自然结束，旧代不再推进阶段状态。
-                return
-            with self._lock:
-                self._status.message = "自动维护完成"
-            self._mark_remote_stage_finished()
-            self._set_phase("等待下一刻度", "自动维护完成")
-            # cleanup 若在运行中命中风控，会把自己 maintenance_risk_paused 置 ON；
-            # 此处把同一风险同时提升为“全局自动远程暂停”。
-            newly_paused, new_reason = auto_maintenance_paused_state()
-            if newly_paused:
-                self._pause_all_auto_remote("cleanup_auto_maintain", new_reason or "cleanup 风控暂停")
-        except CollisionError:
-            self._log("warn", "自动维护发现已有任务在运行，本轮跳过。")
-            self._done_maintain.add(key)
-        except Exception as exc:
-            if matches_platform_risk(exc):
-                self._pause_all_auto_remote("cleanup_auto_maintain", str(exc) or type(exc).__name__)
-            elif _is_hard_failure(exc):
-                self._fatal(str(exc))
-                return
-            else:
-                self._log("warn", f"自动维护跳过：{exc}")
-            self._done_maintain.add(key)
-            self._set_phase("等待下一刻度", f"自动维护已跳过：{exc}")
 
     def _run_winner_scan(self, key: str) -> None:
         if not _stale_or_slot_guard(self, "winner_scan", key):

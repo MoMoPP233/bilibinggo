@@ -207,8 +207,8 @@ def test_scheduler_cleanup_runs_without_toggle(state_path: Path, monkeypatch) ->
 
     scheduler = AutoScheduler(job_runner=MagicMock())
     scheduler._click_and_wait = fake
-    scheduler._run_maintenance("2026-07-17-06-maintain")
-    assert calls == ["cleanup_auto_maintain"]
+    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
+    assert calls == ["cleanup_maintenance_cycle"]
 
 
 def test_next_scan_follows_cadence() -> None:

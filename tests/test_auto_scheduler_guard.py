@@ -114,7 +114,7 @@ def test_cooldown_blocks_consecutive_ticks_with_zero_remote(state_path: Path) ->
     scheduler = _scheduler_with_fake_click(fake)
     for i in range(4):
         scheduler._run_triple_slot(f"triple-{i}")
-        scheduler._run_maintenance(f"maint-{i}")
+        scheduler._run_cleanup_cycle(f"cleanup-{i}")
         scheduler._run_refresh_batch(f"refresh-{i}")
     assert calls == []
     assert scheduler._status.state != "fatal"
@@ -200,9 +200,9 @@ def test_cleanup_risk_sets_global_cooldown(state_path: Path, monkeypatch) -> Non
         return {"skipped": False}
 
     scheduler = _scheduler_with_fake_click(fake)
-    scheduler._run_maintenance("2026-07-17-06-maintain")
+    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
 
-    assert calls == ["cleanup_auto_maintain"]
+    assert calls == ["cleanup_maintenance_cycle"]
     assert cleanup_read()[0] is True
     assert state_mod.is_risk_paused() is True
     assert "cleanup" in state_mod.risk_pause_state()["trigger_stage"]
@@ -225,9 +225,9 @@ def test_cleanup_local_pause_auto_clears_after_cooldown(
         return {"skipped": False}
 
     scheduler = _scheduler_with_fake_click(fake)
-    scheduler._run_maintenance("2026-07-17-08-maintain")
+    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
     # 冷却到期 → 本地恢复资格 → 本轮（正常维护刻度）执行 cleanup。
-    assert calls == ["cleanup_auto_maintain"]
+    assert calls == ["cleanup_maintenance_cycle"]
     assert state_mod.is_risk_paused() is False
 
 
@@ -249,9 +249,9 @@ def test_cleanup_local_pause_within_cooldown_skips_zero_remote(
         return {"skipped": False}
 
     scheduler = _scheduler_with_fake_click(fake)
-    scheduler._run_maintenance("2026-07-17-08-maintain")
+    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
     assert calls == []
-    assert "2026-07-17-08-maintain" in scheduler._done_maintain
+    assert "cleanup-2026-07-17-08" in scheduler._done_cleanup
 
 
 def test_min_remote_stage_gap_still_blocks(state_path: Path) -> None:

@@ -142,7 +142,7 @@ def test_corrupt_state_fails_closed(slot_root: Path) -> None:
 def test_missing_state_is_not_corrupt(slot_root: Path) -> None:
     clicks: list[str] = []
     scheduler = _scheduler_with_count(clicks, slot_root)
-    scheduler._run_maintenance("maint-2026-09-06-04")
+    scheduler._run_cleanup_cycle("cleanup-2026-09-06-04")
     assert _count(clicks) == 1
 
 
@@ -219,9 +219,9 @@ def test_stale_generation_cannot_claim(slot_root: Path) -> None:
 
 def test_state_write_is_atomic_no_partial_file(slot_root: Path) -> None:
     scheduler = _scheduler_with_count([], slot_root)
-    scheduler._run_maintenance("maint-2026-09-06-08")
+    scheduler._run_cleanup_cycle("cleanup-2026-09-06-08")
     assert _slot_file(slot_root).exists()
     leftovers = list(slot_root.glob(".scheduler_slots.json.*.tmp"))
     assert leftovers == []
     data = json.loads(_slot_file(slot_root).read_text(encoding="utf-8"))
-    assert data["maintain"] == "maint-2026-09-06-08"
+    assert data["cleanup_cycle"] == "cleanup-2026-09-06-08"

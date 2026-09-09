@@ -220,7 +220,7 @@ def test_structured_risk_blocks_all_following(monkeypatch, message) -> None:
     assert len(client.deleted) == 1
     assert result["deleted_count"] == 0
 
-def test_scheduler_maintenance_never_starts_auto_delete(isolated_home, monkeypatch) -> None:
+def test_scheduler_cleanup_cycle_never_starts_auto_delete(isolated_home, monkeypatch) -> None:
     from unittest.mock import MagicMock
 
     from web.auto_scheduler import AutoScheduler
@@ -236,6 +236,6 @@ def test_scheduler_maintenance_never_starts_auto_delete(isolated_home, monkeypat
     scheduler = AutoScheduler(job_runner=MagicMock())
     scheduler._click_and_wait = fake
     # 触发现有维护周期：不得因此启动 DELETE（M6 不隐式接入 Scheduler）
-    scheduler._run_maintenance("2026-07-17-06-maintain")
+    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
     assert "cleanup_auto_delete" not in calls
-    assert calls == ["cleanup_auto_maintain"]
+    assert calls == ["cleanup_maintenance_cycle"]

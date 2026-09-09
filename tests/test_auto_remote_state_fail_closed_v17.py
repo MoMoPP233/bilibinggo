@@ -207,7 +207,7 @@ def test_corrupt_state_blocks_all_auto_remote_stages(state_path: Path) -> None:
     # 自动 refresh / participate / cleanup 三连入口共用 _remote_stage_allowed 门禁。
     scheduler._run_refresh_batch("2026-07-17-6")
     scheduler._run_triple_slot("2026-07-17-06-05")
-    scheduler._run_maintenance("2026-07-17-06-maintain")
+    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
     scheduler._run_following_scan("following-2026-07-17-06")
     assert calls == []  # 零远程 Job
     assert scheduler._status.state != "fatal"
