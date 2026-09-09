@@ -20,6 +20,8 @@ from src.login_onboarding import (
     onboarding_complete,
     onboarding_create,
     onboarding_fail,
+    onboarding_qr_image_path,
+    onboarding_start_remote,
     onboarding_store_scanned_cookie,
 )
 from src.profile_writer_lease import ProfileWriterLeaseBusy
@@ -280,6 +282,43 @@ def test_onboarding_waiting_never_touches_current_profile(root: Path) -> None:
     session = onboarding_create(qr_url="https://qr.test/1", qr_key="k1")
     assert session["status"] == "waiting"
     assert _old_cookie(root) == before
+
+
+def test_remote_start_reuses_login_generate_primitive(root: Path, monkeypatch) -> None:
+    before = _old_cookie(root)
+    monkeypatch.setattr(
+        "src.bilibili_login.generate_qrcode",
+        lambda: ("https://passport.bilibili.com/h5-app/passport/login/scan", "key-1"),
+    )
+    save_calls: list[str] = []
+    monkeypatch.setattr(
+        "src.bilibili_login.save_cookies",
+        lambda cookie: save_calls.append(cookie),
+    )
+    result = onboarding_start_remote()
+
+    assert result["onboarding_id"]
+    assert result["qr_url"].startswith("https://")
+    assert "cookie" not in result
+    assert "qrcode_key" not in result
+    staged = json.loads(
+        (root / "shared" / "onboarding" / f"{result['onboarding_id']}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert staged["qr_url"].startswith("https://")
+    assert staged["qr_key"] == "key-1"
+    assert _old_cookie(root) == before
+    assert save_calls == []
+
+
+def test_qr_image_is_non_empty_png(root: Path) -> None:
+    session = onboarding_create(qr_url="https://qr.test/1", qr_key="k1")
+    image_path = onboarding_qr_image_path(session["onboarding_id"])
+
+    assert image_path.suffix == ".png"
+    assert image_path.stat().st_size > 0
+    assert image_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_session_scanned_cookie_and_complete_creates_profile(root: Path) -> None:

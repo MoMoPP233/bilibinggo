@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import urllib.parse
+import re
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Callable
@@ -31,6 +32,8 @@ PASSPORT_HEADERS = {
     "Origin": "https://www.bilibili.com",
 }
 
+QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+
 POLL_WAITING = 86101
 POLL_SCANNED = 86090
 POLL_EXPIRED = 86038
@@ -45,6 +48,85 @@ class BilibiliLoginError(Exception):
 
 class LoginCancelledError(BilibiliLoginError):
     pass
+
+
+def _safe_response_body_summary(response: httpx.Response, limit: int = 200) -> str:
+    """Return a short diagnostic body with login-related values redacted."""
+    try:
+        summary = " ".join(response.text.split())[:limit]
+    except Exception:  # pragma: no cover - defensive around malformed responses
+        return "<unavailable>"
+    return re.sub(
+        r'(?i)("?(?:cookie|sessdata|bili_jct|qrcode_key)"?\s*[:=]\s*)("[^"]*"|[^,\s}]+)',
+        r"\1<redacted>",
+        summary,
+    )
+
+
+def generate_qrcode(client: httpx.Client | None = None) -> tuple[str, str]:
+    """Generate one login QR payload without polling or writing Profile state."""
+    owns_client = client is None
+    transport = client or httpx.Client(
+        headers=PASSPORT_HEADERS,
+        follow_redirects=True,
+        timeout=20.0,
+    )
+    try:
+        try:
+            response = transport.get(
+                QR_GENERATE_URL,
+                params={"source": "main-fe-header"},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            request_url = response.request.url
+            logger.error(
+                "二维码生成请求失败: status=%s host=%s path=%s content_type=%s redirects=%s body_summary=%s",
+                response.status_code,
+                request_url.host,
+                request_url.path,
+                response.headers.get("content-type", ""),
+                len(response.history),
+                _safe_response_body_summary(response),
+            )
+            raise BilibiliLoginError(
+                f"获取二维码失败（B站返回 HTTP {response.status_code}）"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise BilibiliLoginError(
+                f"获取二维码失败（网络请求异常：{type(exc).__name__}）"
+            ) from exc
+
+        try:
+            body = response.json()
+        except (ValueError, TypeError) as exc:
+            raise BilibiliLoginError("获取二维码失败（B站响应不是有效 JSON）") from exc
+        if not isinstance(body, dict):
+            raise BilibiliLoginError("获取二维码失败（B站响应不是 JSON 对象）")
+        if body.get("code") != 0:
+            raise BilibiliLoginError(
+                f"获取二维码失败（B站 code {body.get('code')}：{body.get('message') or '未知错误'}）"
+            )
+        data = body.get("data") or {}
+        qrcode_url = str(data.get("url") or "").strip()
+        qrcode_key = str(data.get("qrcode_key") or "").strip()
+        if not qrcode_url or not qrcode_key:
+            raise BilibiliLoginError("获取二维码失败：响应缺少 url 或 qrcode_key")
+        request = getattr(response, "request", None)
+        request_url = getattr(request, "url", None)
+        logger.info(
+            "二维码生成请求成功: status=%s host=%s path=%s content_type=%s redirects=%s",
+            getattr(response, "status_code", 200),
+            getattr(request_url, "host", ""),
+            getattr(request_url, "path", ""),
+            response.headers.get("content-type", ""),
+            len(getattr(response, "history", ())),
+        )
+        return qrcode_url, qrcode_key
+    finally:
+        if owns_client:
+            transport.close()
 
 
 def _poll_status(body: dict) -> int:
@@ -260,18 +342,7 @@ def login_with_qrcode(
             on_status_change(phase, message)
 
     def _issue_qrcode() -> tuple[str, str]:
-        gen_data = _request_json(
-            client,
-            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
-            params={"source": "main-fe-header"},
-        )
-        if gen_data.get("code") != 0:
-            raise BilibiliLoginError(f"获取二维码失败: {gen_data.get('message')}")
-        data = gen_data.get("data") or {}
-        qrcode_url = str(data.get("url") or "").strip()
-        qrcode_key = str(data.get("qrcode_key") or "").strip()
-        if not qrcode_url or not qrcode_key:
-            raise BilibiliLoginError("获取二维码失败：响应缺少 url 或 qrcode_key")
+        qrcode_url, qrcode_key = generate_qrcode(client)
         if open_image:
             print("请使用哔哩哔哩手机 App 扫描下方二维码登录：")
             print(qrcode_url)

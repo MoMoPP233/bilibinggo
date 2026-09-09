@@ -49,7 +49,10 @@ describe("profiles onboarding main flow", () => {
   it("starts onboarding without create_profile and shows QR", async () => {
     const mod = await load();
     mocks.fetchJSON
-      .mockResolvedValueOnce({ onboarding_id: "o1", qr_url: "https://qr.x" })
+      .mockResolvedValueOnce({
+        ok: true,
+        result: { onboarding_id: "o1", qr_url: "https://qr.x" },
+      })
       .mockResolvedValueOnce({ status: "waiting" })
       .mockResolvedValueOnce({ status: "scanned" })
       .mockResolvedValueOnce({
@@ -69,6 +72,13 @@ describe("profiles onboarding main flow", () => {
       profiles: [],
     });
     (document.getElementById("profile-onboarding-start") as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(document.getElementById("onboarding-qr-img")).not.toBeNull();
+    });
+    const qrImage = document.getElementById("onboarding-qr-img") as HTMLImageElement;
+    expect(qrImage.src).toContain("/api/accounts/onboarding/o1/qr");
+    expect(qrImage.src).not.toContain("undefined");
+    qrImage.dispatchEvent(new Event("load"));
     await vi.advanceTimersByTimeAsync(2100); // poll round 1 -> scanned
     await vi.advanceTimersByTimeAsync(2100);
     const urls = mocks.fetchJSON.mock.calls.map((call) => String(call[0]));
@@ -85,5 +95,34 @@ describe("profiles onboarding main flow", () => {
     expect(mocks.fetchJSON.mock.calls.every((call) => !JSON.stringify(call).includes("cookie"))).toBe(true);
     // 未调用旧 current-profile login job
     expect(urls.some((u) => u.includes("/api/jobs"))).toBe(false);
+  });
+
+  it("shows an explicit error and does not poll when the QR image fails", async () => {
+    await load();
+    mocks.fetchJSON.mockResolvedValueOnce({
+      ok: true,
+      result: { onboarding_id: "o-error", qr_url: "https://qr.x" },
+    });
+
+    (document.getElementById("profile-onboarding-start") as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(document.getElementById("onboarding-qr-img")).not.toBeNull();
+    });
+    const qrImage = document.getElementById("onboarding-qr-img") as HTMLImageElement;
+
+    await vi.advanceTimersByTimeAsync(2100);
+    expect(mocks.fetchJSON).toHaveBeenCalledTimes(1);
+
+    qrImage.dispatchEvent(new Event("error"));
+    await Promise.resolve();
+
+    expect(document.getElementById("onboarding-status")?.textContent).toContain(
+      "二维码加载失败",
+    );
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      "二维码加载失败，请关闭后重试。",
+      "error",
+    );
+    expect(mocks.fetchJSON).toHaveBeenCalledTimes(1);
   });
 });

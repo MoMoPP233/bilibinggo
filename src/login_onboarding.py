@@ -454,24 +454,17 @@ def onboarding_status_public(onboarding_id: str) -> dict[str, Any]:
 # QR 网络层（真实流程使用；测试通过注入/monkeypatch 保持离线）
 # ---------------------------------------------------------------------------
 
-_QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
 _QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 
 
 def onboarding_start_remote() -> dict[str, Any]:
     """真实流程：请求 Bilibili 二维码并创建未绑定 onboarding session。"""
+    from src import bilibili_login as blogin
+
     try:
-        with httpx.Client(follow_redirects=True, timeout=12.0) as client:
-            resp = client.post(_QR_GENERATE_URL)
-            resp.raise_for_status()
-            body = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        raise OnboardingError("qr_unavailable", f"获取二维码失败（{type(exc).__name__}）") from exc
-    data = (body or {}).get("data") or {}
-    qr_url = str(data.get("url") or "")
-    qr_key = str(data.get("qrcode_key") or "")
-    if not qr_url or not qr_key:
-        raise OnboardingError("qr_unavailable", "二维码响应缺少 url/qrcode_key")
+        qr_url, qr_key = blogin.generate_qrcode()
+    except blogin.BilibiliLoginError as exc:
+        raise OnboardingError("qr_unavailable", str(exc)) from exc
     return onboarding_create(qr_url=qr_url, qr_key=qr_key)
 
 

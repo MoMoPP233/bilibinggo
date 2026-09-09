@@ -278,10 +278,17 @@ export async function runOnboardingFlow(): Promise<void> {
   if (onboardingStartBtn) onboardingStartBtn.disabled = true;
   let onboardingId = "";
   try {
-    const started = await fetchJSON<{ onboarding_id: string; qr_url: string }>(
+    const response = await fetchJSON<{
+      ok: boolean;
+      result: { onboarding_id: string; qr_url: string };
+    }>(
       "/api/accounts/onboarding/start",
       { method: "POST" },
     );
+    const started = response.result;
+    if (!started?.onboarding_id) {
+      throw new Error("创建扫码会话失败：响应缺少 onboarding_id");
+    }
     onboardingId = started.onboarding_id;
     showToast("请在浏览器中完成扫码", "info");
     const modal = document.createElement("div");
@@ -297,15 +304,44 @@ export async function runOnboardingFlow(): Promise<void> {
        </div>`;
     document.body.appendChild(modal);
     const img = modal.querySelector("#onboarding-qr-img") as HTMLImageElement | null;
-    if (img) img.src = `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/qr`;
     const statusEl = modal.querySelector("#onboarding-status");
-    modal.querySelector("#onboarding-close")?.addEventListener("click", () => {
-      modal.remove();
-      if (onboardingStartBtn) onboardingStartBtn.disabled = false;
-      mutating = false;
+    const closeBtn = modal.querySelector("#onboarding-close");
+    const qrReady = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (ready: boolean): void => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        resolve(ready);
+      };
+      const fail = (message: string): void => {
+        if (statusEl) statusEl.textContent = message;
+        showToast(message, "error");
+        finish(false);
+      };
+      const timeoutId = window.setTimeout(
+        () => fail("二维码加载超时，请关闭后重试。"),
+        15000,
+      );
+      closeBtn?.addEventListener("click", () => {
+        modal.remove();
+        finish(false);
+      }, { once: true });
+      if (!img) {
+        fail("二维码显示组件不可用，请关闭后重试。");
+        return;
+      }
+      img.addEventListener("load", () => finish(true), { once: true });
+      img.addEventListener(
+        "error",
+        () => fail("二维码加载失败，请关闭后重试。"),
+        { once: true },
+      );
+      img.src = `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/qr`;
     });
+    if (!qrReady) return;
 
-    // 轮询直到 scanned，再 complete；只使用 onboarding_id，绝不接触 Cookie/UID。
+    // 二维码确认展示后才轮询；只使用 onboarding_id，绝不接触 Cookie/UID。
     let result: { profile_id: string; created_new: boolean; reused_existing: boolean } | null = null;
     let terminal = false;
     for (let round = 0; round < 120 && !terminal; round += 1) {

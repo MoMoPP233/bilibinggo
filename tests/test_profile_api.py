@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -47,6 +48,33 @@ def _idle_patches():
         patch("web.app.runner.is_running", return_value=False),
         patch("web.app.auto_scheduler.get_status", return_value={"state": "idle"}),
     )
+
+
+def test_onboarding_start_returns_result_with_valid_id() -> None:
+    staged = {
+        "onboarding_id": "onboarding-1",
+        "qr_url": "https://passport.bilibili.com/qr-login",
+        "status": "waiting",
+        "ttl_seconds": 600,
+    }
+    with patch("src.login_onboarding.onboarding_start_remote", return_value=staged):
+        response = client.post("/api/accounts/onboarding/start")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "result": staged}
+    assert response.json()["result"]["onboarding_id"]
+    assert "cookie" not in response.text.lower()
+
+
+def test_onboarding_qr_returns_non_empty_png(tmp_path: Path) -> None:
+    image_path = tmp_path / "onboarding.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nqr")
+    with patch("src.login_onboarding.onboarding_qr_image_path", return_value=image_path):
+        response = client.get("/api/accounts/onboarding/onboarding-1/qr")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.content
 
 
 def test_profiles_get_reports_runtime_and_pending_restart() -> None:
