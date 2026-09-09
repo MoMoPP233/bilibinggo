@@ -3,10 +3,13 @@ from __future__ import annotations
 import time
 
 from src.bilibili_client import BilibiliClient, api_code
+from src.platform_risk import is_platform_risk_code
 
 SPACE_ACC_INFO_URL = "https://api.bilibili.com/x/space/acc/info"
 SPACE_CARD_URL = "https://api.bilibili.com/x/web-interface/card"
-_RETRY_CODES = frozenset({-352, -509, -799})
+# 仅 -799（临时反爬/频率受限）：不是正式 platform risk，允许有限只读重试。
+# 正式平台风控（-352/-509/HTTP429）绝不在此层重试，立即上抛。
+_RETRY_CODES = frozenset({-799})
 
 
 def _extract_name(payload: dict) -> str:
@@ -39,6 +42,10 @@ def resolve_watch_user_name(client: BilibiliClient, mid: int) -> str:
         for attempt in range(3):
             payload = client.request_json(url, params=params, referer=referer)
             code = api_code(payload)
+            if is_platform_risk_code(code):
+                # 正式平台风控（-352/-509/429）：请求次数=1，立即向上传播（不吞、不重试）
+                message = str(payload.get("message") or payload.get("msg") or code)
+                raise RuntimeError(f"API error {code}: {message}".rstrip())
             if code == 0:
                 name = _extract_name(payload)
                 if name:

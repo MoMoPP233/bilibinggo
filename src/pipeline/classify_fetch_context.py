@@ -67,9 +67,13 @@ class ClassifyFetchContext:
 
     def risk_control_code(self) -> int | None:
         """返回本轮分类中命中的结构化风控码（仅 API code 字段，绝不扫描正文）。
-
-        -352 / -509 / -799 等来自 detail/notice API 的整数 code；
-        普通正文文本（含“429”“风控”“限流”字样）不参与判定。
+        分类期碰到的结构化 API code（detail/notice）。注意语义分层：
+        - 正式平台风控只有 -352 / -509（HTTP 429 由 HTTP 层直接抛出）；
+          platform risk 判定一律经 platform_risk.is_platform_risk_code / risk_code_of。
+        - -799 只是「临时反爬/频率受限」（temporary restriction），不是 platform risk：
+          它可用于局部停止读取，但任何消费者都不得因 -799 触发 platform pause、
+          global cooldown、DELETE breaker 或 Scheduler pause。
+        字段名 risk_code 为历史兼容保留，不表示 -799 属于正式平台风控。
         """
         if self._risk_code is not None:
             return self._risk_code

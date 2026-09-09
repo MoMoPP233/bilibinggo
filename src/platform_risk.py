@@ -48,6 +48,16 @@ def _risk_code_from_text(text: str) -> int | None:
     return None
 
 
+def is_platform_risk_code(code: object) -> bool:
+    """正式平台风控码判定：只有 -352 / -509 / HTTP 429。
+
+    -799 等“临时反爬/频率受限”码一律返回 False（它可能用于局部停止读取，
+    但绝不进入 platform risk / global cooldown / Profile risk pause）。
+    """
+    value = _coerce_code(code)
+    return value is not None and value in API_RISK_CODES
+
+
 def risk_code_of(exc_or_message: object) -> int | None:
     """返回明确平台风控码（-352/-509/429），无法可靠确认时返回 None。"""
     if exc_or_message is None:

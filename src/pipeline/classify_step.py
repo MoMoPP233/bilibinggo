@@ -144,12 +144,13 @@ def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcom
     分类期间若命中明确平台风控（结构化 code -352/-509/429），立即向上抛出，
     不允许降级成“正文不可读/当前动态跳过”；refresh 流水线由此停止后续处理。
     """
-    from src.platform_risk import API_RISK_CODES
+    from src.platform_risk import is_platform_risk_code
 
     ctx = ClassifyFetchContext(client, dynamic_id)
     outcome = classify_with_context(ctx)
     code = ctx.risk_control_code()
-    if code is not None and code in API_RISK_CODES:
+    if is_platform_risk_code(code):
+        # -799 等临时限频码不在此抛（非正式平台风控），只按正文不可读降级
         raise RuntimeError(f"API error {code}: 分类阶段命中平台风控（{dynamic_id}）")
     return outcome
 
