@@ -366,12 +366,20 @@ def _fetch_remote_profile() -> dict[str, Any]:
             data = nav_payload.get("data") or {}
             is_login = bool(data.get("isLogin"))
             if not is_login and code in _NAV_RISK_CODES:
-                # 平台风控 / 限流会临时让 NAV 不可用，但不代表 Cookie 失效。
-                return _profile_from_network_error(
-                    RuntimeError(
-                        f"平台暂时限流（{code}），本地 Cookie 仍已保存，稍后可刷新账号"
+                # 展示语义分层：-352/-509/429 是正式平台风控/限流；
+                # -799 只是临时限频（temporary restriction），不是正式 platform risk，
+                # 二者都不代表 Cookie 失效，且都不写任何 cooldown/pause。
+                from src.platform_risk import is_platform_risk_code
+
+                if is_platform_risk_code(code):
+                    message = (
+                        f"平台风控/暂时限流（{code}），本地 Cookie 仍已保存，稍后可刷新账号"
                     )
-                )
+                else:
+                    message = (
+                        f"请求暂时受限（{code}，临时限频），本地 Cookie 仍有效，稍后可刷新账号"
+                    )
+                return _profile_from_network_error(RuntimeError(message))
             if code == -101 or not is_login:
                 # 明确不再登录：旧成功快照立即失效。
                 invalidate_account_cache()

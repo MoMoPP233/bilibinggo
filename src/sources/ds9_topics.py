@@ -483,6 +483,7 @@ def check_update(*, force: bool = False) -> CheckResult:
     seen_links: set[str] = set()
     pending: list[dict[str, Any]] = []
     failed_topic_ids: list[str] = []
+    nochange_topic_ids: list[str] = []
 
     with BilibiliClient() as client:
         for record in records:
@@ -523,8 +524,10 @@ def check_update(*, force: bool = False) -> CheckResult:
                         if item not in visible_outers and item not in incomplete:
                             incomplete.append(item)
                 if not needs:
-                    # 无变化且无未完成项：本轮无产出（仍更新扫描时间元数据）。
+                    # 无变化且无未完成项：本轮无产出。last_scan_at 是纯观察字段
+                    # （不参与 fp/checkpoint/去重/是否扫描），仍然持久化以便重启后可读。
                     record["last_scan_at"] = now
+                    nochange_topic_ids.append(topic_id)
                     continue
             except Exception as exc:  # noqa: BLE001 - 普通失败按话题隔离；风险继续上抛
                 if risk_code_of(exc) is not None:
@@ -550,14 +553,19 @@ def check_update(*, force: bool = False) -> CheckResult:
                 }
             )
 
-    # 失败话题的错误/扫描时间元数据立即落盘（不含 checkpoint 推进）。
-    if failed_topic_ids:
-        meta_records = [
-            {"topic_id": topic_id, "last_error": record["last_error"], "last_scan_at": now}
-            for record in records
-            if str(record.get("topic_id")) in failed_topic_ids
-        ]
-        _commit_topic_meta_now(meta_records, now=now)
+    # 失败话题与“无变化话题”的 last_scan_at 观察元数据一次性原子落盘
+    # （绝不触碰 fp/incomplete/成功态/checkpoint）。
+    meta_updates: list[dict[str, Any]] = []
+    for record in records:
+        tid = str(record.get("topic_id") or "")
+        if tid in failed_topic_ids:
+            meta_updates.append(
+                {"topic_id": tid, "last_error": record.get("last_error", ""), "last_scan_at": now}
+            )
+        elif tid in nochange_topic_ids:
+            meta_updates.append({"topic_id": tid, "last_scan_at": now})
+    if meta_updates:
+        _commit_topic_meta_now(meta_updates, now=now)
 
     updated = bool(pending)
     summary = {
