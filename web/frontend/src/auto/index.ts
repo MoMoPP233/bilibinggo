@@ -12,6 +12,10 @@ import { prefersReducedMotion } from "../utils/motion";
 import { sanitizeUserText, escapeHtml } from "../utils/text";
 
 let schedulerOpSeq = 0;
+const EXPIRED_STATUS_REFRESH_INTERVAL_MS = 1500;
+let expiredStatusRefreshInFlight = false;
+let expiredStatusLastAttemptAt = Number.NEGATIVE_INFINITY;
+let expiredCountdownConfirmationActive = false;
 
 export function setAutoDockOpen(open) {
   state.autoDockOpen = open;
@@ -115,6 +119,14 @@ function nextTaskUnix(status) {
   return Number.isFinite(unix) ? unix : null;
 }
 
+function countdownTargetUnix(status) {
+  const cooldowns = Object.values(status?.tasks || {})
+    .filter((task: any) => task?.status === "risk_paused")
+    .map((task: any) => Number(task?.resume_at))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return cooldowns.length ? Math.min(...cooldowns) : nextTaskUnix(status);
+}
+
 function runningAutoTask(status) {
   return Object.values(status?.tasks || {}).find((task: any) => task?.status === "running") as any;
 }
@@ -124,46 +136,6 @@ function safeAutoLogText(value) {
   text = text.replace(/\b(SESSDATA|bili_jct|SendKey|token|secret|webhook)\b\s*[:=]\s*[^\s,;]+/gi, "$1=[已隐藏]");
   text = text.replace(/(https?:\/\/[^\s?]+)\?[^\s]+/gi, "$1?[查询参数已隐藏]");
   return text;
-}
-
-function formatTaskTime(value) {
-  if (!value) return "—";
-  const date = typeof value === "number" ? new Date(value * 1000) : new Date(String(value).replace(" ", "T") + "+08:00");
-  if (Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleTimeString("zh-CN", { hour12: false });
-}
-
-export function renderAutoTaskStatuses(status) {
-  const root = document.getElementById("auto-task-status-list");
-  if (!root) return;
-  const rows = status?.tasks || {};
-  const labels = {
-    waiting: "等待",
-    running: "运行中",
-    completed: "完成",
-    skipped_busy: "本轮跳过（任务占用）",
-    risk_paused: "风控暂停",
-    error: "错误",
-  };
-  root.innerHTML = ["winner", "cleanup", "following", "refresh", "participate"]
-    .filter((key) => rows[key])
-    .map((key) => {
-      const task: any = rows[key] || {};
-      const taskStatus = String(task.status || "waiting");
-      const next = taskStatus === "risk_paused" ? task.resume_at : task.next_run_at;
-      const countdownSeconds = getAutoCountdownSeconds(Number(next) || null);
-      const countdown = taskStatus === "running"
-        ? "正在执行"
-        : String(status?.state || "") === "running" && countdownSeconds === 0
-          ? "正在确认状态…"
-          : formatAutoCountdown(Number(next) || null);
-      return `<div class="auto-task-status-row" data-status="${escapeHtml(taskStatus)}">
-        <div><strong>${escapeHtml(task.label || key)}</strong><span>${escapeHtml(labels[taskStatus] || taskStatus)}</span></div>
-        <p>上次 ${escapeHtml(formatTaskTime(task.last_started_at))} · 下次 ${escapeHtml(formatTaskTime(next))} · ${escapeHtml(countdown)}</p>
-        <small>${escapeHtml(safeAutoLogText(task.last_result || ""))}</small>
-      </div>`;
-    })
-    .join("");
 }
 
 export function renderAutoLogs(logs) {
@@ -180,17 +152,42 @@ export function renderAutoLogs(logs) {
   output.scrollTop = output.scrollHeight;
 }
 
+async function refreshExpiredCountdownState(): Promise<void> {
+  const now = Date.now();
+  if (expiredStatusRefreshInFlight || now - expiredStatusLastAttemptAt < EXPIRED_STATUS_REFRESH_INTERVAL_MS) {
+    return;
+  }
+  expiredStatusRefreshInFlight = true;
+  expiredStatusLastAttemptAt = now;
+  const opToken = schedulerOpSeq;
+  const baselineServerNow = Number(state.autoScheduler?.server_now_unix || 0);
+  try {
+    // 只读、临时的到期确认：不走 start/stop，也不触发任何 Job POST。
+    const fresh = await fetchJSON("/api/auto/status");
+    if (opToken !== schedulerOpSeq) return;
+    const currentServerNow = Number(state.autoScheduler?.server_now_unix || 0);
+    const freshServerNow = Number(fresh?.server_now_unix || 0);
+    if (freshServerNow && freshServerNow < Math.max(baselineServerNow, currentServerNow)) return;
+    renderAutoDock(fresh);
+  } catch {
+    // 保持“正在确认状态…”，由现有 1 秒 tick 在 1.5 秒节流后有限重试。
+  } finally {
+    expiredStatusRefreshInFlight = false;
+  }
+}
+
 export function updateAutoCollapsedMeta(status) {
   if (!autoDockToggleMeta) return;
   const schedulerState = String(status?.state || "idle");
   if (schedulerState === "running") {
     const runningTask = runningAutoTask(status);
-    const seconds = getAutoCountdownSeconds(nextTaskUnix(status));
+    const targetUnix = countdownTargetUnix(status);
+    const seconds = getAutoCountdownSeconds(targetUnix);
     const countdown = runningTask
       ? "正在执行"
       : seconds === 0
         ? "正在确认状态…"
-        : formatAutoCountdown(nextTaskUnix(status));
+        : formatAutoCountdown(targetUnix);
     autoDockToggleMeta.hidden = false;
     autoDockToggleMeta.textContent = countdown === "—" ? "…" : countdown;
     return;
@@ -254,7 +251,7 @@ export function renderAutoDock(status) {
   }
   const hero = document.querySelector(".auto-dock-hero");
   const pipelineBlock = document.querySelector(".auto-dock-pipeline-block");
-  const countdownSec = getAutoCountdownSeconds(nextTaskUnix(status));
+  const countdownSec = getAutoCountdownSeconds(countdownTargetUnix(status));
   const urgent = schedulerState === "running" && countdownSec !== null && countdownSec > 0 && countdownSec < 60;
   if (hero) {
     hero.classList.toggle("is-live", schedulerState === "running");
@@ -273,7 +270,6 @@ export function renderAutoDock(status) {
   }
   tickAutoCountdown();
   renderAutoPipeline(status.refresh_pipeline);
-  renderAutoTaskStatuses(status);
   renderAutoLogs(status.logs);
   updateAutoCollapsedMeta(status);
   renderNextAutoTask(status);
@@ -324,21 +320,32 @@ export function renderAutoDock(status) {
 export function tickAutoCountdown() {
   const status = state.autoScheduler;
   if (!autoDockCountdown) return;
-  const targetUnix = nextTaskUnix(status);
+  const targetUnix = countdownTargetUnix(status);
   const countdownSec = getAutoCountdownSeconds(targetUnix);
   const running = String(status?.state || "") === "running";
   const activeTask = runningAutoTask(status);
-  autoDockCountdown.textContent = activeTask
-    ? "正在执行"
-    : running && countdownSec === 0
-      ? "正在确认状态…"
-      : formatAutoCountdown(targetUnix);
+  if (!running) {
+    expiredCountdownConfirmationActive = false;
+  } else if (countdownSec === 0 || activeTask) {
+    expiredCountdownConfirmationActive = true;
+  } else {
+    expiredCountdownConfirmationActive = false;
+  }
+  autoDockCountdown.textContent = !running
+    ? "—"
+    : activeTask
+      ? "正在执行"
+      : countdownSec === 0
+        ? "正在确认状态…"
+        : formatAutoCountdown(targetUnix);
   const urgent = running && countdownSec !== null && countdownSec > 0 && countdownSec < 60;
   autoDockCountdown.classList.toggle("is-urgent", urgent);
   document.querySelector(".auto-dock-hero")?.classList.toggle("is-urgent", urgent);
-  renderAutoTaskStatuses(status);
   updateAutoCollapsedMeta(status);
   window.dispatchEvent(new CustomEvent("binggo:auto-tick", { detail: status }));
+  if (running && expiredCountdownConfirmationActive) {
+    refreshExpiredCountdownState().catch(() => {});
+  }
 }
 
 export function ensureAutoCountdown() {

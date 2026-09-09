@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 const {
   fetchJSONMock,
@@ -26,8 +27,8 @@ function setupDom() {
     <span id="auto-dock-countdown"></span>
     <span id="auto-dock-scheduler"></span>
     <span id="auto-dock-job"></span>
-    <div id="auto-task-status-list"></div>
     <pre id="auto-log"></pre>
+    <p id="auto-next-task"></p>
     <p id="auto-following-info"></p>
     <div id="auto-dock-panel"></div>
     <button id="auto-dock-start"></button>
@@ -69,6 +70,7 @@ function installFetch(statusQueue: Array<{ promise: Promise<unknown>; resolve: (
 
 describe("scheduler start/stop async race", () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.resetModules();
     fetchJSONMock.mockReset();
     openAppConfirmMock.mockReset();
@@ -111,9 +113,42 @@ describe("scheduler start/stop async race", () => {
     expect(document.getElementById("auto-dock-status")?.textContent).toBe("调度运行中");
   });
 
-  it("renders backend task state and never leaves an expired countdown at 00:00", async () => {
+  it("ships the original compact monitor structure without per-task cards", () => {
+    const html = readFileSync("index.html", "utf-8");
+    const monitor = html.slice(html.indexOf('id="auto-dock"'), html.indexOf('id="log-dock"'));
+
+    expect(monitor).toContain('id="auto-dock-countdown"');
+    expect(monitor).toContain('id="auto-dock-pipeline"');
+    expect(monitor).toContain('id="auto-next-task"');
+    expect(monitor.match(/auto-dock-schedule-note/g)).toHaveLength(4);
+    expect(monitor).not.toContain('id="auto-task-status-list"');
+    expect(html).toContain('id="auto-log"');
+  });
+
+  it("uses a read-only REST fallback after expiry and enters the next countdown without reload", async () => {
     const mod = await import("./index");
+    const freshState = await import("../state");
+    freshState.state.sseHealthy = true;
+    freshState.state.eventSource = {} as EventSource;
     const now = Math.floor(Date.now() / 1000);
+    const refreshed = {
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 2, at_unix: now + 120 },
+      tasks: {
+        cleanup: {
+          label: "清理维护",
+          status: "completed",
+          last_result: "清理维护完成",
+          next_run_at: now + 21600,
+        },
+      },
+      logs: [],
+    };
+    fetchJSONMock.mockImplementation((url, options) => {
+      if (url === "/api/auto/status") return Promise.resolve(refreshed);
+      return Promise.resolve({});
+    });
 
     mod.renderAutoDock({
       ...runningStatus(),
@@ -131,25 +166,89 @@ describe("scheduler start/stop async race", () => {
     });
 
     expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在确认状态…");
-    expect(document.getElementById("auto-task-status-list")?.textContent).toContain("正在确认状态…");
+    await vi.waitFor(() => expect(fetchJSONMock).toHaveBeenCalledWith("/api/auto/status"));
+    await vi.waitFor(() => expect(document.getElementById("auto-dock-countdown")?.textContent).not.toBe("正在确认状态…"));
 
+    expect(document.getElementById("auto-dock-countdown")?.textContent).not.toBe("00:00");
+    expect(document.getElementById("auto-next-task")?.textContent).toContain("自动参与");
+    expect(fetchJSONMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+  });
+
+  it("deduplicates expiry refreshes and shows running from backend state", async () => {
+    let clock = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const pending = deferred();
+    fetchJSONMock.mockReturnValue(pending.promise);
+    const mod = await import("./index");
+    const now = Math.floor(Date.now() / 1000);
     mod.renderAutoDock({
       ...runningStatus(),
       server_now_unix: now,
-      next_task: { label: "自动参与", minutes: 3, at_unix: now + 180 },
+      next_task: { label: "清理维护", minutes: 0, at_unix: now - 1 },
+      tasks: { cleanup: { status: "waiting", next_run_at: now - 1 } },
+      logs: [],
+    });
+    mod.tickAutoCountdown();
+    mod.tickAutoCountdown();
+    expect(fetchJSONMock).toHaveBeenCalledTimes(1);
+
+    pending.resolve({
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 5, at_unix: now + 300 },
+      tasks: { cleanup: { status: "running", next_run_at: now + 21600 } },
+      logs: [],
+    });
+    await pending.promise;
+    await vi.waitFor(() => expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在执行"));
+    clock += 1600;
+    mod.tickAutoCountdown();
+    await vi.waitFor(() => expect(fetchJSONMock).toHaveBeenCalledTimes(2));
+    expect(fetchJSONMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
+  });
+
+  it("uses risk cooldown and hides countdown when the scheduler is stopped", async () => {
+    const mod = await import("./index");
+    const now = Math.floor(Date.now() / 1000);
+    mod.renderAutoDock({
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 30, at_unix: now + 1800 },
+      tasks: { cleanup: { status: "risk_paused", resume_at: now + 60 } },
+      logs: [],
+    });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("01:00");
+
+    mod.renderAutoDock({
+      ...stoppedStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 30, at_unix: now + 1800 },
+    });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("—");
+  });
+
+  it("moves a skipped_busy task directly to the backend-provided next countdown", async () => {
+    const mod = await import("./index");
+    const now = Math.floor(Date.now() / 1000);
+    mod.renderAutoDock({
+      ...runningStatus(),
+      server_now_unix: now,
+      current_phase: "本轮跳过（任务占用）",
+      next_task: { label: "关注补漏", minutes: 5, at_unix: now + 300 },
       tasks: {
         cleanup: {
-          label: "清理维护",
-          status: "running",
-          last_result: "清理维护开始",
+          status: "skipped_busy",
+          last_result: "本轮跳过（任务占用）",
           next_run_at: now + 21600,
         },
       },
       logs: [],
     });
 
-    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在执行");
-    expect(document.getElementById("auto-task-status-list")?.textContent).toContain("运行中");
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("05:00");
+    expect(document.getElementById("auto-dock-phase")?.textContent).toBe("本轮跳过（任务占用）");
+    expect(document.getElementById("auto-next-task")?.textContent).toContain("关注补漏");
+    expect(fetchJSONMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
   });
 
   it("renders only the newest 100 sanitized scheduler log lines", async () => {

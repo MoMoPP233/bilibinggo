@@ -6014,42 +6014,6 @@ body.modal-open {
   white-space: pre-wrap;
 }
 
-.auto-task-status-list {
-  display: grid;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.auto-task-status-row {
-  padding: 9px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: 12px;
-  background: var(--surface-soft);
-}
-
-.auto-task-status-row > div {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.auto-task-status-row p,
-.auto-task-status-row small {
-  display: block;
-  margin: 4px 0 0;
-  color: var(--foreground-muted);
-  line-height: 1.35;
-}
-
-.auto-task-status-row[data-status="running"] {
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
-}
-
-.auto-task-status-row[data-status="risk_paused"],
-.auto-task-status-row[data-status="error"] {
-  border-color: color-mix(in srgb, var(--danger-alt) 42%, var(--border-soft));
-}
-
 .winner-scheduler-state {
   display: flex;
   flex-wrap: wrap;
