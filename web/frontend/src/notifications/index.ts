@@ -289,13 +289,18 @@ function renderWinner(state) {
     </div>
     ${winnerSchedulerHtml(schedulerTask, scheduler)}
     <div class="ntf-event-list">
-      ${Object.entries(SOURCE_LABELS_M3)
-        .map(([key, label]) => {
-          const source = sources[key] || {};
-          const cursor = key === "dm" ? "—" : `${source.cursor_id || 0}`;
-          return `<span class="caption"><b>${label}</b> · ${source.last_error ? "最近错误" : source.last_success_at ? "正常" : "未运行"} · cursor ${cursor}</span>`;
-        })
-        .join("")}
+    ${Object.entries(SOURCE_LABELS_M3)
+      .map(([key, label]) => {
+        const source = sources[key] || {};
+        const cursor = key === "dm" ? "—" : `${source.cursor_id || 0}`;
+        const skipped = Array.isArray(source.malformed_skipped) ? source.malformed_skipped.length : 0;
+        const lastReason = Array.isArray(source.malformed_skipped) && source.malformed_skipped.length
+          ? String(source.malformed_skipped[source.malformed_skipped.length - 1]?.reason || "")
+          : "";
+        return `<span class="caption"${skipped && lastReason ? ` title="${escapeHtml(lastReason.slice(0, 80))}"` : ""}>
+          <b>${label}</b> · ${source.last_error ? "最近错误" : source.last_success_at ? "正常" : "未运行"} · cursor ${cursor}${skipped ? ` · 跳过 ${skipped} 条无法稳定识别消息` : ""}</span>`;
+      })
+      .join("")}
     </div>
     <table class="ntf-records">
       <thead><tr><th>时间</th><th>来源</th><th>发送者</th><th>摘要</th><th>状态</th></tr></thead>

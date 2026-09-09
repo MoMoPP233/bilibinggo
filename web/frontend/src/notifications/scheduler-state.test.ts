@@ -159,7 +159,40 @@ describe("winner scan auto refresh on job terminal", () => {
     expect(winnerScanCalls()).toBe(before); // 只触发一次 GET，无 interval 持续刷新
   });
 
-  it("hidden tab does not trigger refresh while panel hidden", async () => {
+  it("shows bounded malformed skip count per source without message bodies", async () => {
+    fetchJSONMock.mockImplementation(async (url: string) => {
+      if (url === "/api/notifications") return { channels: [], events: {}, records: [] };
+      if (url === "/api/winner-scan") {
+        return {
+          sources: {
+            mention: {
+              cursor_id: 5,
+              last_error: null,
+              last_success_at: 1_750_000_000,
+              malformed_skipped: [
+                { ts: 1, source_type: "mention", reason: "条目缺少稳定平台 ID，已跳过" },
+                { ts: 2, source_type: "mention", reason: "条目缺少稳定平台 ID，已跳过" },
+              ],
+            },
+            reply: {},
+            dm: {},
+          },
+          candidates: [{ id: "c1", discovered_at: 1_750_000_000, source_type: "mention", sender: {}, summary: "ok", status: "candidate" }],
+        };
+      }
+      if (url === "/api/auto/status") return { state: "running", tasks: { winner: { status: "waiting" } } };
+      return {};
+    });
+    const module = await import("./index");
+    module.bindNotificationsPage();
+    await vi.waitFor(() => expect(document.getElementById("winner-scan-panel")).not.toBeNull());
+    const text = document.getElementById("winner-scan-panel")?.textContent || "";
+    expect(text).toContain("跳过 2 条无法稳定识别消息");
+    // 正常 candidate 不受影响（候选行仍渲染其摘要）
+    expect(text).toContain("ok");
+  });
+
+  it("hidden tab does not trigger refresh while hidden", async () => {
     await setupPage();
     const before = winnerScanCalls();
     Object.defineProperty(document, "hidden", { configurable: true, value: true });

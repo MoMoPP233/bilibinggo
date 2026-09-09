@@ -50,6 +50,7 @@ function topicRowHtml(topic) {
       <div class="ds9-topic-meta">
         <span class="caption">最近成功：${timeText(topic?.last_success_at)}</span>
         <span class="caption">最近发现：${Number(topic?.last_found) || 0} 条</span>
+        ${Number(topic?.incomplete_count) > 0 ? `<span class="caption" title="等待下轮重新解析的条目数（不影响 checkpoint）">待解析：${Number(topic?.incomplete_count)} 条</span>` : ""}
         ${topic?.last_error ? `<span class="caption is-error" title="${escapeHtml(String(topic.last_error))}">最近错误</span>` : ""}
         <span class="caption">checkpoint：${topic?.fp ? "已推进" : "未运行"}</span>
       </div>

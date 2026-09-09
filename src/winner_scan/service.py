@@ -259,6 +259,7 @@ class WinnerScanService:
     def _record_malformed(self, state: dict[str, Any], source_type: str, entry: MessageEntry) -> None:
         """命中关键词但缺少稳定平台 ID 的条目：记录本地 skip 原因（有界），不建 candidate。
 
+        只保存通用原因与来源（不落消息正文，避免观察面泄露消息内容）。
         该条目无法被稳定引用，本轮跳过；不影响同批其它成功项，也不推进任何错误状态。
         """
         skipped = state.setdefault("malformed_skipped", [])
@@ -267,7 +268,6 @@ class WinnerScanService:
                 "ts": int(time.time()),
                 "source_type": source_type,
                 "reason": "条目缺少稳定平台 ID，已跳过（避免空 key 碰撞 / 随机 key 重复通知）",
-                "summary": str(entry.text or entry.title or "")[:80],
             }
         )
         state["malformed_skipped"] = skipped[-20:]

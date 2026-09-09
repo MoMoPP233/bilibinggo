@@ -166,8 +166,18 @@ def _save_topic_records(records: list[dict[str, Any]]) -> None:
 
 
 def list_topics() -> list[dict[str, Any]]:
-    """当前 Profile 的 DS9 话题配置视图（含 built-in 与 custom，0 远程）。"""
-    return _topic_records(_read_state())
+    """当前 Profile 的 DS9 话题配置视图（含 built-in 与 custom，0 远程）。
+
+    返回派生的 incomplete_count（纯观察字段，由持久化的 incomplete 列表现算，
+    绝不落盘、绝不参与 needs/checkpoint/fingerprint/dedup）。
+    """
+    topics = []
+    for record in _topic_records(_read_state()):
+        view = dict(record)
+        incomplete = list(view.get("incomplete") or [])
+        view["incomplete_count"] = len(incomplete)
+        topics.append(view)
+    return topics
 
 
 def parse_topic_id(value: str) -> str:
