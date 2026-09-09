@@ -512,7 +512,7 @@ class _AssessmentBreaker:
     def note_failure(self, exc_or_code: object) -> None:
         risk = _risk_code_from_message(exc_or_code)
         if risk is None and isinstance(exc_or_code, int):
-            risk = exc_or_code if isinstance(exc_or_code, int) and exc_or_code in (-352, -509, -799, 429) else None
+            risk = exc_or_code if isinstance(exc_or_code, int) and exc_or_code in (-352, -509, 429) else None
         if risk is not None:
             self.rate_limited = True
             self.stopped = True
@@ -738,8 +738,16 @@ def _assess_via_public_classifier(
             "classify_failed", classification_source="public_classifier",
         )
     if risk_code is not None:
-        raise AssessmentRateLimited(
-            f"本轮评估因平台限流/风控提前停止（{risk_code}），已经完成的结果已保存。"
+        if risk_code in (-352, -509, 429):
+            # 正式结构化平台风控：停止当前评估并上抛（durable pause 由调用方处理）
+            raise AssessmentRateLimited(
+                f"分类接口命中平台风控（{risk_code}）已停止，已完成的结果已保留。"
+            ) from None
+        # -799 等非正式码：只按本地受限处理（不参与平台风控/全局冷却/风险暂停），
+        # 标记 blocked 候选，绝不进入 DELETE。
+        return CandidateAssessment(
+            "blocked", f"原动态状态获取受限（{risk_code}），本轮按不可参与处理；非正式平台风控，不写全局冷却",
+            "temporary_unavailable", classification_source="public_classifier",
         )
     summary = _summary_from_content(outcome.classify_content)
     if outcome.skipped:
@@ -2521,7 +2529,7 @@ def auto_cleanup_delete(
                             except Exception:
                                 saved = False
                             status, message = ("delete_failed" if saved else "unknown"), error
-                            if code in (-352, -509, -799, 429):
+                            if code in (-352, -509, 429):
                                 _record_risk(code, error)
                                 breaker.rate_limited = True
                             # 自动路径：任何明确业务拒绝都停止整 Job，留给人工检查

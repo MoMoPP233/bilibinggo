@@ -400,14 +400,12 @@ _DS_PLATFORM_RISK_MARKERS = (
     "-509",
     "-799",
     "429",
-    "too many",
-    "rate-limit",
-    "rate limit",
-    "risk-control",
-    "risk control",
-    "风控",
-    "限流",
 )
+
+# 仅匹配结构化 code 文本令牌（-352/-509/-799/429）——Binggo 正式平台风控只认
+# -352/-509/HTTP429（platform_risk.risk_code_of）。-799 是临时反爬/频率受限，不是正式风控；
+# 正文字样（“风控/限流/too many…”等）一律不参与判断。本组只用于“保守停止后续只读数据源”
+# 的本地兼容行为：不写 global cooldown / 不写 risk pause / 不触发 mutation breaker。
 
 # 内部导入阶段提示（出现在单源 refresh_source 的流水线消息里）
 _DS_IMPORT_PHASE_MARKERS = (
@@ -873,13 +871,27 @@ def _update_all_datasources(
                 stopped_index = index
                 emit("done", index, log_append=f"【一键更新】{source_id} 已取消")
                 break
-            if _looks_like_platform_risk(message):
+            risk_code = _risk_code_of(exc)
+            if risk_code is not None:
+                # 正式结构化平台风控（-352/-509/HTTP429）：保守停止后续只读源
                 risk_stopped = True
                 states[index]["status"] = "risk"
                 states[index]["phase"] = "risk"
-                states[index]["message"] = f"平台风控（已停止后续数据源）：{message}"
+                states[index]["message"] = f"平台风控（{risk_code}），已停止后续数据源刷新"
+                states[index]["error"] = message
                 stopped_index = index
-                emit("done", index, log_append=f"【一键更新】{source_id} 触发风控停止")
+                emit("done", index, log_append=f"一键更新：{source_id} 平台风控停止")
+                break
+            if _looks_like_platform_risk(message):
+                # 文本含 -799/429 等 code 令牌但未确认正式风控：source-local 保守停止
+                # （禁止升级为 platform risk / global cooldown / mutation breaker）
+                risk_stopped = True
+                states[index]["status"] = "risk"
+                states[index]["phase"] = "risk"
+                states[index]["message"] = "疑似平台风控 code（未确认正式风控信封），保守停止后续只读数据源；不写全局冷却"
+                states[index]["error"] = message
+                stopped_index = index
+                emit("done", index, log_append=f"一键更新：{source_id} 疑似临时受限，保守停止")
                 break
             failed_count += 1
             states[index]["status"] = "failed"
@@ -902,18 +914,18 @@ def _update_all_datasources(
         states[index]["new_link_count"] = counts["candidate_count"]
 
         if states[index].get("_risk_seen"):
-            # DS-3 等在源内命中 -352 后仍会保留本源结果返回；按整体策略，
-            # 不再继续后续数据源（已经成功的结果保留，不自动重试）。
+            # DS 源内部出现 -352/-509 等 code 文本：保守停止后续只读源；
+            # 未确认正式结构化风控，不写 global cooldown，仅供本轮展示。
             risk_stopped = True
-            states[index]["status"] = "risk"
-            states[index]["phase"] = "risk"
-            states[index]["message"] = "平台风控（已停止后续数据源），本源已保存已完成结果"
-            states[index]["error"] = "DS-3 在源内命中 -352"
+            states[index]["status"] = "stopped"
+            states[index]["phase"] = "stopped"
+            states[index]["message"] = "疑似源内临时受限（未确认正式平台风控），保守停止后续只读数据源；不写全局冷却"
+            states[index]["error"] = "源内出现风控/限流 code 文本"
             stopped_index = index
             log_lines.append(
-                f"【一键更新】{source_id} 源内命中 -352，停止后续数据源（已完成结果保留）"
+                f"一键更新：{source_id} 疑似源内临时受限，保守停止后续只读源（不写全局冷却）"
             )
-            emit("done", index, log_append=f"【一键更新】{source_id} 触发风控停止")
+            emit("done", index, log_append=f"一键更新：{source_id} 疑似受限保守停止")
             break
 
         states[index]["status"] = "success"
