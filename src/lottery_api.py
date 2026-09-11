@@ -71,10 +71,16 @@ def fetch_lottery_notice(
             referer=referer,
             retries=request_retries,
         )
-        if on_risk is not None:
-            code = data.get("code")
-            if isinstance(code, int) and code in (-352, -509, -799):
-                on_risk(code)
+        code = data.get("code")
+        if on_risk is not None and isinstance(code, int) and code in (-352, -509, -799):
+            on_risk(code)
+        if isinstance(code, int) and code in (-352, -509, 429):
+            # 正式平台风控：立即结构化上抛，0 后续请求（不 fallback/不进入下一阶段）
+            raise OpusRiskControlError(
+                f"API error {code}: {data.get('message') or data.get('msg') or ''}"
+            )
+            notice = data.get("data") or {}
+            return notice if notice.get("lottery_id") else None
         if data.get("code") == 0:
             notice = data.get("data") or {}
             return notice if notice.get("lottery_id") else None

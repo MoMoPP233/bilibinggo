@@ -496,6 +496,24 @@ def _risk_code_from_message(message: object) -> int | None:
     return risk_code_of(message)
 
 
+def _record_global_platform_risk(stage: str, exc: object) -> None:
+    """正式平台风控（-352/-509/429）→ 写入 per-Profile 全局自动远程冷却（单一来源）。
+
+    -799/普通失败不写；写失败不影响当前业务结果（只记日志）。
+    """
+    code = _risk_code_from_message(exc)
+    if code not in (-352, -509, 429):
+        return
+    try:
+        from web.auto_remote_state import record_auto_remote_risk
+
+        record_auto_remote_risk(trigger_stage=stage, reason=str(exc or ""), code=str(code))
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("repost_cleanup").exception("记录全局平台风控冷却失败 code=%s", code)
+
+
 class _AssessmentBreaker:
     """串行评估/删除的风控熔断器：-352/429 立即停止，连续异常达阈值也停止。"""
 
@@ -505,6 +523,7 @@ class _AssessmentBreaker:
         self.rate_limited = False
         self.stopped = False
         self.stop_message = ""
+        self.risk_code: int | None = None
 
     def note_success(self) -> None:
         self.consecutive_failures = 0
@@ -515,6 +534,7 @@ class _AssessmentBreaker:
             risk = exc_or_code if isinstance(exc_or_code, int) and exc_or_code in (-352, -509, 429) else None
         if risk is not None:
             self.rate_limited = True
+            self.risk_code = risk
             self.stopped = True
             self.stop_message = (
                 f"本轮操作因平台限流/风控提前停止（{risk}），已经完成的结果已保存。"
@@ -741,7 +761,7 @@ def _assess_via_public_classifier(
         if risk_code in (-352, -509, 429):
             # 正式结构化平台风控：停止当前评估并上抛（durable pause 由调用方处理）
             raise AssessmentRateLimited(
-                f"分类接口命中平台风控（{risk_code}）已停止，已完成的结果已保留。"
+                f"API error {risk_code}: 分类接口命中平台风控，已停止（已完成结果已保留）"
             ) from None
         # -799 等非正式码：只按本地受限处理（不参与平台风控/全局冷却/风险暂停），
         # 标记 blocked 候选，绝不进入 DELETE。
@@ -1066,7 +1086,9 @@ def scan_expired_reposts(
                 except AssessmentRateLimited as exc:
                     breaker.rate_limited = True
                     breaker.stopped = True
+                    breaker.risk_code = _risk_code_from_message(exc)
                     breaker.stop_message = str(exc)
+                    _record_global_platform_risk("scan_expired_reposts", exc)
                     break
                 except RemoteStateUnknown as exc:
                     assessment = CandidateAssessment(
@@ -1079,6 +1101,8 @@ def scan_expired_reposts(
                         raise
                     breaker.rate_limited = True
                     breaker.stopped = True
+                    breaker.risk_code = risk
+                    _record_global_platform_risk("scan_expired_reposts", exc)
                     breaker.stop_message = (
                         f"本任务命中平台风控（{risk}），"
                         "已停止后续评估；已经完成的结果已保存。"
@@ -1145,6 +1169,7 @@ def scan_expired_reposts(
         "attempted_this_job": len(attempted_this_job),
         "made_progress": made_progress_total,
         "rate_limited": breaker.rate_limited,
+        "risk_code": breaker.risk_code,
         "stopped_early": breaker.stopped,
         "stop_reason": stop_reason,
         "message": message,
@@ -1323,6 +1348,8 @@ def auto_maintain(
                     uid,
                     f"自动维护命中平台风控（{risk}）已暂停，需人工恢复",
                 )
+                _record_global_platform_risk("auto_maintain", exc)
+                breaker.risk_code = _risk_code_from_message(exc)
                 breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
             else:
                 breaker.stop_message = (
@@ -1371,6 +1398,8 @@ def auto_maintain(
                     uid,
                     f"自动维护首次账号校验命中平台风控（{risk}）已暂停，需人工恢复",
                 )
+                _record_global_platform_risk("auto_maintain", exc)
+                breaker.risk_code = _risk_code_from_message(exc)
                 breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
 
             for original_id in ordered:
@@ -1399,6 +1428,8 @@ def auto_maintain(
                         uid,
                         f"自动维护命中平台风控已暂停，需人工恢复：{exc}",
                     )
+                    _record_global_platform_risk("auto_maintain", exc)
+                    breaker.risk_code = _risk_code_from_message(exc)
                     breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
                     break
                 except RemoteStateUnknown as exc:
@@ -1415,6 +1446,8 @@ def auto_maintain(
                             uid,
                             f"自动维护命中平台风控（{risk}）已暂停，需人工恢复",
                         )
+                        _record_global_platform_risk("auto_maintain", exc)
+                        breaker.risk_code = _risk_code_from_message(exc)
                         breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
                         break
                     raise
@@ -1456,6 +1489,7 @@ def auto_maintain(
         "evaluated_originals": evaluated,
         "sync_needed": bool(getattr(get_checkpoint(uid), "sync_needed", False)),
         "rate_limited": breaker.rate_limited,
+        "risk_code": breaker.risk_code,
         "message": message,
         "guard_reconciliation": guard_reconciliation,
         "candidates": load_persisted_candidates(uid),

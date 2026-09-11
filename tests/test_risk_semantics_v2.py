@@ -482,7 +482,7 @@ def test_same_risk_recorded_twice_does_not_extend_cooldown(risk_state_path: Path
         reason="API error -352: 风控",
         now_ts=1_000_060,  # 同一事件 60 秒内重复传播
     )
-    assert second["paused_until"] == first["paused_until"] == 1_000_000 + 6 * 3600
+    assert second["paused_until"] == first["paused_until"] == 1_000_000 + 20 * 60
 
 
 def test_new_later_risk_still_extends_cooldown(risk_state_path: Path) -> None:
@@ -494,7 +494,7 @@ def test_new_later_risk_still_extends_cooldown(risk_state_path: Path) -> None:
         reason="API error -509",
         now_ts=1_000_000 + 4 * 3600,  # 数小时后新一次真实风控
     )
-    assert later["paused_until"] == (1_000_000 + 4 * 3600) + 6 * 3600
+    assert later["paused_until"] == (1_000_000 + 4 * 3600) + 20 * 60
 
 
 

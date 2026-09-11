@@ -1034,6 +1034,15 @@ def run_action(
     return _run_action_impl(action, params, on_progress=on_progress, cancel_event=cancel_event)
 
 
+def _raise_assessment_platform_risk(result: object) -> None:
+    """评估结果若为正式平台风控：结构化上抛（Job 失败 + 全局冷却已由核心层记录）。"""
+    if not isinstance(result, dict) or not result.get("rate_limited"):
+        return
+    code = result.get("risk_code")
+    if code in (-352, -509, 429):
+        raise RuntimeError(f"API error {code}: 平台风控已停止当前评估（已完成结果已保留）")
+
+
 def _run_action_impl(
     action: str,
     params: dict[str, Any] | None = None,
@@ -1490,6 +1499,7 @@ def _run_action_impl(
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
         )
         _raise_if_cancelled(cancel_event)
+        _raise_assessment_platform_risk(assessed)
         message = str(assessed.get("message") or "同步/评估转发历史完成")
         progress(step=2, total=2, message=message, log_append=message)
         return {
@@ -1558,6 +1568,7 @@ def _run_action_impl(
             force_original_ids=force_original_ids,
         )
         _raise_if_cancelled(cancel_event)
+        _raise_assessment_platform_risk(result)
         candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
         message = str(result.get("message") or "历史抽奖评估完成")
         progress(step=1, total=1, message=message, log_append=message)

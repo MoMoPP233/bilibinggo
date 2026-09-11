@@ -65,6 +65,13 @@ class ClassifyFetchContext:
         if self._risk_code is None:
             self._risk_code = code
 
+    def platform_risk_code(self) -> int | None:
+        """正式平台风控码（仅 -352/-509/429）；-799 属 temporary restriction，不算。"""
+        from src.platform_risk import is_platform_risk_code
+
+        code = self.risk_control_code()
+        return code if is_platform_risk_code(code) else None
+
     def risk_control_code(self) -> int | None:
         """返回本轮分类中命中的结构化风控码（仅 API code 字段，绝不扫描正文）。
         分类期碰到的结构化 API code（detail/notice）。注意语义分层：

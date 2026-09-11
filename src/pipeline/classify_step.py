@@ -51,15 +51,24 @@ def _outcome_with_api_cache(
     return outcome
 
 
+def _raise_if_platform_risk(ctx: ClassifyFetchContext, dynamic_id: str) -> None:
+    """任一远程阶段确认正式平台风控（-352/-509/429）→ 立即结构化上抛（0 后续请求/0 LLM）。"""
+    code = ctx.platform_risk_code()
+    if code is not None:
+        raise RuntimeError(f"API error {code}: 分类阶段命中平台风控（{dynamic_id}）")
+
+
 def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
     """纯分类能力：复用同一上下文内的 detail/notice 缓存，不触碰任何存储。"""
     client = ctx.client
     dynamic_id = ctx.dynamic_id
     referer = opus_link(dynamic_id)
     if ctx.is_deleted_link():
+        _raise_if_platform_risk(ctx, dynamic_id)
         return ClassifyOutcome(dynamic_id, None, True, "链接失效")
 
     additional = ctx.get_additional()
+    _raise_if_platform_risk(ctx, dynamic_id)
     if additional and _is_upower_lottery(additional):
         return ClassifyOutcome(dynamic_id, "充电抽奖", True, "充电抽奖")
 
@@ -72,6 +81,7 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
         request_retries=ctx._notice_fetch_retries,
         on_risk=ctx._record_risk,
     )
+    _raise_if_platform_risk(ctx, dynamic_id)
     if interact_notice and interact_notice.get("lottery_id"):
         return _outcome_with_api_cache(
             ClassifyOutcome(dynamic_id, "互动抽奖", False),
@@ -90,6 +100,7 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
         request_retries=ctx._notice_fetch_retries,
         on_risk=ctx._record_risk,
     )
+    _raise_if_platform_risk(ctx, dynamic_id)
     if upower_notice and upower_notice.get("lottery_id"):
         return ClassifyOutcome(dynamic_id, "充电抽奖", True, "充电抽奖")
 
@@ -110,6 +121,7 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
             )
         return _outcome_with_api_cache(outcome, ctx)
 
+    _raise_if_platform_risk(ctx, dynamic_id)
     content = ctx.resolve_classify_content()
 
     parsed = classify_forward_lottery(dynamic_id, content)

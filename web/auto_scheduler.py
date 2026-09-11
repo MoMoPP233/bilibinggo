@@ -480,14 +480,14 @@ class AutoScheduler:
             if until
             else "稍后"
         )
-        hours = AUTO_REMOTE_RISK_COOLDOWN_SECONDS // 3600
+        minutes = AUTO_REMOTE_RISK_COOLDOWN_SECONDS // 60
         self._log(
             "error",
-            f"检测到平台风控，自动远程任务进入 {hours} 小时冷却（至 {until_text}）：{message}",
+            f"检测到平台风控，自动远程任务进入 {minutes} 小时冷却（至 {until_text}）：{message}",
         )
         self._set_phase(
             "等待下一刻度",
-            f"自动远程任务已因平台风控进入 {hours} 小时冷却，冷却结束后等下一次正常调度。",
+            f"自动远程任务已因平台风控进入 {minutes} 小时冷却，冷却结束后等下一次正常调度。",
         )
 
     def _remote_stage_allowed(self) -> bool:
