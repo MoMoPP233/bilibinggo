@@ -481,7 +481,10 @@ def _source_payload_counts(payload: dict[str, Any]) -> dict[str, Any]:
         "new_link_count": candidate,
         "non_lottery_count": int(pipeline.get("non_lottery_count", 0) or 0),
         "other_skipped_count": int(pipeline.get("other_skipped_count", 0) or 0),
-        "processing_failed_count": int(pipeline.get("failed_count", 0) or 0),
+        "processing_failed_count": int(
+            pipeline.get("failed_count", 0) or 0
+        )
+        + int(pipeline.get("provider_failed_count", 0) or 0),
         "persisted_count": int(
             result.get("persisted_count", pipeline.get("persisted_count", 0)) or 0
         ),
@@ -626,7 +629,17 @@ def _run_source_refresh(
     finally:
         pipeline_spans.close(error_kind=pipeline_error)
     _raise_if_cancelled(cancel_event)
-    commit_source_checkpoint(check_result)
+    if pipeline_result.partial:
+        # V21：partial/breaker 时禁止提交最终 checkpoint，避免剩余候选被永久跳过。
+        # 已成功结果已由 pipeline 落库；下一轮从同一专栏重新进入，由 DB 去重与
+        # classification cache 挡下已完成候选。
+        partial_line = (
+            "【部分完成】LLM 服务异常，未推进数据源检查点；"
+            "已成功结果已保存，剩余候选将在后续刷新继续"
+        )
+        log_lines.append(partial_line)
+    else:
+        commit_source_checkpoint(check_result)
     invalidate_activity_cache()
     for line in _pipeline_log_lines(pipeline_result):
         log_lines.append(line)
@@ -660,9 +673,12 @@ def _run_source_refresh(
         "pipeline": pipeline_result.to_dict(),
     }
     counts = _source_payload_counts({"result": result_payload})
+    message = f"{source_id} 更新完成：{_format_source_scan_counts(counts)}"
+    if pipeline_result.partial:
+        message += "（部分完成：LLM 服务异常，剩余候选待后续刷新）"
     return {
         "ok": True,
-        "message": f"{source_id} 更新完成：{_format_source_scan_counts(counts)}",
+        "message": message,
         "result": result_payload,
         "log": sanitize_log("\n".join(log_lines).strip()),
     }
@@ -1224,8 +1240,16 @@ def _run_action_impl(
         finally:
             pipeline_spans.close(error_kind=pipeline_error)
         _raise_if_cancelled(cancel_event)
-        for check_result in ds_check_results:
-            commit_source_checkpoint(check_result)
+        if pipeline_result.partial:
+            # V21：partial/breaker 时禁止提交任何最终 checkpoint，避免剩余候选被永久跳过。
+            partial_line = (
+                "【部分完成】LLM 服务异常，未推进数据源检查点；"
+                "已成功结果已保存，剩余候选将在后续刷新继续"
+            )
+            log_lines.append(partial_line)
+        else:
+            for check_result in ds_check_results:
+                commit_source_checkpoint(check_result)
         invalidate_activity_cache()
         for line in _pipeline_log_lines(pipeline_result):
             log_lines.append(line)
@@ -1243,6 +1267,8 @@ def _run_action_impl(
         ]
         if pipeline_result.skip_reasons:
             summary_parts.append(f"跳过 {pipeline_result.skipped_count} 条")
+        if pipeline_result.partial:
+            summary_parts.append("部分完成（LLM 服务异常，剩余候选待后续刷新）")
 
         logger.info(
             "一键更新完成：新链接 %s，入库 %s",
@@ -1392,7 +1418,14 @@ def _run_action_impl(
             log_append=log_lines[-1] if log_lines else "",
         )
 
-        set_watch_last_synced_at(watch_result.synced_at)
+        if pipeline_result.partial:
+            # V21：partial 时保留监控窗口 checkpoint，下一轮重扫同一窗口；
+            # 已成功结果由 DB 去重与 classification cache 挡下。
+            log_lines.append(
+                "【部分完成】LLM 服务异常，未推进监控窗口检查点；剩余候选将在后续刷新继续"
+            )
+        else:
+            set_watch_last_synced_at(watch_result.synced_at)
         save_watch_result(watch_result)
         set_last_pipeline_persisted(
             action="refresh_watch",
@@ -1405,6 +1438,8 @@ def _run_action_impl(
             f"新链接 {pipeline_result.new_link_count} 条",
             f"新入库 {pipeline_result.persisted_count} 条",
         ]
+        if pipeline_result.partial:
+            summary_parts.append("部分完成（LLM 服务异常，剩余候选待后续刷新）")
         logger.info(
             "监控用户更新完成：窗口 %s 条，入库 %s",
             watch_result.link_count,

@@ -80,7 +80,9 @@ MAX_DELETE_BATCH = 20
 AUTO_DELETE_BATCH_SIZE = 20
 HEALTH_ISSUE_LIMIT = 20
 TRUSTED_IDENTITY_SOURCES = frozenset({"space_feed", "legacy_space_feed"})
-RETRYABLE_ASSESSMENT_REASON_CODES = frozenset({"remote_unknown"})
+RETRYABLE_ASSESSMENT_REASON_CODES = frozenset({"remote_unknown", "llm_temporary"})
+# 基础设施临时失败的最小退避窗口：同一 retryable 记录在该窗口内不重复远程评估
+RETRYABLE_ASSESSMENT_BACKOFF_SECONDS = 15 * 60
 PERMANENT_IDENTITY_ERROR_MARKERS = (
     "不属于当前账号",
     "不是明确的转发动态",
@@ -753,6 +755,16 @@ def _assess_via_public_classifier(
             raise AssessmentRateLimited(
                 f"本轮评估因平台限流/风控提前停止（{risk}），已经完成的结果已保存。"
             ) from exc
+        # LLM 基础设施临时/协议失败：属于 retryable，绝不保存成业务 final。
+        from src.llm_client import LlmConfigError, LlmProtocolError, LlmTemporaryError
+
+        if isinstance(exc, (LlmTemporaryError, LlmProtocolError, LlmConfigError)):
+            return CandidateAssessment(
+                "blocked",
+                f"LLM 服务临时不可用（{type(exc).__name__}），稍后自动重试",
+                "llm_temporary",
+                classification_source="public_classifier",
+            )
         return CandidateAssessment(
             "blocked", f"公共分类无法可靠判断原动态是否为抽奖：{exc}",
             "classify_failed", classification_source="public_classifier",
@@ -1054,13 +1066,25 @@ def scan_expired_reposts(
 
             # 每批开始：重新查库（assessment 状态以最新为准）
             existing = list_repost_assessments(uid)
+
+            def _retryable_ready(original_id: str) -> bool:
+                data = _record_dict(existing[original_id])
+                if data.get("assessment_status") != "retryable_unknown":
+                    return False
+                evaluated_at = int(data.get("evaluated_at") or 0)
+                # 时间戳缺失/时钟偏差（>= 当前固定时钟）时不阻塞恢复，只对明确
+                # “最近失败且早于当前”的记录应用最小退避窗口。
+                if evaluated_at >= current:
+                    return True
+                return (current - evaluated_at) >= RETRYABLE_ASSESSMENT_BACKOFF_SECONDS
+
             pending = [
                 original_id
                 for original_id in scope_ids
                 if original_id not in attempted_this_job
                 and (
                     original_id not in existing
-                    or _record_dict(existing[original_id]).get("assessment_status") == "retryable_unknown"
+                    or _retryable_ready(original_id)
                 )
             ]
             if not pending:

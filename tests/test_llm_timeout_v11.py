@@ -119,7 +119,7 @@ def test_llm_timeout_never_touches_platform_risk() -> None:
 def test_backend_own_timeout_error_is_explicit() -> None:
     fake = _FakeHttp(error=httpx.ReadTimeout("read timeout after 90 seconds", request=None))
     with patch.object(llm.httpx, "Client", lambda **kwargs: fake):
-        with pytest.raises(RuntimeError, match="无法连接"):
+        with pytest.raises(RuntimeError, match="超时"):
             llm.test_llm_connection(_config())
 
 

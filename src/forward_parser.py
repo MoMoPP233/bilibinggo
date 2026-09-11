@@ -632,6 +632,13 @@ def classify_forward_lottery(dynamic_id: str, content_text: str) -> dict[str, An
         parsed["from_cache"] = True
         return parsed
 
+    # V21：provider breaker 打开后不再发起任何 LLM 请求（0 additional requests）。
+    from src.llm_resilience import current_llm_provider_breaker
+
+    breaker = current_llm_provider_breaker()
+    if breaker is not None:
+        breaker.check()
+
     raw = chat_json(
         system=CLASSIFY_SYSTEM_PROMPT,
         user=_build_classify_user_prompt(dynamic_id=dynamic_id, content_text=content_text),
@@ -708,6 +715,13 @@ def parse_forward_content(dynamic_id: str, content_text: str) -> dict[str, Any]:
 
     if len(content_text.strip()) < MIN_CONTENT_LEN:
         return _empty_parse(error="正文过短")
+
+    # V21：provider breaker 打开后不再发起任何 LLM 请求（0 additional requests）。
+    from src.llm_resilience import current_llm_provider_breaker
+
+    breaker = current_llm_provider_breaker()
+    if breaker is not None:
+        breaker.check()
 
     reference_ts = int(time.time())
     raw = chat_json(

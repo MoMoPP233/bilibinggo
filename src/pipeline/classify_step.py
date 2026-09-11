@@ -29,6 +29,8 @@ class ClassifyOutcome:
     lottery_notice: dict[str, Any] | None = None
     notice_business_type: int | None = None
     notice_business_id: str | None = None
+    # 本次分类是否真正调用了 LLM provider（缓存命中/纯 API 路径为 False）。
+    llm_called: bool = False
 
 
 def _classify_detail_item(ctx: ClassifyFetchContext) -> dict[str, Any] | None:
@@ -127,6 +129,7 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
     parsed = classify_forward_lottery(dynamic_id, content)
     if parsed.get("error"):
         raise RuntimeError(f"LLM 分类失败 {dynamic_id}: {parsed.get('error')}")
+    llm_called = not bool(parsed.get("from_cache"))
 
     if parsed.get("is_lottery"):
         return _outcome_with_api_cache(
@@ -135,6 +138,7 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
                 "转发抽奖",
                 False,
                 classify_content=content,
+                llm_called=llm_called,
             ),
             ctx,
         )
@@ -145,6 +149,7 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
             True,
             "非抽奖活动",
             classify_content=content,
+            llm_called=llm_called,
         ),
         ctx,
     )

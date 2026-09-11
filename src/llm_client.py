@@ -12,6 +12,27 @@ from src.retry_utils import is_transient_http_error, retry_call
 
 import threading
 
+
+class LlmConfigError(RuntimeError):
+    """LLM 配置/鉴权失败（401/403/404、model/endpoint 不存在等）——不重试。"""
+
+
+class LlmConfigUnavailableError(LlmConfigError):
+    """配置/鉴权已明确失败且 fingerprint 未变：跳过重复远程请求（自动任务快速失败）。
+
+    属于 recoverable configuration failure：用户修改 Host/Model/API Key 后
+    fingerprint 改变即自动恢复；数据库状态仍不得保存成业务 final。
+    """
+
+
+class LlmTemporaryError(RuntimeError):
+    """LLM 临时 provider 故障（429/5xx/timeout/连接中断）——可有限重试/retryable。"""
+
+
+class LlmProtocolError(RuntimeError):
+    """LLM 协议不兼容（HTML/空响应/error object/缺 choices/content 非法等）——不可静默成空。"""
+
+
 _llm_lock = threading.Semaphore(3)
 # 生成/读取允许较长窗口；连接（connect）快速失败，不共享同一长超时。
 _LLM_READ_TIMEOUT_SEC = 90.0
@@ -26,25 +47,110 @@ _LLM_TEST_TOTAL_TIMEOUT_SEC = 90.0
 # 连接测试只需极短回复，但 DeepSeek V4 等模型在部分网关下 max_tokens=1 会触发 400。
 _LLM_TEST_MAX_TOKENS = 64
 
+# 配置/鉴权失败后的最小状态：只保存脱敏 fingerprint（key|base|model 的不可逆 hash），
+# 绝不保存 API Key 原文。进程内生效；配置变更（fingerprint 改变）后下一次任务自动恢复。
+_unavailable_config_fingerprint: str | None = None
+
+
+def _llm_config_fingerprint(config: LlmConfig) -> str:
+    from src.llm_settings import _config_fingerprint
+
+    return _config_fingerprint(config.api_key, config.base_url, config.model_name)
+
+
+def _raise_if_llm_config_unavailable(config: LlmConfig) -> str:
+    fingerprint = _llm_config_fingerprint(config)
+    if _unavailable_config_fingerprint == fingerprint:
+        raise LlmConfigUnavailableError(
+            "LLM 配置/鉴权不可用且配置未变更（llm_configuration_unavailable），已跳过重复请求"
+        )
+    return fingerprint
+
+
+def _mark_llm_config_unavailable(fingerprint: str) -> None:
+    global _unavailable_config_fingerprint
+    _unavailable_config_fingerprint = fingerprint
+
+
+def _clear_llm_config_unavailable(fingerprint: str) -> None:
+    global _unavailable_config_fingerprint
+    if _unavailable_config_fingerprint == fingerprint:
+        _unavailable_config_fingerprint = None
+
+
+def llm_config_unavailable() -> bool:
+    return _unavailable_config_fingerprint is not None
+
+
+def reset_llm_config_unavailable_for_tests() -> None:
+    global _unavailable_config_fingerprint
+    _unavailable_config_fingerprint = None
+
 
 def _format_llm_http_error(exc: httpx.HTTPStatusError) -> str:
     status = exc.response.status_code
-    message = ""
-    try:
-        body = exc.response.json()
-        if isinstance(body.get("error"), dict):
-            message = str(body["error"].get("message") or "").strip()
-        else:
-            message = str(body.get("message") or body.get("detail") or "").strip()
-    except Exception:
-        message = (exc.response.text or "").strip()[:200]
-    if status == 401:
-        return f"API Key 无效或已过期{('：' + message) if message else ''}"
+    if status in {401, 403}:
+        return "API Key 无效或权限不足"
     if status == 404:
-        return f"接口地址或模型不存在{('：' + message) if message else ''}"
-    if status in {408, 429, 500, 502, 503, 504}:
-        return f"LLM 服务暂时不可用（HTTP {status}）{('：' + message) if message else ''}"
-    return f"连接失败（HTTP {status}）{('：' + message) if message else ''}"
+        return "接口地址或模型名称不存在"
+    if status == 429:
+        return "LLM 服务当前限流，请稍后重试"
+    if status in {408, 500, 502, 503, 504}:
+        return f"LLM 服务暂时不可用（HTTP {status}）"
+    return f"LLM 请求失败（HTTP {status}）"
+
+
+def _map_http_error(exc: httpx.HTTPStatusError) -> RuntimeError:
+    """HTTP 状态 → 结构化 LLM 错误（config/auth vs temporary provider）。"""
+    status = exc.response.status_code
+    message = _format_llm_http_error(exc)
+    if status in {401, 403, 404}:
+        return LlmConfigError(message)
+    if status == 429 or 500 <= status <= 599 or status in {408}:
+        return LlmTemporaryError(message)
+    return LlmConfigError(message)
+
+
+def _content_text(content: Any) -> str | None:
+    """OpenAI-compatible content → 文本；无法安全解析返回 None（由上层抛 protocol error）。"""
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        text = "".join(parts).strip()
+        return text or None
+    return None
+
+
+def _normalize_chat_response(data: Any) -> str:
+    """单一 response normalization：业务请求与连接测试共用。
+
+    支持 choices[0].message.content 为 string 或 text parts 数组；
+    HTML/空/error object/缺 choices/缺 message/非法 content/reasoning-only
+    一律抛 LlmProtocolError（绝不静默返回空串）。
+    """
+    if not isinstance(data, dict):
+        raise LlmProtocolError("LLM 响应不是 JSON 对象（协议不兼容）")
+    if isinstance(data.get("error"), (dict, list)):
+        raise LlmProtocolError("LLM 返回了 error 对象（协议不兼容）")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LlmProtocolError("LLM 响应缺少 choices（协议不兼容）")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise LlmProtocolError("LLM choices[0] 结构非法（协议不兼容）")
+    message = first.get("message")
+    if not isinstance(message, dict):
+        raise LlmProtocolError("LLM 响应缺少 message（协议不兼容）")
+    text = _content_text(message.get("content"))
+    if text is None:
+        raise LlmProtocolError("LLM 响应 content 为空或结构不支持（协议不兼容）")
+    if text.startswith("<"):
+        raise LlmProtocolError("LLM 返回内容不是 JSON（疑似 HTML，协议不兼容）")
+    return text
 
 
 def _llm_retryable(exc: BaseException) -> bool:
@@ -52,6 +158,10 @@ def _llm_retryable(exc: BaseException) -> bool:
     # 普通网络错误按原有语义判断；HTTP 5xx/429 等瞬时错误维持既有重试。
     if isinstance(exc, httpx.TimeoutException):
         return False
+    if isinstance(exc, LlmProtocolError):
+        return False
+    if isinstance(exc, LlmTemporaryError):
+        return True
     if isinstance(exc, (json.JSONDecodeError, RuntimeError)):
         message = str(exc)
         if "无法解析出…JSON" in message or "不是对象" in message:
@@ -109,13 +219,20 @@ def _post_chat_completion(
 
 def test_llm_connection(config: LlmConfig) -> str:
     url, headers, payload = _test_request(config)
+    fingerprint = _llm_config_fingerprint(config)
     try:
         # 连接测试=单次尝试（兼容旧调用方；真正总窗口由 async 路由保证）。
-        _post_chat_completion(url=url, headers=headers, payload=payload, attempts=1)
+        data = _post_chat_completion(url=url, headers=headers, payload=payload, attempts=1)
     except httpx.HTTPStatusError as exc:
-        raise RuntimeError(_format_llm_http_error(exc)) from exc
+        mapped = _map_http_error(exc)
+        if isinstance(mapped, LlmConfigError):
+            _mark_llm_config_unavailable(fingerprint)
+        raise mapped from exc
     except httpx.RequestError as exc:
-        raise RuntimeError(f"无法连接接口地址：{exc}") from exc
+        raise LlmTemporaryError("LLM 服务连接超时或网络不可达") from exc
+    # 必须与业务请求复用同一 normalizer：只有拿到非空文本才算真正连通。
+    _normalize_chat_response(data)
+    _clear_llm_config_unavailable(fingerprint)
     return f"{config.model_name} @ {config.base_url}"
 
 
@@ -123,6 +240,8 @@ def chat_json(*, system: str, user: str, config: LlmConfig | None = None) -> dic
     cfg = config or load_llm_config()
     if not cfg:
         raise RuntimeError("未配置 LLM，请检查数据根目录下的 shared/llm.env")
+    # 配置未变且上次已明确 Config/Auth 失败：不再重复远程请求（手动连接测试不受限）。
+    fingerprint = _raise_if_llm_config_unavailable(cfg)
 
     payload = _build_chat_payload(
         cfg,
@@ -142,13 +261,16 @@ def chat_json(*, system: str, user: str, config: LlmConfig | None = None) -> dic
         try:
             data = _post_chat_completion(url=url, headers=headers, payload=payload)
         except httpx.HTTPStatusError as exc:
-            raise RuntimeError(_format_llm_http_error(exc)) from exc
+            mapped = _map_http_error(exc)
+            if isinstance(mapped, LlmConfigError):
+                _mark_llm_config_unavailable(fingerprint)
+            raise mapped from exc
         except httpx.RequestError as exc:
-            raise RuntimeError(f"无法连接 LLM 接口：{exc}") from exc
+            raise LlmTemporaryError("LLM 服务连接超时或网络不可达") from exc
 
-    content = (
-        ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-    ).strip()
+    content = _normalize_chat_response(data)
+    # HTTP/协议层已证明当前配置可用：解除 fingerprint 封锁（配置变更也会自然放行）。
+    _clear_llm_config_unavailable(fingerprint)
 
     def _parse() -> dict[str, Any]:
         return _extract_json_object(content)
@@ -170,10 +292,10 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
     match = re.search(r"\{.*\}", text, re.S)
     if not match:
-        raise RuntimeError(f"LLM 返回无法解析为 JSON: {text[:200]}")
+        raise LlmProtocolError("LLM 返回内容不是合法 JSON（协议不兼容）")
     parsed = json.loads(match.group(0))
     if not isinstance(parsed, dict):
-        raise RuntimeError("LLM 返回的 JSON 不是对象")
+        raise LlmProtocolError("LLM 返回的 JSON 不是对象（协议不兼容）")
     return parsed
 
 def _test_request(config: LlmConfig):
@@ -194,9 +316,9 @@ def _test_request(config: LlmConfig):
 
 def _map_provider_error(exc: BaseException) -> RuntimeError:
     if isinstance(exc, httpx.HTTPStatusError):
-        return RuntimeError(_format_llm_http_error(exc))
+        return _map_http_error(exc)
     if isinstance(exc, (httpx.RequestError, TimeoutError, asyncio.TimeoutError)):
-        return RuntimeError(f"无法连接接口地址：{exc}")
+        return LlmTemporaryError("LLM 服务连接超时或网络不可达")
     return RuntimeError(str(exc))
 
 
@@ -212,6 +334,7 @@ async def test_llm_connection_async(
     远端 provider 是否立即停止生成无法保证，但本地请求生命周期必然结束。
     """
     url, headers, payload = _test_request(config)
+    fingerprint = _llm_config_fingerprint(config)
     try:
         async with asyncio.timeout(total_timeout_sec):
             async with httpx.AsyncClient(
@@ -221,6 +344,14 @@ async def test_llm_connection_async(
             ) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 resp.raise_for_status()
+                data = resp.json()
     except (httpx.HTTPStatusError, httpx.RequestError, TimeoutError) as exc:
-        raise _map_provider_error(exc) from exc
+        mapped = _map_provider_error(exc)
+        if isinstance(mapped, LlmConfigError):
+            _mark_llm_config_unavailable(fingerprint)
+        raise mapped from exc
+    except ValueError as exc:
+        raise LlmProtocolError("LLM 响应不是合法 JSON（协议不兼容）") from exc
+    _normalize_chat_response(data)
+    _clear_llm_config_unavailable(fingerprint)
     return f"{config.model_name} @ {config.base_url}"

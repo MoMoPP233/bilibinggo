@@ -259,6 +259,9 @@ def scan_following_feed(
             int(skip_reasons.get(reason, 0) or 0)
             for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
         )
+    # V21：LLM provider partial/breaker 时保留旧 checkpoint，未完成候选下一轮继续。
+    if bool(getattr(pipeline, "partial", False)):
+        blocking_count += 1
 
     if blocking_count > 0:
         # 保守语义：只保留进入本轮前 checkpoint 的值；不先写新值再 rollback。

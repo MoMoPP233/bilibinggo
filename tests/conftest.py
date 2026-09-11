@@ -50,10 +50,17 @@ def _reset_runtime_profile_after_each_test():
     get_runtime_profile_id 因进程内 root 与当前 env 不一致而抛错）。
     各测试自身仍需自足 setup；本 fixture 只兜底清理跨测试状态。
     """
+    from src import llm_client
+    from src.llm_resilience import clear_llm_provider_breaker_for_tests
+
+    llm_client.reset_llm_config_unavailable_for_tests()
+    clear_llm_provider_breaker_for_tests()
     yield
     from src import data_paths
 
     data_paths.reset_runtime_profile_for_tests()
+    llm_client.reset_llm_config_unavailable_for_tests()
+    clear_llm_provider_breaker_for_tests()
 
 
 @pytest.fixture

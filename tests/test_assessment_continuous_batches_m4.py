@@ -11,6 +11,8 @@ T progress step 单调、total 固定；V 完成后无额外 progress；W termin
 
 from __future__ import annotations
 
+import time
+
 from types import SimpleNamespace
 
 import pytest
@@ -252,7 +254,8 @@ def test_each_batch_requeries_db(isolated_home, monkeypatch) -> None:
             assessment_level="manual_review",
             assessment_status="final",
             reason_code="forward_lottery_manual",
-            assessed_at=1_800_000_000,
+            # V21 退避：retryable 需超过 RETRYABLE_ASSESSMENT_BACKOFF_SECONDS 才重新进入候选
+            assessed_at=int(time.time()) - 15 * 60 - 1,
         )
 
     fail_on = {originals[0]: {"mode": "add_more", "side_effect": side_effect}}
