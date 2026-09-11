@@ -51,16 +51,19 @@ def _reset_runtime_profile_after_each_test():
     各测试自身仍需自足 setup；本 fixture 只兜底清理跨测试状态。
     """
     from src import llm_client
+    from src.bilibili_request_budget import clear_bilibili_request_budget_scope_for_tests
     from src.llm_resilience import clear_llm_provider_breaker_for_tests
 
     llm_client.reset_llm_config_unavailable_for_tests()
     clear_llm_provider_breaker_for_tests()
+    clear_bilibili_request_budget_scope_for_tests()
     yield
     from src import data_paths
 
     data_paths.reset_runtime_profile_for_tests()
     llm_client.reset_llm_config_unavailable_for_tests()
     clear_llm_provider_breaker_for_tests()
+    clear_bilibili_request_budget_scope_for_tests()
 
 
 @pytest.fixture

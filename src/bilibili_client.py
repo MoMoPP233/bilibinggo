@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 
 from src.bilibili_rate_limit import acquire_bilibili_request_slot
+from src.bilibili_request_budget import reserve_bilibili_http_attempt
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -104,6 +105,9 @@ class BilibiliClient:
                 )
         except httpx.HTTPError:
             pass
+        except RequestBudgetExhausted:
+            # V22：窗口未恢复时构造 client 不应崩溃；首个真实业务请求会结构化暂停。
+            pass
 
     def _http_get(
         self,
@@ -112,6 +116,8 @@ class BilibiliClient:
         params: dict | None = None,
         headers: dict | None = None,
     ) -> httpx.Response:
+        # V22：受保护任务内按真实 HTTP attempt 先 reserve 后发送（retry 每次都会重入）。
+        reserve_bilibili_http_attempt(url)
         acquire_bilibili_request_slot()
         with self._http_lock:
             return self._client.get(url, params=params or {}, headers=headers)
@@ -125,6 +131,7 @@ class BilibiliClient:
         params: dict | None = None,
         headers: dict | None = None,
     ) -> httpx.Response:
+        reserve_bilibili_http_attempt(url)
         acquire_bilibili_request_slot()
         with self._http_lock:
             return self._client.post(

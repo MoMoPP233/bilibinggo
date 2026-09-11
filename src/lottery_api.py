@@ -9,6 +9,7 @@ from collections.abc import Callable
 import httpx
 
 from src.bilibili_client import BilibiliClient
+from src.bilibili_request_budget import RequestBudgetExhausted
 from src.lottery_classifier import UPOWER_BUSINESS_TYPE
 from src.platform_risk import risk_code_of
 from src.sources.common import opus_link
@@ -187,6 +188,9 @@ def _fetch_opus_detail_item(
             referer=referer,
             retries=retries,
         )
+    except RequestBudgetExhausted:
+        # V22 本地预算保护是独立控制流：绝不能被“不可读/跳过当前动态”吞掉。
+        raise
     except Exception as exc:
         # 明确平台风控绝不能被“不可读/跳过当前动态”吞掉；普通失败允许跳过该条。
         if risk_code_of(exc) is not None:
@@ -315,6 +319,8 @@ def probe_dynamic_detail_api(
             referer=referer,
             retries=retries,
         )
+    except RequestBudgetExhausted:
+        raise
     except Exception as exc:
         logger.debug("dynamic/detail 请求失败 %s: %s", dynamic_id, exc)
         return None, None, str(exc)
@@ -393,6 +399,8 @@ def resolve_reserve_business(
     referer = opus_link(dynamic_id)
     try:
         html = client.get_text(referer, referer="https://www.bilibili.com", retries=1)
+    except RequestBudgetExhausted:
+        raise
     except RuntimeError:
         return None
     match = RESERVE_RID_RE.search(html)

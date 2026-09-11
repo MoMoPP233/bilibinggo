@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from src.bilibili_client import BilibiliClient
+from src.bilibili_request_budget import RequestBudgetExhausted
 from src.forward_classify_cache import get_cached_classify, put_cached_classify
 from src.forward_parse_cache import get_cached_parse, put_cached_parse
 from src.llm_client import chat_json
@@ -388,6 +389,9 @@ def _fetch_html_dynamic_text(client: BilibiliClient, dynamic_id: str) -> str:
             text = _extract_from_initial_state(html)
             if _is_sufficient_content(text):
                 return text.strip()
+        except RequestBudgetExhausted:
+            # V22 本地预算保护是独立控制流：不得降级为可重试正文抓取失败。
+            raise
         except RuntimeError as exc:
             last_error = exc
         if attempt < HTML_FETCH_ATTEMPTS - 1:
@@ -497,6 +501,9 @@ def fetch_dynamic_content_with_retry(
                 detail_item=initial_detail_item,
                 try_html=(attempt == 0) and (not forward_cached or forward_empty_detail),
             )
+        except RequestBudgetExhausted:
+            # 预算耗尽：立即停止，不进入重试等待/不伪装成正文不可读取。
+            raise
         except DynamicContentFetchError as exc:
             last_error = exc
             if not exc.retryable:

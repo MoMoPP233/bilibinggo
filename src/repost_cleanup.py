@@ -18,6 +18,11 @@ import httpx
 from src.activity_store import load_activities
 from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient, api_code
+from src.bilibili_request_budget import (
+    RequestBudgetExhausted,
+    bilibili_request_budget_scope,
+    get_bilibili_request_budget,
+)
 from src.data_paths import get_runtime_profile_id, get_selected_profile_id
 from src.db.engine import db_path
 from src.lottery_api import DYNAMIC_DETAIL_URL, LOTTERY_NOTICE_URL
@@ -185,6 +190,9 @@ def _require_verified_login(client: BilibiliClient) -> tuple[str, int]:
     csrf, cookie_uid = require_login()
     try:
         payload = client.request_json(NAV_URL, retries=0)
+    except RequestBudgetExhausted:
+        # V22 本地预算保护：不伪装成登录/网络失败。
+        raise
     except (httpx.HTTPError, RuntimeError) as exc:
         raise RuntimeError(f"无法校验当前登录账号：{exc}") from exc
     if not isinstance(payload, dict):
@@ -226,121 +234,155 @@ def sync_repost_history(
         if initial_sync_needed
         else None
     )
-    with client_factory() as client:
-        _, uid = _require_verified_login(client)
-        checkpoint = get_checkpoint(str(uid))
-        old_head = str(getattr(checkpoint, "head_dynamic_id", "") or "")
-        old_head_ts = _strict_positive_int(
-            getattr(checkpoint, "head_published_at", None)
+    uid = str(local_uid)
+    checkpoint = initial_checkpoint
+    old_head = str(getattr(checkpoint, "head_dynamic_id", "") or "")
+    old_head_ts = _strict_positive_int(getattr(checkpoint, "head_published_at", None))
+    offset = ""
+    seen_offsets: set[str] = set()
+    scanned_pages = 0
+    scanned_items = 0
+    found_reposts = 0
+    imported_count = 0
+    completed = False
+    budget_exhausted = False
+    newest_id: str | None = None
+    newest_ts: int | None = None
+    saved_checkpoint = checkpoint
+
+    with bilibili_request_budget_scope() as budget_scope:
+        with client_factory() as client:
+            try:
+                _, uid = _require_verified_login(client)
+                checkpoint = get_checkpoint(str(uid))
+                old_head = str(getattr(checkpoint, "head_dynamic_id", "") or "")
+                old_head_ts = _strict_positive_int(
+                    getattr(checkpoint, "head_published_at", None)
+                )
+                saved_checkpoint = checkpoint
+
+                _progress(on_progress, 0, 0, "正在读取当前账号的转发历史…")
+                while True:
+                    _check_cancel(cancel_check)
+                    if offset in seen_offsets:
+                        raise RuntimeError("空间动态分页游标重复，未推进同步检查点")
+                    seen_offsets.add(offset)
+                    try:
+                        data = fetch_space_feed_page(
+                            client, mid=uid, offset=offset, retries=0
+                        )
+                    except RequestBudgetExhausted:
+                        # V22：预算耗尽 → 安全停止分页；不保存检查点、不清 dirty。
+                        budget_exhausted = True
+                        break
+                    scanned_pages += 1
+                    raw_items = data.get("items")
+                    if raw_items is None:
+                        raise RuntimeError("空间动态响应缺少 items，未推进同步检查点")
+                    if not isinstance(raw_items, list):
+                        raise RuntimeError("空间动态 items 格式异常，未推进同步检查点")
+                    scanned_items += len(raw_items)
+
+                    page_records: list[dict[str, Any]] = []
+                    reached_checkpoint = False
+                    page_timestamps: list[int | None] = []
+                    seen_at = int(time.time())
+                    for item in raw_items:
+                        item_id = _feed_item_id(item)
+                        item_ts = (
+                            extract_feed_pub_ts(item) if isinstance(item, dict) else None
+                        )
+                        page_timestamps.append(item_ts)
+                        if item_id and item_ts and (newest_ts is None or item_ts > newest_ts):
+                            newest_id, newest_ts = item_id, item_ts
+                        if old_head and item_id == old_head:
+                            reached_checkpoint = True
+
+                        owned = (
+                            extract_owned_repost(item, uid=uid)
+                            if isinstance(item, dict)
+                            else None
+                        )
+                        if owned is None:
+                            continue
+                        found_reposts += 1
+                        page_records.append(
+                            {
+                                "uid": str(uid),
+                                "repost_dynamic_id": owned.repost_dynamic_id,
+                                "original_dynamic_id": owned.original_dynamic_id,
+                                "reposted_at": owned.reposted_at,
+                                "original_author_uid": owned.original_author_uid,
+                                "original_author_name": owned.original_author_name,
+                                "source": "history_import",
+                                "delete_status": "active",
+                                "last_seen_at": seen_at,
+                                "updated_at": seen_at,
+                            }
+                        )
+
+                    # Feed 中旧 head 可能已被用户手工删除。只有整页每一条都有可靠
+                    # 时间，且全部严格早于旧锚点时，才以时间作为保守回退停止条件。
+                    # 本页仍完整导入，避免分页边界附近的新转发被漏掉。
+                    if (
+                        old_head
+                        and old_head_ts is not None
+                        and raw_items
+                        and all(timestamp is not None for timestamp in page_timestamps)
+                        and all(
+                            timestamp < old_head_ts
+                            for timestamp in page_timestamps
+                            if timestamp
+                        )
+                    ):
+                        reached_checkpoint = True
+                    if page_records:
+                        imported_count += int(
+                            upsert_repost_records(str(uid), page_records, seen_at=seen_at)
+                        )
+
+                    _progress(
+                        on_progress,
+                        scanned_pages,
+                        0,
+                        f"已扫描 {scanned_pages} 页，发现 {found_reposts} 条自己的转发",
+                    )
+                    if reached_checkpoint:
+                        completed = True
+                        break
+                    next_offset = str(data.get("offset") or "").strip()
+                    if not raw_items or not next_offset:
+                        completed = True
+                        break
+                    offset = next_offset
+                    if PAGE_REQUEST_DELAY > 0:
+                        time.sleep(PAGE_REQUEST_DELAY)
+
+                _check_cancel(cancel_check)
+                if completed:
+                    # 空账号保留旧锚点；首次空扫描仍以 full_scan_completed 标记完成。
+                    saved_checkpoint = save_checkpoint(
+                        str(uid),
+                        head_dynamic_id=newest_id or old_head or None,
+                        head_published_at=newest_ts
+                        if newest_ts is not None
+                        else getattr(checkpoint, "head_published_at", None),
+                        full_scan_completed=bool(
+                            getattr(checkpoint, "full_scan_completed", False) or not old_head
+                        ),
+                        # 秒级时间无法区分“同步开始”和同秒 confirmed 的先后；把覆盖水位
+                        # 保守地停在开始前 1 秒，最多多补同步一次，不能永久漏同步。
+                        last_synced_at=max(1, sync_started_at - 1),
+                    )
+            except RequestBudgetExhausted:
+                # 登录校验/分页等任何真实请求耗尽预算：安全暂停，不推进检查点。
+                budget_exhausted = True
+
+        budget_fields = budget_scope.result_fields(
+            exhausted=budget_exhausted, partial=budget_exhausted or not completed
         )
-
-        offset = ""
-        seen_offsets: set[str] = set()
-        scanned_pages = 0
-        scanned_items = 0
-        found_reposts = 0
-        imported_count = 0
-        completed = False
-        newest_id: str | None = None
-        newest_ts: int | None = None
-
-        _progress(on_progress, 0, 0, "正在读取当前账号的转发历史…")
-        while True:
-            _check_cancel(cancel_check)
-            if offset in seen_offsets:
-                raise RuntimeError("空间动态分页游标重复，未推进同步检查点")
-            seen_offsets.add(offset)
-            data = fetch_space_feed_page(client, mid=uid, offset=offset, retries=0)
-            scanned_pages += 1
-            raw_items = data.get("items")
-            if raw_items is None:
-                raise RuntimeError("空间动态响应缺少 items，未推进同步检查点")
-            if not isinstance(raw_items, list):
-                raise RuntimeError("空间动态 items 格式异常，未推进同步检查点")
-            scanned_items += len(raw_items)
-
-            page_records: list[dict[str, Any]] = []
-            reached_checkpoint = False
-            page_timestamps: list[int | None] = []
-            seen_at = int(time.time())
-            for item in raw_items:
-                item_id = _feed_item_id(item)
-                item_ts = extract_feed_pub_ts(item) if isinstance(item, dict) else None
-                page_timestamps.append(item_ts)
-                if item_id and item_ts and (newest_ts is None or item_ts > newest_ts):
-                    newest_id, newest_ts = item_id, item_ts
-                if old_head and item_id == old_head:
-                    reached_checkpoint = True
-
-                owned = extract_owned_repost(item, uid=uid) if isinstance(item, dict) else None
-                if owned is None:
-                    continue
-                found_reposts += 1
-                page_records.append(
-                    {
-                        "uid": str(uid),
-                        "repost_dynamic_id": owned.repost_dynamic_id,
-                        "original_dynamic_id": owned.original_dynamic_id,
-                        "reposted_at": owned.reposted_at,
-                        "original_author_uid": owned.original_author_uid,
-                        "original_author_name": owned.original_author_name,
-                        "source": "history_import",
-                        "delete_status": "active",
-                        "last_seen_at": seen_at,
-                        "updated_at": seen_at,
-                    }
-                )
-
-            # Feed 中旧 head 可能已被用户手工删除。只有整页每一条都有可靠
-            # 时间，且全部严格早于旧锚点时，才以时间作为保守回退停止条件。
-            # 本页仍完整导入，避免分页边界附近的新转发被漏掉。
-            if (
-                old_head
-                and old_head_ts is not None
-                and raw_items
-                and all(timestamp is not None for timestamp in page_timestamps)
-                and all(timestamp < old_head_ts for timestamp in page_timestamps if timestamp)
-            ):
-                reached_checkpoint = True
-            if page_records:
-                imported_count += int(
-                    upsert_repost_records(str(uid), page_records, seen_at=seen_at)
-                )
-
-            _progress(
-                on_progress,
-                scanned_pages,
-                0,
-                f"已扫描 {scanned_pages} 页，发现 {found_reposts} 条自己的转发",
-            )
-            if reached_checkpoint:
-                completed = True
-                break
-            next_offset = str(data.get("offset") or "").strip()
-            if not raw_items or not next_offset:
-                completed = True
-                break
-            offset = next_offset
-            if PAGE_REQUEST_DELAY > 0:
-                time.sleep(PAGE_REQUEST_DELAY)
-
-        _check_cancel(cancel_check)
-        saved_checkpoint = checkpoint
-        if completed:
-            # 空账号保留旧锚点；首次空扫描仍以 full_scan_completed 标记完成。
-            saved_checkpoint = save_checkpoint(
-                str(uid),
-                head_dynamic_id=newest_id or old_head or None,
-                head_published_at=newest_ts
-                if newest_ts is not None
-                else getattr(checkpoint, "head_published_at", None),
-                full_scan_completed=bool(
-                    getattr(checkpoint, "full_scan_completed", False) or not old_head
-                ),
-                # 秒级时间无法区分“同步开始”和同秒 confirmed 的先后；把覆盖水位
-                # 保守地停在开始前 1 秒，最多多补同步一次，不能永久漏同步。
-                last_synced_at=max(1, sync_started_at - 1),
-            )
+        if budget_exhausted:
+            _log_budget_paused(budget_scope, f"sync uid={uid}")
 
     guard_reconciliation = {"checked": 0, "resolved": 0, "remaining": 0}
     if completed:
@@ -367,6 +409,7 @@ def sync_repost_history(
         "scanned_items": scanned_items,
         "found_reposts": found_reposts,
         "imported_count": imported_count,
+        "sync_complete": completed,
         "full_scan_completed": bool(
             getattr(saved_checkpoint, "full_scan_completed", completed)
         ),
@@ -375,6 +418,7 @@ def sync_repost_history(
         "sync_needed_cleared": dirty_cleared,
         "guard_reconciliation": guard_reconciliation,
         "checkpoint": checkpoint_payload,
+        **budget_fields,
     }
 
 
@@ -389,6 +433,8 @@ def _fetch_dynamic_item_strict(
             referer=opus_link(dynamic_id),
             retries=0,
         )
+    except RequestBudgetExhausted:
+        raise
     except (httpx.HTTPError, RuntimeError) as exc:
         # 明确平台风控原样保留（不得转成 notice_unreadable/manual_review）。
         risk = _risk_code_from_message(exc)
@@ -430,6 +476,8 @@ def _fetch_notice_strict(
             referer=opus_link(original_dynamic_id),
             retries=0,
         )
+    except RequestBudgetExhausted:
+        raise
     except (httpx.HTTPError, RuntimeError) as exc:
         # 明确平台风控必须原样保留（不得转成普通 notice_unreadable/manual_review）。
         risk = _risk_code_from_message(exc)
@@ -514,6 +562,102 @@ def _record_global_platform_risk(stage: str, exc: object) -> None:
         import logging
 
         logging.getLogger("repost_cleanup").exception("记录全局平台风控冷却失败 code=%s", code)
+
+
+def _format_budget_resume(expires_at: int) -> str:
+    from datetime import datetime
+
+    try:
+        return datetime.fromtimestamp(int(expires_at)).strftime("%H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "--:--"
+
+
+def _log_budget_paused(scope: object, stage: str) -> None:
+    """同一个任务预算耗尽只记录一次主 warning（不逐 candidate 刷屏）。"""
+    import logging
+
+    snapshot = scope.snapshot()  # type: ignore[attr-defined]
+    logging.getLogger("repost_cleanup").warning(
+        "本轮 Bilibili 安全请求预算已用完：已使用 %s / %s 次（%s）；"
+        "已安全暂停连续评估，剩余记录将在下一预算窗口自动继续；预计可继续时间：%s",
+        snapshot.used_requests,
+        snapshot.budget_limit,
+        stage,
+        _format_budget_resume(snapshot.window_expires_at),
+    )
+
+
+def _log_budget_cooling(scope: object, stage: str) -> None:
+    import logging
+
+    snapshot = scope.snapshot()  # type: ignore[attr-defined]
+    minutes = max(1, (snapshot.remaining_seconds + 59) // 60)
+    logging.getLogger("repost_cleanup").info(
+        "Bilibili 请求安全窗口仍在冷却，本轮不发送新的评估请求（%s）；剩余约 %s 分钟",
+        stage,
+        minutes,
+    )
+
+
+def _log_budget_recovered(scope: object, stage: str) -> None:
+    import logging
+
+    if bool(getattr(scope, "rolled", False)):
+        logging.getLogger("repost_cleanup").info(
+            "Bilibili 请求安全预算已恢复，继续处理未完成评估（%s）", stage
+        )
+
+
+def _budget_paused_message(snapshot: object) -> str:
+    return (
+        f"本轮 Bilibili 安全请求预算已用完：已使用 "
+        f"{getattr(snapshot, 'used_requests', 0)} / {getattr(snapshot, 'budget_limit', 0)} 次；"
+        "已安全暂停连续评估，剩余记录将在下一预算窗口自动继续；"
+        f"预计可继续时间：{_format_budget_resume(getattr(snapshot, 'window_expires_at', 0))}"
+    )
+
+
+def _budget_cooling_message(snapshot: object) -> str:
+    remaining = int(getattr(snapshot, "remaining_seconds", 0) or 0)
+    minutes = max(1, (remaining + 59) // 60)
+    return (
+        f"Bilibili 请求安全窗口仍在冷却，本轮不发送新的评估请求；剩余约 {minutes} 分钟"
+    )
+
+
+_BUDGET_RESULT_KEYS = (
+    "budget_exhausted",
+    "partial",
+    "budget_limit",
+    "used_requests",
+    "remaining_requests",
+    "window_started_at",
+    "window_expires_at",
+    "resume_after",
+    "remaining_seconds",
+    "request_attempts",
+    "request_categories",
+    "cache_hits",
+)
+
+
+def _copy_budget_fields(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: source[key] for key in _BUDGET_RESULT_KEYS if key in source}
+
+
+def _budget_result_fields(scope: object | None, *, exhausted: bool) -> dict[str, Any]:
+    if scope is not None:
+        return scope.result_fields(exhausted=exhausted, partial=exhausted)  # type: ignore[attr-defined]
+    snap = get_bilibili_request_budget()
+    return {
+        "budget_exhausted": False,
+        "partial": False,
+        **snap.to_dict(),
+        "request_attempts": 0,
+        "request_categories": {},
+        "cache_hits": 0,
+    }
 
 
 class _AssessmentBreaker:
@@ -749,6 +893,9 @@ def _assess_via_public_classifier(
     """activities 无可靠记录时复用公共分类能力；命中风控立即熔断。"""
     try:
         outcome, risk_code = classify_for_cleanup(client, original_id)
+    except RequestBudgetExhausted:
+        # V22 本地预算保护：不得保存成 classify_failed / 业务 final。
+        raise
     except Exception as exc:
         risk = _risk_code_from_message(exc)
         if risk is not None:
@@ -950,6 +1097,8 @@ def scan_expired_reposts(
     _check_cancel(cancel_check)
     forced = _normalize_force_originals(force_original_ids)
     breaker = _AssessmentBreaker()
+    budget_exhausted = False
+    local_cache_hits = 0
 
     def _semantic(record: object) -> tuple | None:
         if record is None:
@@ -983,8 +1132,47 @@ def scan_expired_reposts(
             raise RuntimeError("运行期间数据库路径发生变化，已停止")
         # UID 已在本 Job 开始由 _require_verified_login 冻结；Profile/DB 不变即身份不变。
 
-    with client_factory() as client:
-        _, uid_int = _require_verified_login(client)
+    with bilibili_request_budget_scope() as budget_scope, client_factory() as client:
+        try:
+            _, uid_int = _require_verified_login(client)
+        except RequestBudgetExhausted as exc:
+            # 窗口未恢复：本轮 0 远程请求，返回结构化 paused 结果（不是风控/崩溃）。
+            _log_budget_cooling(budget_scope, "scan verify")
+            _, local_uid_int = require_login()
+            early_uid = str(local_uid_int)
+            early_reposts = list_evaluable_reposts(early_uid)
+            early_existing = list_repost_assessments(early_uid)
+            early_pending = {
+                record.original_dynamic_id
+                for record in early_reposts
+                if record.original_dynamic_id not in early_existing
+                or getattr(
+                    early_existing[record.original_dynamic_id],
+                    "assessment_status",
+                    "final",
+                )
+                == "retryable_unknown"
+            }
+            return {
+                "uid": early_uid,
+                "history_total": len(early_reposts),
+                "evaluated_originals": 0,
+                "pending_originals": len(early_pending),
+                "budget": ASSESSMENT_BUDGET_PER_ROUND,
+                "job_budget": MAX_ASSESSMENTS_PER_JOB,
+                "batch_size": ASSESSMENT_BATCH_SIZE,
+                "frozen_scope": len(early_pending),
+                "batches_done": 0,
+                "attempted_this_job": 0,
+                "made_progress": 0,
+                "rate_limited": False,
+                "risk_code": None,
+                "stopped_early": True,
+                "stop_reason": "REQUEST_BUDGET_EXHAUSTED",
+                "message": _budget_cooling_message(exc.snapshot),
+                "candidates": load_persisted_candidates(early_uid),
+                **budget_scope.result_fields(exhausted=True, partial=True),
+            }
         uid = str(uid_int)
         frozen_profile = get_runtime_profile_id()
         frozen_db = str(db_path())
@@ -1021,6 +1209,10 @@ def scan_expired_reposts(
                 )
                 set_repost_identity(uid, repost_id, ok=True, source="remote_detail", checked_at=current)
                 breaker.note_success()
+            except RequestBudgetExhausted:
+                # V22：预算耗尽不得把身份写成失败；安全停止，剩余下窗口继续。
+                budget_exhausted = True
+                break
             except (RemoteStateUnknown, RuntimeError, ValueError) as exc:
                 set_repost_identity(
                     uid, repost_id, ok=False, source="remote_detail",
@@ -1058,7 +1250,7 @@ def scan_expired_reposts(
 
         for batch_no in range(max_batches):
             _check_cancel(cancel_check)
-            if breaker.stopped:
+            if breaker.stopped or budget_exhausted:
                 break
             if stale_check is not None and stale_check() is True:
                 raise RuntimeError("任务已过期（调度换代），已停止")
@@ -1099,6 +1291,7 @@ def scan_expired_reposts(
                 # 关键：任何网络/LLM/_assess_original 之前登记，防止同 Job 重复评估。
                 attempted_this_job.add(original_id)
                 before = _semantic(existing.get(original_id))
+                attempts_before = budget_scope.total_attempts
                 try:
                     assessment = _assess_original(
                         client,
@@ -1107,6 +1300,12 @@ def scan_expired_reposts(
                         now_ts=current,
                         activities_map=activities_map,
                     )
+                except RequestBudgetExhausted:
+                    # V22：单条处理一半（如 detail 已成功、notice 前耗尽）→ 不写 final，
+                    # 保持 pending，下一窗口继续；已完成的其它记录照常保存。
+                    budget_exhausted = True
+                    stop_reason = "REQUEST_BUDGET_EXHAUSTED"
+                    break
                 except AssessmentRateLimited as exc:
                     breaker.rate_limited = True
                     breaker.stopped = True
@@ -1133,6 +1332,10 @@ def scan_expired_reposts(
                     )
                     break
                 _persist_assessment(uid, original_id, assessment)
+                if budget_scope.total_attempts == attempts_before:
+                    # 本地 activities 复用/无远程请求：单独计数 cache hit（0 budget）。
+                    local_cache_hits += 1
+                    budget_scope.note_cache_hit()
                 processed_batch += 1
                 processed_total += 1
                 evaluated += 1
@@ -1152,6 +1355,9 @@ def scan_expired_reposts(
             batches_done += 1
             if breaker.stopped:
                 break
+            if budget_exhausted:
+                stop_reason = "REQUEST_BUDGET_EXHAUSTED"
+                break
             if processed_batch == 0:
                 stop_reason = "NO_PROCESSED_PROGRESS"
                 break
@@ -1167,7 +1373,11 @@ def scan_expired_reposts(
         if original_id not in refreshed
         or _record_dict(refreshed[original_id]).get("assessment_status") == "retryable_unknown"
     )
-    if breaker.stop_message:
+    if budget_exhausted:
+        _log_budget_paused(budget_scope, "scan")
+        _log_budget_recovered(budget_scope, "scan")
+        message = _budget_paused_message(budget_scope.snapshot())
+    elif breaker.stop_message:
         message = breaker.stop_message
     elif stop_reason == "NO_PROCESSED_PROGRESS":
         message = "本轮无可处理记录，已停止。"
@@ -1194,10 +1404,14 @@ def scan_expired_reposts(
         "made_progress": made_progress_total,
         "rate_limited": breaker.rate_limited,
         "risk_code": breaker.risk_code,
-        "stopped_early": breaker.stopped,
+        "stopped_early": bool(breaker.stopped or budget_exhausted),
         "stop_reason": stop_reason,
         "message": message,
         "candidates": load_persisted_candidates(uid),
+        **budget_scope.result_fields(
+            exhausted=budget_exhausted,
+            partial=budget_exhausted,
+        ),
     }
 
 
@@ -1390,6 +1604,24 @@ def auto_maintain(
                 "candidates": load_persisted_candidates(uid),
             }
         synced = True
+        if sync_result.get("budget_exhausted"):
+            # V22：同步阶段已耗尽预算 → 0 assessment，结构化 paused 返回。
+            return {
+                "uid": uid,
+                "synced": False,
+                "evaluated_originals": 0,
+                "sync_needed": bool(getattr(get_checkpoint(uid), "sync_needed", False)),
+                "rate_limited": False,
+                "risk_code": None,
+                "stopped_early": True,
+                "stop_reason": "REQUEST_BUDGET_EXHAUSTED",
+                "message": str(
+                    sync_result.get("message") or "本轮 Bilibili 安全请求预算已用完"
+                ),
+                "guard_reconciliation": guard_reconciliation,
+                "candidates": load_persisted_candidates(uid),
+                **_copy_budget_fields(sync_result),
+            }
         assessments = list_repost_assessments(uid)
         reposts = list_evaluable_reposts(uid)
         pending = {
@@ -1407,11 +1639,17 @@ def auto_maintain(
     }
     evaluated = 0
     ordered = sorted(pending)
+    budget_exhausted = False
+    budget_scope: object | None = None
     if ordered and assess:
         # 评估阶段使用全新的 client。首次 NAV 也纳入明确风控持久化暂停。
-        with client_factory() as client:
+        with bilibili_request_budget_scope() as budget_scope, client_factory() as client:
             try:
                 _require_verified_login(client)
+            except RequestBudgetExhausted:
+                # V22：窗口未恢复 → 0 远程请求，结构化 paused 返回。
+                budget_exhausted = True
+                _log_budget_cooling(budget_scope, "auto_maintain verify")
             except RuntimeError as exc:
                 risk = _risk_code_from_message(exc)
                 if risk is None:
@@ -1427,7 +1665,11 @@ def auto_maintain(
                 breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
 
             for original_id in ordered:
-                if evaluated >= AUTO_ASSESSMENT_BUDGET or breaker.stopped:
+                if (
+                    evaluated >= AUTO_ASSESSMENT_BUDGET
+                    or breaker.stopped
+                    or budget_exhausted
+                ):
                     break
                 _check_cancel(cancel_check)
                 if (
@@ -1445,6 +1687,10 @@ def auto_maintain(
                         now_ts=current,
                         activities_map=activities_map,
                     )
+                except RequestBudgetExhausted:
+                    # V22：单条处理一半 → 不写 final，保持 pending，下一窗口继续。
+                    budget_exhausted = True
+                    break
                 except AssessmentRateLimited as exc:
                     breaker.rate_limited = True
                     breaker.stopped = True
@@ -1496,7 +1742,14 @@ def auto_maintain(
             == "retryable_unknown"
         }
     )
-    if breaker.stop_message:
+    if budget_exhausted:
+        if budget_scope is not None:
+            _log_budget_paused(budget_scope, "auto_maintain")
+            _log_budget_recovered(budget_scope, "auto_maintain")
+            message = _budget_paused_message(budget_scope.snapshot())  # type: ignore[attr-defined]
+        else:
+            message = "Bilibili 请求安全窗口仍在冷却，本轮不发送新的评估请求"
+    elif breaker.stop_message:
         message = breaker.stop_message
     elif remaining:
         message = f"自动维护完成：增量同步 {'成功' if synced else '无需'}，本轮评估 {evaluated} 条，仍有 {remaining} 条待评估。"
@@ -1514,9 +1767,12 @@ def auto_maintain(
         "sync_needed": bool(getattr(get_checkpoint(uid), "sync_needed", False)),
         "rate_limited": breaker.rate_limited,
         "risk_code": breaker.risk_code,
+        "stopped_early": bool(breaker.stopped or budget_exhausted),
+        "stop_reason": "REQUEST_BUDGET_EXHAUSTED" if budget_exhausted else "",
         "message": message,
         "guard_reconciliation": guard_reconciliation,
         "candidates": load_persisted_candidates(uid),
+        **_budget_result_fields(budget_scope, exhausted=budget_exhausted),
     }
 
 
@@ -2763,8 +3019,15 @@ def cleanup_maintenance_cycle(
             or stage1.get("synced") is not True
         )
         if stage1_blocked:
-            reason = "pre_maintenance_blocked"
-            skip_message = "前置维护未安全完成（风控/失败），本轮 0 assessment、0 DELETE。"
+            if stage1.get("budget_exhausted"):
+                reason = "request_budget_exhausted"
+                skip_message = (
+                    "Bilibili 请求预算已用完，本轮 0 assessment、0 DELETE；"
+                    "剩余记录将在下一预算窗口自动继续。"
+                )
+            else:
+                reason = "pre_maintenance_blocked"
+                skip_message = "前置维护未安全完成（风控/失败），本轮 0 assessment、0 DELETE。"
             stage2 = {"skipped": True, "reason": reason, "message": skip_message}
             stage3 = {"skipped": True, "reason": reason, "message": "前置维护未安全完成，自动删除未执行：0 DELETE。"}
             phases.append({"stage": "连续智能评估", "result": stage2})

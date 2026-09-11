@@ -1502,7 +1502,13 @@ def _run_action_impl(
         _raise_if_cancelled(cancel_event)
         imported = int(result.get("imported_count") or result.get("imported") or 0)
         discovered = int(result.get("found_reposts") or result.get("discovered") or 0)
-        message = f"转发历史同步完成：发现 {discovered} 条，本次新增 {imported} 条"
+        if result.get("budget_exhausted"):
+            message = str(
+                result.get("message")
+                or "Bilibili 请求预算已用完，同步已安全暂停，剩余将在下一预算窗口继续"
+            )
+        else:
+            message = f"转发历史同步完成：发现 {discovered} 条，本次新增 {imported} 条"
         reconciliation = result.get("guard_reconciliation")
         resolved = (
             int(reconciliation.get("resolved") or 0)
@@ -1528,6 +1534,28 @@ def _run_action_impl(
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
         )
         _raise_if_cancelled(cancel_event)
+        if synced.get("budget_exhausted"):
+            # V22：同步已耗尽预算 → 0 assessment 请求，返回结构化 paused 结果。
+            message = str(
+                synced.get("message")
+                or "Bilibili 请求预算已用完，本轮同步/评估已安全暂停"
+            )
+            progress(step=2, total=2, message=message, log_append=message)
+            return {
+                "ok": True,
+                "message": message,
+                "result": {
+                    "sync": synced,
+                    "assessment": {
+                        "skipped": True,
+                        "reason": "request_budget_exhausted",
+                        "message": message,
+                        "budget_exhausted": True,
+                        "partial": True,
+                    },
+                },
+                "log": sanitize_log(f"同步转发历史完成\n{message}"),
+            }
         progress(step=1, total=2, message="同步完成，正在连续智能评估…", log_append="同步转发历史完成；智能评估开始")
         assessed = scan_expired_reposts(
             on_progress=_cleanup_progress_adapter(progress, cancel_event),
