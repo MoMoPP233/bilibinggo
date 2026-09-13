@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from web.auto_config import ALLOWED_CLICK_ACTIONS
-from web.auto_scheduler import AutoScheduler, CollisionError, _is_hard_failure, _next_slot, _probe_job, next_auto_task
+from web.auto_scheduler import AutoScheduler, CollisionError, _next_slot, _probe_job, next_auto_task
 from web.job_runner import JobRunner, JobStatus
 
 
@@ -202,10 +202,11 @@ def test_probe_only_reads_runner_status() -> None:
 
 
 def test_soft_failure_for_empty_triple() -> None:
-    assert _is_hard_failure(RuntimeError("当前列表没有可参与的未参加活动")) is False
-    assert _is_hard_failure(RuntimeError("当前没有可参与的未参加活动，已跳过")) is False
-    assert _is_hard_failure(CollisionError("撞车")) is True
-    assert _is_hard_failure(RuntimeError("请先扫码登录")) is True
+    from web.auto_scheduler import _is_triple_empty_skip
+
+    assert _is_triple_empty_skip("当前列表没有可参与的未参加活动") is True
+    assert _is_triple_empty_skip("当前没有可参与的未参加活动，已跳过") is True
+    assert _is_triple_empty_skip("网络请求失败: ConnectError") is False
 
 
 def test_click_and_wait_treats_skipped_triple_as_success() -> None:

@@ -682,8 +682,11 @@ class _AssessmentBreaker:
             self.rate_limited = True
             self.risk_code = risk
             self.stopped = True
+            # V24：保留结构化信封，保证任何调用方/上层 helper 都能重新识别正式风控，
+            # 不会因为只有整数码而把 -352/-509/429 降级成普通文本错误。
             self.stop_message = (
-                f"本轮操作因平台限流/风控提前停止（{risk}），已经完成的结果已保存。"
+                f"API error {risk}: 本轮操作因平台限流/风控提前停止（{risk}），"
+                "已经完成的结果已保存。"
             )
             raise AssessmentRateLimited(self.stop_message)
         self.consecutive_failures += 1

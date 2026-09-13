@@ -1617,6 +1617,16 @@ def _run_action_impl(
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
         )
         _raise_if_cancelled(cancel_event)
+        # V24：任一阶段即使以结构化 result 返回正式风控（如身份校验路径），
+        # 也必须走统一风险上抛，不能降级成 ok=True/普通 success。
+        phases = result.get("phases") if isinstance(result, dict) else None
+        if isinstance(phases, list):
+            for phase in phases:
+                if not isinstance(phase, dict):
+                    continue
+                stage_result = phase.get("result")
+                if isinstance(stage_result, dict):
+                    _raise_assessment_platform_risk(stage_result)
         message = str(result.get("message") or "清理维护周期完成")
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from src.app_logging import get_logger
+from src.platform_risk import risk_code_of
 from src.restart_control import restart_control
 from web.auto_config import (
     ACTION_LABELS,
@@ -173,6 +174,21 @@ def _stale_or_slot_guard(scheduler: "AutoScheduler", task: str, slot: str) -> bo
 
 class CollisionError(RuntimeError):
     """抽奖端已有任务在跑，自动调度必须立即停机。"""
+
+
+@dataclass(frozen=True)
+class RemoteGateDecision:
+    """自动远程任务门禁的结构化结果（V24）。
+
+    kind: ok / cooldown / invalid_state / gap
+    普通业务任务异常永远不进入 fatal；只有门禁跳过的结构化原因用于状态与日志。
+    """
+
+    allowed: bool
+    kind: str
+    message: str
+    remaining_minutes: int = 0
+    resume_at: int | None = None
 
 
 @dataclass
@@ -434,7 +450,13 @@ class AutoScheduler:
             if status == "running":
                 entry["last_started_at"] = now
                 entry["last_finished_at"] = None
-            elif status in {"completed", "skipped_busy", "risk_paused", "error"}:
+            elif status in {
+                "completed",
+                "skipped_busy",
+                "risk_paused",
+                "error",
+                "skipped_by_platform_cooldown",
+            }:
                 entry["last_finished_at"] = now
             if result:
                 from web.user_messages import sanitize_log
@@ -472,7 +494,9 @@ class AutoScheduler:
             self._log("warn", f"调度器已换代，忽略旧代风控信号：{stage_label}")
             return
         state = record_auto_remote_risk(
-            trigger_stage=stage_label, reason=str(message or "")
+            trigger_stage=stage_label,
+            reason=str(message or "") or type(message).__name__,
+            code=str(risk_code_of(message) or ""),
         )
         until = state.get("paused_until")
         until_text = (
@@ -481,47 +505,53 @@ class AutoScheduler:
             else "稍后"
         )
         minutes = AUTO_REMOTE_RISK_COOLDOWN_SECONDS // 60
+        code = str(state.get("code") or "").strip()
+        code_text = f"：{code}" if code else ""
         self._log(
             "error",
-            f"检测到平台风控，自动远程任务进入 {minutes} 小时冷却（至 {until_text}）：{message}",
+            f"检测到 Bilibili 平台风控{code_text}；当前远程任务已停止，Scheduler 继续运行；"
+            f"进入 {minutes} 分钟冷却，预计 {until_text} 恢复：{message}",
         )
         self._set_phase(
             "等待下一刻度",
-            f"自动远程任务已因平台风控进入 {minutes} 小时冷却，冷却结束后等下一次正常调度。",
+            f"自动远程任务因平台风控进入 {minutes} 分钟冷却（预计 {until_text} 恢复），"
+            "冷却结束后等下一次正常调度。",
         )
 
-    def _remote_stage_allowed(self) -> bool:
-        """返回当前是否允许启动下一个自动远程大任务（0 远程只读判断）。
+    def _remote_gate(self) -> RemoteGateDecision:
+        """自动远程任务门禁（0 远程只读判断，结构化原因）。
 
-        仅禁止新的自动远程任务：
-        - 风控冷却期内（含状态文件损坏/不可读的 Fail-Closed）；
-        - 或距上一自动远程大任务结束未达最小错峰间隔。
+        仅禁止新的自动远程任务：风控冷却（含状态文件损坏的 Fail-Closed）或最小错峰间隔。
         冷却到期后本地清除，只恢复“等待下一次正常调度”的资格，绝不主动探测或补跑。
-        状态文件损坏不会自动清空/重写；修复后或新一次真实风控写入后才恢复。
         """
         view = risk_pause_state()
         if view.get("paused"):
             status = str(view.get("state_status") or "ok")
             if status in ("invalid", "unreadable"):
-                self._log(
-                    "warn",
-                    "自动远程风控状态文件损坏/不可读，fail-closed：本轮跳过且不联网，"
+                return RemoteGateDecision(
+                    False,
+                    "invalid_state",
+                    "自动远程风控状态文件损坏/不可读，fail-closed：本轮远程任务跳过且不联网，"
                     "请检查 auto_remote_state.json。",
                 )
-                return False
             reason = view.get("reason") or view.get("code") or "平台风控"
             until = view.get("paused_until")
+            resume_at = int(until) if until else None
+            remaining = max(0, (resume_at or 0) - int(time.time())) if resume_at else 0
+            minutes = (remaining + 59) // 60
             until_text = (
-                datetime.fromtimestamp(int(until), CN_TZ).strftime("%H:%M")
-                if until
-                else ""
+                datetime.fromtimestamp(resume_at, CN_TZ).strftime("%H:%M")
+                if resume_at
+                else "稍后"
             )
-            self._log(
-                "warn",
-                f"自动远程任务风控冷却中（{view.get('trigger_stage') or '未知'}）："
-                f"{reason}，至 {until_text}。本轮跳过且不联网。",
+            return RemoteGateDecision(
+                False,
+                "cooldown",
+                f"平台风控冷却中（{reason}）：本轮远程任务跳过；"
+                f"剩余约 {minutes} 分钟，预计 {until_text} 恢复。",
+                remaining_minutes=minutes,
+                resume_at=resume_at,
             )
-            return False
         clear_expired_risk_pause()
         now_mono = time.monotonic()
         if (
@@ -529,12 +559,46 @@ class AutoScheduler:
             and now_mono - self._last_remote_stage_finished_mono
             < MIN_REMOTE_STAGE_GAP_SECONDS
         ):
-            self._log(
-                "info",
-                "上一个自动远程大任务刚结束，尚未达到最小错峰间隔，本轮跳过。",
+            return RemoteGateDecision(
+                False,
+                "gap",
+                "上一个自动远程大任务刚结束，尚未达到最小错峰间隔，本轮远程任务跳过。",
             )
-            return False
-        return True
+        return RemoteGateDecision(True, "ok", "")
+
+    def _remote_stage_allowed(self) -> bool:
+        """兼容入口：是否允许启动下一个自动远程大任务（0 远程只读判断）。"""
+        return self._remote_gate().allowed
+
+    def _log_remote_gate_skip(self, task: str, gate: RemoteGateDecision) -> None:
+        """同一 slot 只记录一次主要跳过日志。"""
+        if gate.kind in ("cooldown", "invalid_state"):
+            self._log("warn", f"{gate.message}（{task}）")
+        elif gate.kind == "gap":
+            self._log("info", gate.message)
+
+    def _skip_remote_slot(
+        self,
+        task: str,
+        gate: RemoteGateDecision,
+        *,
+        done: set[str],
+        key: str,
+        phase_message: str | None = None,
+    ) -> None:
+        """cooldown/gap 时消费 slot 并写入结构化任务状态；Scheduler 保持运行。"""
+        self._log_remote_gate_skip(task, gate)
+        done.add(key)
+        status = (
+            "skipped_by_platform_cooldown"
+            if gate.kind in ("cooldown", "invalid_state")
+            else "skipped_busy"
+        )
+        self._set_task_status(task, status, gate.message)
+        if phase_message:
+            self._set_phase("等待下一刻度", phase_message)
+        else:
+            self._set_phase("等待下一刻度", gate.message)
 
     def _mark_remote_stage_finished(self) -> None:
         self._last_remote_stage_finished_mono = time.monotonic()
@@ -701,33 +765,41 @@ class AutoScheduler:
                     self._set_phase("等待下一刻度", "调度器运行中")
                 stop_event.wait(1.0)
         except CollisionError as exc:
-            self._fatal(f"任务撞车：{exc}")
+            # 兜底：业务 wrapper 已各自处理撞车；loop 级撞车说明调度器不变量被破坏。
+            self._fatal(f"调度器内部任务撞车：{exc}")
         except Exception as exc:
-            logger.exception("定时调度未预期错误")
-            self._fatal(f"未预期错误：{friendly_error(exc)}")
+            logger.exception("调度器内部未预期错误")
+            self._fatal(f"调度器内部不可恢复错误：{friendly_error(exc)}")
 
     def _run_refresh_batch(self, key: str) -> None:
         if not _stale_or_slot_guard(self, "refresh", key):
             self._done_refresh.add(key)
             return
-        if not self._remote_stage_allowed():
-            # 全局暂停或 60s 错峰期内：本轮整批跳过，不致命、不补跑。
-            self._done_refresh.add(key)
-            return
+        # V24：远程门禁只拦截需要 Bilibili 的动作；本地 refresh_status 始终运行。
+        gate = self._remote_gate()
         self._set_phase("刷新批次", f"开始刷新批次 {key}")
         self._set_task_status("refresh", "running", "刷新批次开始")
         self._log("info", f"刷新批次开始 {key}：一键更新 → 监控动态 → 刷新状态")
         self._set_pipeline(active=True, step_index=0, waiting=False)
+        remote_actions = {"refresh_all", "refresh_watch"}
         actions = ("refresh_all", "refresh_watch", "refresh_status")
+        remote_attempted = False
+        remote_skipped = False
+        failures: list[str] = []
         try:
             for index, action in enumerate(actions):
                 # 停止/换代后：不再安排后续任何自动任务。
                 if self._is_stale():
                     self._set_pipeline(active=False)
                     return
+                if action in remote_actions and not gate.allowed:
+                    remote_skipped = True
+                    continue
                 self._set_pipeline(active=True, step_index=index, waiting=False)
                 try:
                     self._click_and_wait(action, pipeline_index=index)
+                    if action in remote_actions:
+                        remote_attempted = True
                 except CollisionError:
                     # 已有 Job 在运行：本轮直接跳过，不 fatal、不补跑。
                     self._log(
@@ -741,50 +813,61 @@ class AutoScheduler:
                 except Exception as exc:
                     if matches_platform_risk(exc):
                         self._pause_all_auto_remote(
-                            f"refresh:{action}", str(exc) or type(exc).__name__
+                            f"refresh:{action}", exc
                         )
                         self._done_refresh.add(key)
                         self._set_pipeline(active=False)
                         self._set_task_status("refresh", "risk_paused", str(exc))
                         return
-                    if _is_hard_failure(exc):
-                        raise
-                    self._log("warn", f"「{ACTION_LABELS.get(action, action)}」业务结束：{exc}，继续下一项")
+                    # V24：普通业务失败（网络/LLM/登录/timeout/预算）只结束当前动作，
+                    # 绝不 fatal；Scheduler 继续运行，本地动作继续执行。
+                    if action in remote_actions:
+                        remote_attempted = True
+                    label = ACTION_LABELS.get(action, action)
+                    failures.append(f"{label}：{exc}")
+                    self._log(
+                        "error",
+                        f"「{label}」当前任务失败：{exc}；"
+                        "Scheduler 继续运行，将在下一正常调度时重试。",
+                    )
             self._done_refresh.add(key)
-            with self._lock:
-                self._status.refresh_batch_key = key
-            self._mark_remote_stage_finished()
-            self._log("info", f"刷新批次完成 {key}")
-            self._set_task_status("refresh", "completed", "刷新批次完成")
-            self._set_pipeline(active=False)
-            self._set_phase("等待下一刻度", "刷新批次已完成")
-        except CollisionError:
-            # 兜底：任何时刻发现撞车都以“跳过本轮”处理，不致命。
-            self._log("warn", f"刷新批次检测到任务撞车，本轮已跳过：{key}")
-            self._done_refresh.add(key)
-            self._set_pipeline(active=False)
-            self._set_task_status("refresh", "skipped_busy", "本轮跳过（任务占用）")
-        except Exception as exc:
-            if matches_platform_risk(exc):
-                self._pause_all_auto_remote("refresh_batch", str(exc) or type(exc).__name__)
-                self._set_task_status("refresh", "risk_paused", str(exc))
-            elif _is_hard_failure(exc):
-                self._set_task_status("refresh", "error", str(exc))
-                self._fatal(str(exc))
-                return
+            if remote_attempted:
+                self._mark_remote_stage_finished()
+            if failures:
+                message = "；".join(failures)[:300]
+                self._set_task_status("refresh", "error", message)
+                self._set_phase("等待下一刻度", f"刷新批次结束（当前任务失败）：{message}")
+                self._log("warn", f"刷新批次结束（当前任务失败）{key}：{message}")
+            elif remote_skipped:
+                # 远程动作被门禁拦截：记录一次结构化跳过；本地 refresh_status 已运行。
+                self._log("warn", f"{gate.message}（refresh；本地状态已刷新）")
+                self._set_task_status(
+                    "refresh",
+                    "skipped_by_platform_cooldown"
+                    if gate.kind in ("cooldown", "invalid_state")
+                    else "skipped_busy",
+                    f"远程任务跳过，本地状态已刷新；{gate.message}",
+                )
+                self._set_phase(
+                    "等待下一刻度",
+                    f"刷新批次：远程任务跳过，本地状态已刷新（{gate.message}）",
+                )
             else:
-                self._log("error", f"刷新批次中断 {key}：{exc}")
-                self._set_task_status("refresh", "error", str(exc))
-            self._done_refresh.add(key)
+                with self._lock:
+                    self._status.refresh_batch_key = key
+                self._log("info", f"刷新批次完成 {key}")
+                self._set_task_status("refresh", "completed", "刷新批次完成")
+                self._set_phase("等待下一刻度", "刷新批次已完成")
+        finally:
             self._set_pipeline(active=False)
-            self._set_phase("等待下一刻度", f"刷新批次异常已跳过：{exc}")
 
     def _run_following_scan(self, key: str) -> None:
         if not _stale_or_slot_guard(self, "following", key):
             self._done_following.add(key)
             return
-        if not self._remote_stage_allowed():
-            self._done_following.add(key)
+        gate = self._remote_gate()
+        if not gate.allowed:
+            self._skip_remote_slot("following", gate, done=self._done_following, key=key)
             return
         self._set_pipeline(active=False)
         self._set_phase("关注动态补漏", f"关注动态补漏 {key}")
@@ -807,14 +890,15 @@ class AutoScheduler:
             self._done_following.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
-                self._pause_all_auto_remote("following_feed_scan", str(exc) or type(exc).__name__)
+                self._pause_all_auto_remote("following_feed_scan", exc)
                 self._set_task_status("following", "risk_paused", str(exc))
-            elif _is_hard_failure(exc):
-                self._set_task_status("following", "error", str(exc))
-                self._fatal(str(exc))
-                return
             else:
-                self._log("warn", f"关注动态补漏跳过：{exc}")
+                # V24：普通业务失败（网络/LLM/登录/timeout/预算）只结束当前 Job。
+                self._log(
+                    "error",
+                    f"关注动态补漏当前任务失败：{exc}；"
+                    "Scheduler 继续运行，将在下一正常调度时重试。",
+                )
                 self._set_task_status("following", "error", str(exc))
             self._done_following.add(key)
             self._set_phase("等待下一刻度", f"关注动态补漏已跳过：{exc}")
@@ -823,8 +907,9 @@ class AutoScheduler:
         if not _stale_or_slot_guard(self, "triple", key):
             self._done_triple.add(key)
             return
-        if not self._remote_stage_allowed():
-            self._done_triple.add(key)
+        gate = self._remote_gate()
+        if not gate.allowed:
+            self._skip_remote_slot("triple", gate, done=self._done_triple, key=key)
             return
         self._set_pipeline(active=False)
         self._set_phase("三连参与", f"触发三连参与 {key}")
@@ -853,14 +938,15 @@ class AutoScheduler:
             self._done_triple.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
-                self._pause_all_auto_remote("participate_triple", str(exc) or type(exc).__name__)
+                self._pause_all_auto_remote("participate_triple", exc)
                 self._set_task_status("participate", "risk_paused", str(exc))
-            elif _is_hard_failure(exc):
-                self._set_task_status("participate", "error", str(exc))
-                self._fatal(str(exc))
-                return
             else:
-                self._log("info", f"三连参与已跳过：{exc}")
+                # V24：普通业务失败只结束当前 Job，Scheduler 继续运行。
+                self._log(
+                    "error",
+                    f"三连参与当前任务失败：{exc}；"
+                    "Scheduler 继续运行，将在下一正常调度时重试。",
+                )
                 self._set_task_status("participate", "error", str(exc))
             self._done_triple.add(key)
             self._set_phase("等待下一刻度", f"已跳过：{exc}")
@@ -869,8 +955,9 @@ class AutoScheduler:
         if not _stale_or_slot_guard(self, "winner_scan", key):
             self._done_winner.add(key)
             return
-        if not self._remote_stage_allowed():
-            self._done_winner.add(key)
+        gate = self._remote_gate()
+        if not gate.allowed:
+            self._skip_remote_slot("winner_scan", gate, done=self._done_winner, key=key)
             return
         self._set_pipeline(active=False)
         self._set_phase("中奖深检", f"中奖深检刻度 {key}")
@@ -894,14 +981,15 @@ class AutoScheduler:
             self._done_winner.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
-                self._pause_all_auto_remote("winner_deep_scan", str(exc) or type(exc).__name__)
+                self._pause_all_auto_remote("winner_deep_scan", exc)
                 self._set_task_status("winner", "risk_paused", str(exc))
-            elif _is_hard_failure(exc):
-                self._set_task_status("winner", "error", str(exc))
-                self._fatal(str(exc))
-                return
             else:
-                self._log("warn", f"中奖深检跳过：{exc}")
+                # V24：普通业务失败只结束当前 Job，Scheduler 继续运行。
+                self._log(
+                    "error",
+                    f"中奖深检当前任务失败：{exc}；"
+                    "Scheduler 继续运行，将在下一正常调度时重试。",
+                )
                 self._set_task_status("winner", "error", str(exc))
             self._done_winner.add(key)
             self._set_phase("等待下一刻度", f"中奖深检已跳过：{exc}")
@@ -910,8 +998,9 @@ class AutoScheduler:
         if not _stale_or_slot_guard(self, "cleanup_cycle", key):
             self._done_cleanup.add(key)
             return
-        if not self._remote_stage_allowed():
-            self._done_cleanup.add(key)
+        gate = self._remote_gate()
+        if not gate.allowed:
+            self._skip_remote_slot("cleanup_cycle", gate, done=self._done_cleanup, key=key)
             return
         self._set_pipeline(active=False)
         self._set_phase("自动维护周期", f"自动维护周期刻度 {key}")
@@ -950,14 +1039,15 @@ class AutoScheduler:
             self._done_cleanup.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
-                self._pause_all_auto_remote("cleanup_maintenance_cycle", str(exc) or type(exc).__name__)
+                self._pause_all_auto_remote("cleanup_maintenance_cycle", exc)
                 self._set_task_status("cleanup", "risk_paused", str(exc))
-            elif _is_hard_failure(exc):
-                self._set_task_status("cleanup", "error", str(exc))
-                self._fatal(str(exc))
-                return
             else:
-                self._log("warn", f"自动维护周期跳过：{exc}")
+                # V24：普通业务失败只结束当前 Job，Scheduler 继续运行。
+                self._log(
+                    "error",
+                    f"自动维护周期当前任务失败：{exc}；"
+                    "Scheduler 继续运行，将在下一正常调度时重试。",
+                )
                 self._set_task_status("cleanup", "error", str(exc))
             self._done_cleanup.add(key)
             self._set_phase("等待下一刻度", f"自动维护周期已跳过：{exc}")
@@ -1086,30 +1176,6 @@ def _is_triple_empty_skip(message: str) -> bool:
     text = str(message or "")
     markers = ("没有可参与", "当前列表没有", "无可参与", "已跳过")
     return any(marker in text for marker in markers)
-
-
-def _is_hard_failure(exc: BaseException) -> bool:
-    if isinstance(exc, CollisionError):
-        return True
-    if _is_triple_empty_skip(str(exc)):
-        return False
-    text = str(exc)
-    soft_markers = ("没有可参与", "当前列表没有", "无可参与", "已跳过")
-    if any(m in text for m in soft_markers):
-        return False
-    hard_markers = (
-        "连接",
-        "timeout",
-        "Timeout",
-        "ConnectError",
-        "等待「",
-        "HTTP 5",
-        "扫码登录",
-        "LLM",
-        "Cookie",
-        "401",
-    )
-    return any(m in text for m in hard_markers)
 
 
 def _now_iso() -> str:

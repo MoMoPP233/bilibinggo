@@ -116,7 +116,12 @@ def test_cooldown_blocks_consecutive_ticks_with_zero_remote(state_path: Path) ->
         scheduler._run_triple_slot(f"triple-{i}")
         scheduler._run_cleanup_cycle(f"cleanup-{i}")
         scheduler._run_refresh_batch(f"refresh-{i}")
-    assert calls == []
+    # V24：cooldown 内远程任务 0 请求；本地 refresh_status 仍按批执行。
+    assert calls == ["refresh_status"] * 4
+    assert all(
+        action not in calls
+        for action in ("refresh_all", "refresh_watch", "participate_triple", "cleanup_maintenance_cycle")
+    )
     assert scheduler._status.state != "fatal"
 
 
