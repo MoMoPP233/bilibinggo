@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
-REFRESH_HOURS = frozenset({0, 3, 6, 9, 12, 15, 18, 21})
-TRIPLE_MINUTES = frozenset(range(5, 60, 5))
-# 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（h%6==2 的 :05，
-# 即 02:05/08:05/14:05/20:05，约每 6 小时一次）。切勿用作调度驱动值。
-CLEANUP_MAINTAIN_INTERVAL_HOURS = 6
+# V26 调度频率（单一事实来源）。
+# refresh_all：00:00/06:00/12:00/18:00（4 次/天）。
+REFRESH_HOURS = frozenset({0, 6, 12, 18})
+# 自动参与：仅非 refresh 小时 :15/:30/:45（20 小时 × 3 = 最多 60 slot/天；
+# 每个 slot 最多处理 PARTICIPATE_TRIPLE_LIMIT=3 个活动 → 上限 180 活动/天）。
+TRIPLE_MINUTES = frozenset({15, 30, 45})
+# 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（04:05/16:05，12 小时一次）。
+CLEANUP_MAINTAIN_INTERVAL_HOURS = 12
+# 中奖深检：05:04/11:04/17:04/23:04（4 次/天，保持原有时间）。
+WINNER_SCAN_HOURS = frozenset({5, 11, 17, 23})
+WINNER_SCAN_MINUTE = 4
+# 清理维护：04:05/16:05（2 次/天，12 小时间隔）。
+CLEANUP_HOURS = frozenset({4, 16})
+CLEANUP_MINUTE = 5
 
 ALLOWED_CLICK_ACTIONS = frozenset(
     {

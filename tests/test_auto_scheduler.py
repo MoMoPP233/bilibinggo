@@ -291,10 +291,10 @@ def test_click_and_wait_interrupted_raises(isolated_home: Path) -> None:
 
 
 def test_next_slot_before_refresh() -> None:
-    now = datetime(2026, 7, 17, 2, 56, tzinfo=timezone(timedelta(hours=8)))
+    now = datetime(2026, 7, 17, 5, 56, tzinfo=timezone(timedelta(hours=8)))
     slot = _next_slot(now)
     assert slot["kind"] == "refresh"
-    assert slot["hour"] == 3
+    assert slot["hour"] == 6
     assert slot["action"] == "refresh_all"
     assert slot["action_label"] == "一键更新活动链接"
     assert slot["at_unix"]
@@ -304,7 +304,8 @@ def test_next_slot_participate_minute() -> None:
     now = datetime(2026, 7, 17, 2, 50, tzinfo=timezone(timedelta(hours=8)))
     slot = _next_slot(now)
     assert slot["kind"] == "participate"
-    assert slot["minute"] == 55
+    assert slot["hour"] == 3
+    assert slot["minute"] == 15
     assert slot["action"] == "participate_triple"
     assert slot["action_label"] == "三连参与"
 def _cn(dt):
@@ -324,16 +325,16 @@ def test_next_auto_task_following_at_1258() -> None:
     assert task["minutes"] == 5
 
 
-def test_next_auto_task_cleanup_uses_real_0205_slot() -> None:
-    task = next_auto_task(_cn(datetime(2026, 7, 17, 2, 2)))
+def test_next_auto_task_cleanup_uses_real_0405_slot() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 50)))
     assert task["label"] == "清理维护"
-    assert task["minutes"] == 3
+    assert task["minutes"] == 15
 
 
 def test_next_auto_task_participate_after_refresh_hour() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 10)))
     assert task["label"] == "自动参与"
-    assert task["minutes"] == 55
+    assert task["minutes"] == 5
 
 
 def test_next_auto_task_winner_uses_real_0504_slot() -> None:

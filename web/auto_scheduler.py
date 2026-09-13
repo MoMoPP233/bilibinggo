@@ -25,7 +25,9 @@ from web.auto_config import (
     ACTION_LABELS,
     ALLOWED_CLICK_ACTIONS,
     AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
+    CLEANUP_HOURS,
     CLEANUP_MAINTAIN_INTERVAL_HOURS,
+    CLEANUP_MINUTE,
     FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
     FOLLOWING_FEED_SCAN_HOUR_OFFSET,
     FOLLOWING_FEED_SCAN_MINUTE,
@@ -34,6 +36,8 @@ from web.auto_config import (
     MIN_REMOTE_STAGE_GAP_SECONDS,
     REFRESH_HOURS,
     TRIPLE_MINUTES,
+    WINNER_SCAN_HOURS,
+    WINNER_SCAN_MINUTE,
 )
 from web.auto_remote_state import (
     clear_expired_risk_pause,
@@ -722,15 +726,15 @@ class AutoScheduler:
 
                 # 清理维护调度随 Scheduler 启动；其中自动 DELETE 仍由 per-Profile
                 # auto_delete_enabled 独立授权，默认关闭，维护调度绝不隐式开启它。
-                # M8: 中奖深检约每 6 小时（05:04/11:04/17:04/23:04）
-                if now.minute == 4 and now.hour % 6 == 5:
+                # V26: 中奖深检保持 05:04/11:04/17:04/23:04（4 次/天）。
+                if now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS:
                     key = f"winner-{now:%Y-%m-%d-%H}"
                     if key not in self._done_winner:
                         self._run_winner_scan(key)
                         continue
 
-                # M8: 统一自动维护周期（约每 6 小时：02:05/08:05/14:05/20:05）
-                if now.minute == 5 and now.hour % 6 == 2:
+                # V26: 统一自动维护周期 04:05/16:05（2 次/天，12 小时间隔）。
+                if now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS:
                     key = f"cleanup-{now:%Y-%m-%d-%H}"
                     if key not in self._done_cleanup:
                         self._run_cleanup_cycle(key)
@@ -745,11 +749,15 @@ class AutoScheduler:
                         self._run_following_scan(key)
                         continue
 
-                # 专用分钟排除：following(03)/winner(04)/cleanup(05)同分钟不参与三连
+                # 专用分钟排除：following(:03)/winner(:04)/cleanup(:05) 不参与三连。
                 dedicated_minute = (
-                    (now.minute == 3 and now.hour % 6 == 1)
-                    or (now.minute == 4 and now.hour % 6 == 5)
-                    or (now.minute == 5 and now.hour % 6 == 2)
+                    (
+                        now.minute == FOLLOWING_FEED_SCAN_MINUTE
+                        and now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL
+                        == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+                    )
+                    or (now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS)
+                    or (now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS)
                 )
                 if (
                     now.hour not in REFRESH_HOURS
@@ -1191,9 +1199,9 @@ def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]
         h, m = candidate.hour, candidate.minute
         if h in REFRESH_HOURS and m == 0:
             candidates.append(("refresh", "刷新批次", candidate))
-        if m == 4 and h % 6 == 5:
+        if m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS:
             candidates.append(("winner", "中奖深探", candidate))
-        if m == 5 and h % 6 == 2:
+        if m == CLEANUP_MINUTE and h in CLEANUP_HOURS:
             candidates.append(("cleanup", "清理维护", candidate))
         if (
             m == FOLLOWING_FEED_SCAN_MINUTE
@@ -1201,9 +1209,12 @@ def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]
         ):
             candidates.append(("following", "关注补漏", candidate))
         dedicated = (
-            (m == 3 and h % 6 == 1)
-            or (m == 4 and h % 6 == 5)
-            or (m == 5 and h % 6 == 2)
+            (
+                m == FOLLOWING_FEED_SCAN_MINUTE
+                and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+            )
+            or (m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS)
+            or (m == CLEANUP_MINUTE and h in CLEANUP_HOURS)
         )
         if h not in REFRESH_HOURS and m in TRIPLE_MINUTES and not dedicated:
             candidates.append(("participate", "自动参与", candidate))

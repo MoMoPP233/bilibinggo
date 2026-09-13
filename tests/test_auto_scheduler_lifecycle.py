@@ -120,8 +120,8 @@ def state_path(tmp_path: Path, monkeypatch) -> Path:
 
 @pytest.fixture
 def fast_clock(monkeypatch):
-    """把调度时钟冻结在整点刷新刻度（选非维护/非 following 的整点）。"""
-    refresh_hour = next(h for h in sorted(REFRESH_HOURS) if h % 2 == 1 and h % 6 != 1)
+    """把调度时钟冻结在整点刷新刻度（选非 winner/cleanup/following 的刷新小时）。"""
+    refresh_hour = sorted(REFRESH_HOURS)[1] if len(REFRESH_HOURS) > 1 else next(iter(REFRESH_HOURS))
     today = datetime.now(CN_TZ).replace(
         hour=refresh_hour, minute=0, second=0, microsecond=0
     )

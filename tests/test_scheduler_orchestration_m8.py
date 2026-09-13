@@ -115,20 +115,40 @@ def test_ds9_uses_same_refresh_path() -> None:
 
 
 def _intended_actions(now):
+    from web.auto_config import (
+        CLEANUP_HOURS,
+        CLEANUP_MINUTE,
+        FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
+        FOLLOWING_FEED_SCAN_HOUR_OFFSET,
+        FOLLOWING_FEED_SCAN_MINUTE,
+        REFRESH_HOURS,
+        TRIPLE_MINUTES,
+        WINNER_SCAN_HOURS,
+        WINNER_SCAN_MINUTE,
+    )
+
     actions = []
     h, m = now.hour, now.minute
-    if h in {0, 3, 6, 9, 12, 15, 18, 21} and m == 0:
+    if h in REFRESH_HOURS and m == 0:
         actions.append("refresh_all")
-    if m == 5 and h % 6 == 2:
+    if m == CLEANUP_MINUTE and h in CLEANUP_HOURS:
         actions.append("cleanup_maintenance_cycle")
-    if m == 3 and h % 6 == 1:
+    if (
+        m == FOLLOWING_FEED_SCAN_MINUTE
+        and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+    ):
         actions.append("following_feed_scan")
-    if m == 4 and h % 6 == 5:
+    if m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS:
         actions.append("winner_deep_scan")
     dedicated = (
-        (m == 3 and h % 6 == 1) or (m == 4 and h % 6 == 5) or (m == 5 and h % 6 == 2)
+        (
+            m == FOLLOWING_FEED_SCAN_MINUTE
+            and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+        )
+        or (m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS)
+        or (m == CLEANUP_MINUTE and h in CLEANUP_HOURS)
     )
-    if h not in {0, 3, 6, 9, 12, 15, 18, 21} and m in range(5, 60, 5) and not dedicated:
+    if h not in REFRESH_HOURS and m in TRIPLE_MINUTES and not dedicated:
         actions.append("participate_triple")
     return actions
 
@@ -153,18 +173,29 @@ def _dt(hour, minute):
 
 
 def test_cleanup_minutes_exclude_participation() -> None:
-    for hour in range(24):
-        if hour % 6 == 2:
-            acts = _intended_actions(_dt(hour, 5))
-            assert acts == ["cleanup_maintenance_cycle"], (hour, acts)
+    from web.auto_config import CLEANUP_HOURS, CLEANUP_MINUTE
+
+    for hour in sorted(CLEANUP_HOURS):
+        acts = _intended_actions(_dt(hour, CLEANUP_MINUTE))
+        assert acts == ["cleanup_maintenance_cycle"], (hour, acts)
 
 
 def test_winner_following_minutes_have_single_intent() -> None:
+    from web.auto_config import (
+        FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
+        FOLLOWING_FEED_SCAN_HOUR_OFFSET,
+        FOLLOWING_FEED_SCAN_MINUTE,
+        WINNER_SCAN_HOURS,
+        WINNER_SCAN_MINUTE,
+    )
+
     for hour in range(24):
-        if hour % 6 == 5:
-            assert _intended_actions(_dt(hour, 4)) == ["winner_deep_scan"]
-        if hour % 6 == 1:
-            assert _intended_actions(_dt(hour, 3)) == ["following_feed_scan"]
+        if hour in WINNER_SCAN_HOURS:
+            assert _intended_actions(_dt(hour, WINNER_SCAN_MINUTE)) == ["winner_deep_scan"]
+        if hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET:
+            assert _intended_actions(_dt(hour, FOLLOWING_FEED_SCAN_MINUTE)) == [
+                "following_feed_scan"
+            ]
 
 
 # ---------- cleanup cycle 编排：唯一 assessment engine / stage1 阻断 ----------

@@ -377,7 +377,7 @@ def test_health_endpoint_is_local_and_flags_delete_job_in_progress() -> None:
     assert payload["ok"] is True
     assert payload["status"] == "normal"
     assert payload["maintenance"]["enabled"] is True
-    assert payload["maintenance"]["interval_hours"] == 6
+    assert payload["maintenance"]["interval_hours"] == 12
     health_mock.assert_called_once_with("123", delete_job_in_progress=True)
 
 

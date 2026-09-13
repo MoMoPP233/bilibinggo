@@ -210,10 +210,10 @@ def test_startup_onboarding_sweep_is_invoked_and_non_blocking(monkeypatch) -> No
     assert "_startup_onboarding_sweep()" in source
 
 
-# ---------- 4. 展示口径 6 小时 ----------
+# ---------- 4. 展示口径 12 小时（V26: cleanup 2 次/天） ----------
 
 
-def test_cleanup_display_interval_is_six_hours() -> None:
+def test_cleanup_display_interval_is_twelve_hours() -> None:
     from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS
 
-    assert CLEANUP_MAINTAIN_INTERVAL_HOURS == 6
+    assert CLEANUP_MAINTAIN_INTERVAL_HOURS == 12
