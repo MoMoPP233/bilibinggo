@@ -49,6 +49,128 @@ DEFAULT_KEYWORDS = [
     "中奖|恭喜|获得|幸运|抽中|奖品|填写地址|核对信息",
 ]
 
+# V25：关注后自动回复（欢迎/感谢关注）过滤。
+# 平台当前没有已确认的 auto_reply 专用字段，因此只做保守、高置信度的本地结构组合：
+#   普通用户 DM + inbound(对方→我) + 会话存在关注关系标记 + 纯欢迎模板
+#   + 无强中奖/领奖信号 + 无链接
+# 任一条件不满足 → 保留为正常 Winner 扫描对象（宁可留可疑候选，不误杀真实中奖）。
+_FILTERED_AUTO_REPLIES_LIMIT = 200
+
+# 强中奖/领奖信号：命中任一即否决过滤（优先级高于欢迎模板）。
+# 注意：不含“恭喜/获得/幸运”这类泛化词——“恭喜成为我的粉丝”正是本次误判来源。
+STRONG_WINNER_MARKERS = (
+    "中奖",
+    "抽中",
+    "获奖",
+    "领奖",
+    "兑奖",
+    "奖品",
+    "抽奖",
+    "开奖",
+    "中奖名单",
+    "中奖用户",
+    "中奖信息",
+    "获奖名单",
+    "获奖用户",
+    "幸运用户",
+    "填写地址",
+    "收货地址",
+    "核对信息",
+    "联系方式",
+)
+
+_LINK_RE = re.compile(
+    r"https?://|www\.|://|b23\.tv|bilibili\.com|t\.bilibili\.com|bili2233\.cn",
+    re.IGNORECASE,
+)
+
+# 受控欢迎短语（顺序即匹配优先级；每次从剩余串开头消费一个短语）。
+_WELCOME_PHRASES = (
+    re.compile(r"(?:感谢|谢谢|多谢|感恩)(?:你|您|你的|您的)?(?:关注|支持|喜欢|陪伴)"),
+    re.compile(
+        r"欢迎(?:你|您|大家)?(?:关注|来到|加入|成为)"
+        r"(?:我的|本|这里|我)?(?:频道|空间|主页|直播间|粉丝团|粉丝|大家庭)?"
+    ),
+    re.compile(r"(?:感谢|谢谢|多谢|感恩)?(?:你|您)?(?:成为|加入)(?:我的|本)?(?:粉丝|粉丝团|大家庭)"),
+    re.compile(r"(?:恭喜|祝贺)(?:你|您)?(?:成为|加入)(?:我的|本)?(?:粉丝|粉丝团|大家庭)"),
+    re.compile(r"(?:与|和|以及)(?:关注|支持|喜欢|陪伴)"),
+)
+
+# 允许出现在欢迎语最前面的称呼/问候（消费后必须被欢迎短语完全覆盖）。
+_LEADING_ADDRESS_RE = re.compile(
+    r"^(?:亲爱的|亲|宝子|小可爱|朋友们|朋友|小伙伴们|小伙伴|大家|"
+    r"你好|您好|哈喽|嗨|hello|hi|在吗)+"
+)
+
+
+def has_strong_winner_signal(text: str) -> bool:
+    value = str(text or "")
+    return any(marker in value for marker in STRONG_WINNER_MARKERS)
+
+
+def contains_link(text: str) -> bool:
+    return bool(_LINK_RE.search(str(text or "")))
+
+
+def is_welcome_template(text: str) -> bool:
+    """严格欢迎模板判定：文本（去标点/emoji/空白后）必须由受控欢迎短语完整组成。
+
+    不做模糊语义分类、不做 LLM；任何剩余未知内容一律判定为“非欢迎模板”。
+    """
+    raw = str(text or "").strip()
+    if not raw or len(raw) > 80:
+        return False
+    compact = "".join(ch for ch in raw if ch.isalnum())
+    if not compact:
+        return False
+    while True:
+        match = _LEADING_ADDRESS_RE.match(compact)
+        if not match or match.end() == 0:
+            break
+        compact = compact[match.end() :]
+    if not compact:
+        return False
+    matched = False
+    for _ in range(8):
+        progressed = False
+        for pattern in _WELCOME_PHRASES:
+            match = pattern.match(compact)
+            if match and match.end() > 0:
+                compact = compact[match.end() :]
+                matched = True
+                progressed = True
+        if not progressed:
+            break
+    return matched and not compact
+
+
+def is_high_confidence_follow_auto_reply(entry: MessageEntry, session: Any) -> bool:
+    """高置信度“关注后自动回复”判定（仅用于 DM，纯本地、无副作用）。"""
+    raw = entry.raw or {}
+    # A. 普通用户 DM：system_msg_type == 0（平台系统消息已由上游过滤）。
+    try:
+        if int(raw.get("system_msg_type") or 0) != 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    # B. inbound：对方（talker）→ 我；sender 缺失或为自己时绝不按自动回复过滤。
+    try:
+        talker_id = int(entry.talker_id or 0)
+        sender_uid = int(raw.get("sender_uid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if talker_id <= 0 or sender_uid <= 0 or sender_uid != talker_id:
+        return False
+    # C. 会话存在关注关系标记（is_follow 语义见报告；仅在明确 True 时使用）。
+    if getattr(session, "is_follow", None) is not True:
+        return False
+    text = str(entry.text or entry.title or "")
+    # E/F. 强中奖信号或链接一律否决过滤。
+    if has_strong_winner_signal(text) or contains_link(text):
+        return False
+    # D. 纯欢迎模板。
+    return is_welcome_template(text)
+
 
 def judge_keywords(text: str, patterns: list[str] | None = None) -> bool:
     """关键词判定（复用 bil-1-main 语义）：`~` 开头为黑名单（命中置 False），
@@ -125,7 +247,7 @@ def _load_state() -> dict[str, Any]:
     state = _default_sources_state()
     sources = stored.get("sources")
     if isinstance(sources, dict):
-        for key in state:
+        for key in ("mention", "reply", "dm"):
             entry = sources.get(key)
             if isinstance(entry, dict):
                 state[key].update(
@@ -134,11 +256,32 @@ def _load_state() -> dict[str, Any]:
                         for field in state[key]
                     }
                 )
+    # V25：已过滤的关注自动回复 stable key（per-Profile，有界，只存 key 不存正文）。
+    filtered = stored.get("filtered_auto_replies")
+    if isinstance(filtered, list):
+        state["filtered_auto_replies"] = [
+            str(item) for item in filtered if str(item or "").strip()
+        ][-_FILTERED_AUTO_REPLIES_LIMIT:]
+    else:
+        state["filtered_auto_replies"] = []
     return state
 
 
 def _save_state(state: dict[str, Any]) -> None:
-    _write_json(_state_path(), {"version": 1, "sources": state})
+    sources = {
+        key: state[key] for key in ("mention", "reply", "dm") if key in state
+    }
+    filtered = state.get("filtered_auto_replies") or []
+    _write_json(
+        _state_path(),
+        {
+            "version": 1,
+            "sources": sources,
+            "filtered_auto_replies": [
+                str(item) for item in filtered if str(item or "").strip()
+            ][-_FILTERED_AUTO_REPLIES_LIMIT:],
+        },
+    )
 
 
 def _load_candidates() -> dict[str, dict[str, Any]]:
@@ -278,8 +421,20 @@ class WinnerScanService:
         *,
         state: dict[str, Any],
         existing: dict[str, dict[str, Any]],
-    ) -> tuple[int, list[str]]:
+    ) -> tuple[int, list[str], int]:
+        """返回 (newly_saved, found_keys, auto_reply_skipped)。
+
+        过滤只发生在 candidate/dispatch 之前；被过滤的消息不落 candidate、不通知。
+        同一 stable key 已记录过滤后不再重复计数（V25 去噪）。
+        """
         sessions = list_dm_sessions(client, size=MAX_DM_SESSIONS)
+        filtered = {
+            str(item)
+            for item in (state.get("filtered_auto_replies") or [])
+            if str(item or "").strip()
+        }
+        newly_filtered: list[str] = []
+        auto_reply_skipped = 0
         newly_saved = 0
         found_keys: list[str] = []
         for session in sessions:
@@ -294,12 +449,21 @@ class WinnerScanService:
             for entry in messages:
                 if entry.msg_type != MessageType.DM:
                     continue
+                key = _source_entry_key("dm", entry)
+                if key is not None and key in filtered:
+                    # 已记录为关注自动回复：不生成 candidate、不通知、不重复计数。
+                    continue
+                if is_high_confidence_follow_auto_reply(entry, session):
+                    if key is not None:
+                        filtered.add(key)
+                        newly_filtered.append(key)
+                        auto_reply_skipped += 1
+                    continue
                 text = str(entry.text or entry.title or "")
                 if not judge_keywords(text):
                     continue
-                key = _source_entry_key("dm", entry)
                 if key is None:
-                    self._record_malformed(state, "dm", entry)
+                    self._record_malformed(state["dm"], "dm", entry)
                     continue
                 if existing.get(key) is not None:
                     continue
@@ -318,7 +482,17 @@ class WinnerScanService:
                 }
                 newly_saved += 1
                 found_keys.append(key)
-        return newly_saved, found_keys
+        if newly_filtered:
+            merged: list[str] = []
+            seen: set[str] = set()
+            for item in list(state.get("filtered_auto_replies") or []) + newly_filtered:
+                value = str(item or "").strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                merged.append(value)
+            state["filtered_auto_replies"] = merged[-_FILTERED_AUTO_REPLIES_LIMIT:]
+        return newly_saved, found_keys, auto_reply_skipped
 
     def run(
         self,
@@ -331,7 +505,8 @@ class WinnerScanService:
     ) -> dict[str, Any]:
         """执行一轮中奖深检。client 由调用方（Job/action）提供。
 
-        返回 {ok, partial, sources:{mention/reply/dm:{status,last_error?,found,advance}}}
+        返回 {ok, partial, sources:{mention/reply/dm:{status,last_error?,found,advance}},
+              auto_reply_skipped_count}
         - 普通失败 → partial=True，该 source advance=False（checkpoint 不推进）；
         - 平台风控/身份不一致 → 立即停止并抛出（不伪装成功）。
         """
@@ -388,24 +563,44 @@ class WinnerScanService:
             if cancel_check and cancel_check():
                 raise RuntimeError("任务已取消")
             try:
-                saved, keys = self._scan_dm_source(active_client, state=state["dm"], existing=existing)
+                saved, keys, auto_reply_skipped = self._scan_dm_source(
+                    active_client, state=state, existing=existing
+                )
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
                 self._advance_source_state(state, "dm")
-                outcomes["dm"] = {"status": "success", "found": saved, "advance": True}
+                outcomes["dm"] = {
+                    "status": "success",
+                    "found": saved,
+                    "advance": True,
+                    "auto_reply_skipped": auto_reply_skipped,
+                }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
                     raise
                 partial = True
                 self._record_source_error(state, "dm", exc)
-                outcomes["dm"] = {"status": "failed", "error": _safe_error(exc), "advance": False}
+                outcomes["dm"] = {
+                    "status": "failed",
+                    "error": _safe_error(exc),
+                    "advance": False,
+                    "auto_reply_skipped": 0,
+                }
         finally:
             if close_after:
                 try:
                     active_client.close()
                 except Exception:
                     pass
-        return {"ok": not partial, "partial": partial, "sources": outcomes}
+        auto_reply_skipped_count = sum(
+            int(item.get("auto_reply_skipped") or 0) for item in outcomes.values()
+        )
+        return {
+            "ok": not partial,
+            "partial": partial,
+            "sources": outcomes,
+            "auto_reply_skipped_count": auto_reply_skipped_count,
+        }
 
     # -- 落库 / 推进 / 通知 --
 

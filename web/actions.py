@@ -1328,10 +1328,13 @@ def _run_action_impl(
         sources = result.get("sources") or {}
         found = sum(int(item.get("found") or 0) for item in sources.values())
         failed = [name for name, item in sources.items() if item.get("status") != "success"]
+        auto_reply_skipped = int(result.get("auto_reply_skipped_count") or 0)
         if result.get("partial"):
             message = f"深检完成（部分来源失败：{','.join(failed)}，本轮新增线索 {found} 条）"
         else:
             message = f"中奖深检完成：新增疑似中奖线索 {found} 条"
+        if auto_reply_skipped:
+            message += f"；跳过 {auto_reply_skipped} 条关注后自动回复"
         progress(step=4, total=4, message=message, log_append=message)
         return {
             "ok": True,
