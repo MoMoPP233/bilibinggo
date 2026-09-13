@@ -329,24 +329,88 @@ def _session_path(onboarding_id: str) -> Path:
     return _onboarding_dir() / f"{onboarding_id}.json"
 
 
+_SECRETS_DIRNAME = ".secrets"
+_ONBOARDING_SECRET_KINDS = ("qr_key", "cookie")
+
+
+def _secrets_dir_path() -> Path:
+    return _onboarding_dir() / _SECRETS_DIRNAME
+
+
+def _secret_path(onboarding_id: str, kind: str) -> Path:
+    """secret sidecar 路径由 onboarding_id + 固定 kind 推导；文件名不含 secret。"""
+    if kind not in _ONBOARDING_SECRET_KINDS:
+        raise ValueError(f"未知 onboarding secret 类型：{kind}")
+    return _secrets_dir_path() / f"{onboarding_id}.{kind}"
+
+
+def _write_onboarding_secret(onboarding_id: str, kind: str, value: str) -> None:
+    """统一走项目 secure secret 原语（原子写 + 尽力权限收紧）。"""
+    write_text_secret(_secret_path(onboarding_id, kind), value)
+
+
+def _read_onboarding_secret(onboarding_id: str, kind: str) -> str:
+    try:
+        return _secret_path(onboarding_id, kind).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _delete_onboarding_secret(onboarding_id: str, kind: str) -> None:
+    try:
+        _secret_path(onboarding_id, kind).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _delete_onboarding_secrets(onboarding_id: str) -> None:
+    for kind in _ONBOARDING_SECRET_KINDS:
+        _delete_onboarding_secret(onboarding_id, kind)
+
+
+def _render_qr_png(onboarding_id: str, qr_url: str) -> Path:
+    """把 QR payload 渲染为 PNG（qr_url 只在此使用，绝不写入普通 session JSON）。"""
+    image_path = _session_path(onboarding_id).with_suffix(".png")
+    try:
+        import qrcode  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise OnboardingError("qr_render_unavailable", f"缺少二维码渲染库：{type(exc).__name__}") from exc
+    try:
+        image = qrcode.make(qr_url)
+        image.save(image_path)
+    except Exception as exc:  # noqa: BLE001
+        raise OnboardingError("qr_render_unavailable", f"二维码渲染失败：{type(exc).__name__}") from exc
+    return image_path
+
+
 def onboarding_create(*, qr_url: str, qr_key: str) -> dict[str, Any]:
-    """创建未绑定 Profile 的 onboarding session（QR 材料由调用方在扫码网络层生成）。"""
+    """创建未绑定 Profile 的 onboarding session。
+
+    - qr_url 只用于立即渲染 QR PNG，不持久化到普通 session JSON；
+    - qrcode_key 写入 .secrets/<id>.qr_key（write_text_secret）；
+    - 普通 JSON 只保存非敏感 metadata 与 has_* 标志。
+    """
     onboarding_id = uuid.uuid4().hex[:16]
+    _render_qr_png(onboarding_id, qr_url)
+    now = int(time.time())
     session: dict[str, Any] = {
         "onboarding_id": onboarding_id,
-        "created_at": int(time.time()),
+        "created_at": now,
+        "updated_at": now,
         "status": "waiting",
-        "qr_url": qr_url,
-        "qr_key": qr_key,
-        "cookie": "",
-        "uid": "",
-        "nickname": "",
+        "has_qr_key": True,
+        "has_cookie": False,
+        "failure_code": "",
         "result": None,
     }
-    _atomic_write_text(_session_path(onboarding_id), json.dumps(session, ensure_ascii=False) + "\n")
+    try:
+        _write_onboarding_secret(onboarding_id, "qr_key", qr_key)
+        _atomic_write_text(_session_path(onboarding_id), json.dumps(session, ensure_ascii=False) + "\n")
+    except BaseException:
+        _cleanup_session_material(onboarding_id)
+        raise
     return {
         "onboarding_id": onboarding_id,
-        "qr_url": qr_url,
         "status": "waiting",
         "ttl_seconds": SESSION_TTL_SECONDS,
     }
@@ -369,73 +433,92 @@ def _session_expired(session: dict[str, Any], now: int) -> bool:
     return int(session.get("created_at") or 0) + SESSION_TTL_SECONDS < int(now)
 
 
-def onboarding_store_scanned_cookie(onboarding_id: str, cookie_str: str, *, now: int | None = None) -> None:
-    """扫码成功：Cookie 只落 server staging（shared/onboarding/<id>.json，敏感字段本地文件）。"""
+def onboarding_store_scanned_cookie(
+    onboarding_id: str,
+    cookie_str: str,
+    *,
+    now: int | None = None,
+    qr_key_consumed: bool = False,
+) -> None:
+    """扫码成功：Cookie 只落 secret sidecar（write_text_secret），普通 JSON 只记 has_cookie。"""
     session = _read_session(onboarding_id)
-    if _session_expired(session, int(now if now is not None else time.time())):
+    timestamp = int(now if now is not None else time.time())
+    if _session_expired(session, timestamp):
         raise OnboardingError("session_expired", "onboarding 已过期，不能 commit")
     if session.get("status") in ("completed", "failed"):
         raise OnboardingError("session_closed", "onboarding 已结束")
-    session["cookie"] = cookie_str
+    _write_onboarding_secret(onboarding_id, "cookie", cookie_str)
     session["status"] = "scanned"
+    session["has_cookie"] = True
+    if qr_key_consumed:
+        session["has_qr_key"] = False
+    session["updated_at"] = timestamp
     _write_session(session)
 
 
 def onboarding_complete(onboarding_id: str, *, nickname: str = "") -> dict[str, Any]:
-    """服务端用 staged Cookie 解析 UID 并 commit；同 id 重复调用幂等返回首次结果。
+    """服务端用 staged Cookie（secret sidecar）解析 UID 并 commit；同 id 重复调用幂等。
 
     crash/retry 语义：
-    - 完成成功即把记录原子转换为 sanitized completed receipt（保留 result，清除 Cookie/QR）；
-    - 在 receipt durable 之前崩溃：staged Cookie 仍在（status=committing），重试会因 UID
-      查重复用 Profile，不会创建第二个；随后写入 receipt。
-    - receipt durable 之后：任何重复 complete 直接返回相同 result（0 新副作用）。
+    - 读取 cookie sidecar → commit_staged_login → 原子写 sanitized completed receipt
+      → 删除全部 onboarding secret / QR PNG；
+    - receipt durable 之前崩溃：cookie sidecar 仍在（status=committing），重试会因 UID
+      查重复用 Profile，不会创建第二个；随后写入 receipt 并清理 secret；
+    - receipt durable 之后：任何重复 complete 直接返回相同 result（不要求 secret 存在）。
     """
     session = _read_session(onboarding_id)
     if session.get("result") is not None and session.get("status") == "completed":
-        return dict(session["result"])  # 幂等：已固化的 receipt
+        return dict(session["result"])  # 幂等：已固化的 sanitized receipt
     now = int(time.time())
     if _session_expired(session, now) or session.get("status") == "failed":
         _strip_secrets(session)
         _write_session(session)
+        _delete_onboarding_secrets(onboarding_id)
         raise OnboardingError("session_expired", "onboarding 已过期或失败，不能 commit")
-    cookie_str = str(session.get("cookie") or "")
+    cookie_str = _read_onboarding_secret(onboarding_id, "cookie")
     if not cookie_str:
-        raise OnboardingError("session_incomplete", "尚未获得登录 Cookie")
+        _logger.warning(
+            "onboarding secret missing: session=%s kind=cookie", str(onboarding_id)[:8]
+        )
+        raise OnboardingError("session_secret_missing", "扫码会话凭据已失效，请重新获取二维码")
     # UID 只由服务端从 staged Cookie 确认
     uid = uid_from_cookie(cookie_str)
-    hint_uid = str(session.get("uid") or "")
-    if hint_uid and str(hint_uid) != uid:
-        raise OnboardingError("uid_mismatch", "UID 与服务端解析结果不一致")
     session["status"] = "committing"
+    session["updated_at"] = int(time.time())
     _write_session(session)
     try:
-        result = commit_staged_login(cookie_str=cookie_str, uid=uid, nickname=nickname or str(session.get("nickname") or ""))
+        result = commit_staged_login(cookie_str=cookie_str, uid=uid, nickname=nickname)
     except Exception:
         # 失败：清除 secret 并保留失败态（不可再次 commit）
         session["status"] = "failed"
+        session["failure_code"] = "commit_failed"
+        session["has_cookie"] = False
         _strip_secrets(session)
         _write_session(session)
+        _delete_onboarding_secrets(onboarding_id)
         raise
-    # Profile/pointer 已确定：构造并原子 durable 保存 sanitized completed receipt
+    # uid（DedeUserID）不写入 receipt / 返回体，保持 sanitized
+    sanitized_result = {key: value for key, value in dict(result).items() if key != "uid"}
+    # Profile/pointer 已确定：构造并原子 durable 保存 sanitized completed receipt（无任何 secret）
     completed = {
         "onboarding_id": onboarding_id,
         "status": "completed",
         "completed_at": int(time.time()),
-        "uid": uid,
-        "nickname": str(nickname or session.get("nickname") or ""),
-        "result": dict(result),
+        "nickname": str(nickname or ""),
+        "result": sanitized_result,
     }
     _atomic_write_text(_session_path(onboarding_id), json.dumps(completed, ensure_ascii=False) + "\n")
-    # complete 成功：QR PNG 不再需要。尽力删除；失败只记录，不影响已成功结果，
-    # 残留会在下次 onboarding_start_remote 的 opportunistic sweep 中清理。
+    # receipt durable 之后才清理 secret / QR PNG；失败只记录，残留由 sweep 兜底。
+    _delete_onboarding_secrets(onboarding_id)
     try:
         _session_path(onboarding_id).with_suffix(".png").unlink(missing_ok=True)
     except OSError:
         _logger.warning("onboarding complete 后清理 QR PNG 失败：%s", onboarding_id)
-    return dict(result)
+    return dict(sanitized_result)
 
 
 def _strip_secrets(session: dict[str, Any]) -> dict[str, Any]:
+    # 兼容升级前的旧格式 session（新格式不含这些键）
     for key in ("cookie", "qr_url", "qr_key"):
         session.pop(key, None)
     return session
@@ -444,24 +527,62 @@ def _strip_secrets(session: dict[str, Any]) -> dict[str, Any]:
 def onboarding_fail(onboarding_id: str, *, reason: str = "") -> None:
     session = _read_session(onboarding_id)
     session["status"] = "failed"
+    session["failure_code"] = str(reason or "")
+    session["has_qr_key"] = False
+    session["has_cookie"] = False
+    session["updated_at"] = int(time.time())
     _strip_secrets(session)
     _write_session(session)
+    _delete_onboarding_secrets(onboarding_id)
 
 
 def _cleanup_session_material(onboarding_id: str) -> None:
+    for path in (
+        _session_path(onboarding_id),
+        _session_path(onboarding_id).with_suffix(".png"),
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _delete_onboarding_secrets(onboarding_id)
+
+
+def _sweep_orphan_secrets(now_ts: int) -> None:
+    """清理无对应 session 且已明显超过 TTL 的 orphan secret sidecar（崩溃窗口兜底）。"""
+    secrets_dir = _secrets_dir_path()
+    if not secrets_dir.is_dir():
+        return
     try:
-        _session_path(onboarding_id).unlink(missing_ok=True)
+        entries = sorted(secrets_dir.iterdir())
     except OSError:
-        pass
+        return
+    sessions_dir = _onboarding_dir()
+    for path in entries:
+        if not path.is_file():
+            continue
+        onboarding_id = path.name.rsplit(".", 1)[0]
+        if (sessions_dir / f"{onboarding_id}.json").exists():
+            continue
+        try:
+            age = now_ts - int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if age > SESSION_TTL_SECONDS:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def onboarding_sweep_expired(now: int | None = None) -> list[str]:
     """Opportunistic 清理过期 onboarding staging（同步、无 thread/timer）。
 
-    - waiting/scanned/committing（含 staged Cookie / qr_url / qr_key）：超过
-      SESSION_TTL_SECONDS 即删除（敏感凭据不留存）；同名 QR PNG 一并删除。
+    - waiting/scanned/committing（含 secret sidecar / has_* 标志）：超过
+      SESSION_TTL_SECONDS 即删除（敏感凭据不留存）；同名 QR PNG 与 secret 一并删除。
     - completed/failed sanitized receipt（已无凭据）：保留 RECEIPT_TTL_SECONDS
       供 duplicate complete 幂等，超龄后删除。
+    - 额外清理无 session 且超过 TTL 的 orphan secret sidecar。
     - 只清理 shared/onboarding 目录，绝不触碰任何 Profile。
     返回被清理的 onboarding_id 列表。
     """
@@ -491,7 +612,11 @@ def onboarding_sweep_expired(now: int | None = None) -> list[str]:
             if not base_ts:
                 continue
             has_sensitive = bool(
-                session.get("cookie") or session.get("qr_url") or session.get("qr_key")
+                session.get("cookie")
+                or session.get("qr_url")
+                or session.get("qr_key")
+                or session.get("has_qr_key")
+                or session.get("has_cookie")
             )
             ttl = SESSION_TTL_SECONDS if has_sensitive else RECEIPT_TTL_SECONDS
             if base_ts + ttl >= now_ts:
@@ -500,6 +625,7 @@ def onboarding_sweep_expired(now: int | None = None) -> list[str]:
             path.unlink(missing_ok=True)
         except OSError:
             continue
+        _delete_onboarding_secrets(onboarding_id)
         try:
             path.with_suffix(".png").unlink(missing_ok=True)
         except OSError:
@@ -516,6 +642,8 @@ def onboarding_sweep_expired(now: int | None = None) -> list[str]:
                     pass
     except OSError:
         pass
+    # 孤儿 secret sidecar（无 session 且超 TTL）
+    _sweep_orphan_secrets(now_ts)
     return removed
 
 
@@ -578,9 +706,12 @@ def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
         return onboarding_status_public(onboarding_id)
     if _session_expired(session, int(time.time())):
         raise OnboardingError("session_expired", "onboarding 已过期")
-    qr_key = str(session.get("qr_key") or "")
+    qr_key = _read_onboarding_secret(onboarding_id, "qr_key")
     if not qr_key:
-        raise OnboardingError("session_closed", "会话缺少 qr_key")
+        _logger.warning(
+            "onboarding secret missing: session=%s kind=qr_key", str(onboarding_id)[:8]
+        )
+        raise OnboardingError("session_secret_missing", "扫码会话凭据已失效，请重新获取二维码")
 
     client = blogin.create_passport_client()
     try:
@@ -599,6 +730,7 @@ def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
                     "暂时无法查询扫码状态，请重新获取二维码",
                 ) from exc
             if exc.category == "protocol_error":
+                onboarding_fail(onboarding_id, reason="poll_protocol_error")
                 raise OnboardingError(
                     "poll_protocol_error",
                     "登录状态查询失败（B站响应异常），请重新获取二维码",
@@ -614,6 +746,7 @@ def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
                 raw_cookie = blogin._collect_login_cookies(client, resp, body)
             except Exception as exc:  # noqa: BLE001 - Cookie 收集失败必须显式分类
                 _log_poll_failure(onboarding_id, "cookie", exc)
+                onboarding_fail(onboarding_id, reason="cookie_collect_failed")
                 raise OnboardingError(
                     "cookie_incomplete", "登录 Cookie 收集失败，请重新扫码"
                 ) from exc
@@ -628,10 +761,15 @@ def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
                     str(onboarding_id)[:8],
                     ",".join(missing),
                 )
+                onboarding_fail(onboarding_id, reason="cookie_incomplete")
                 raise OnboardingError("cookie_incomplete", "登录 Cookie 不完整，请重新扫码")
             essential = {k: v for k, v in raw_cookie.items() if k in blogin.ESSENTIAL_KEYS}
             cookie_str = blogin.cookies_to_header(essential or raw_cookie)
-            onboarding_store_scanned_cookie(onboarding_id, cookie_str, now=int(time.time()))
+            onboarding_store_scanned_cookie(
+                onboarding_id, cookie_str, now=int(time.time()), qr_key_consumed=True
+            )
+            # 扫码已确认，qrcode_key 不再需要：立即删除 secret sidecar
+            _delete_onboarding_secret(onboarding_id, "qr_key")
             return {"onboarding_id": onboarding_id, "status": "success", "need_confirm": True}
 
         if state in (-2, blogin.POLL_EXPIRED, 86039):
@@ -659,22 +797,12 @@ def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
 
 
 def onboarding_qr_image_path(onboarding_id: str) -> Path:
-    """渲染/返回 staging 二维码 PNG 路径（无网络；失败给出明确错误）。"""
+    """返回 staging 二维码 PNG 路径（无网络）；PNG 在 onboarding_create 时已渲染。"""
     session = _read_session(onboarding_id)
-    qr_url = str(session.get("qr_url") or "")
-    if not qr_url:
-        raise OnboardingError("session_closed", "会话缺少二维码内容")
+    if session.get("status") in ("completed", "failed"):
+        raise OnboardingError("session_closed", "会话已结束")
     image_path = _session_path(onboarding_id).with_suffix(".png")
     if image_path.exists():
         return image_path
-    try:
-        import qrcode  # type: ignore
-    except Exception as exc:  # noqa: BLE001
-        raise OnboardingError("qr_render_unavailable", f"缺少二维码渲染库：{type(exc).__name__}") from exc
-    try:
-        image = qrcode.make(qr_url)
-        image.save(image_path)
-    except Exception as exc:  # noqa: BLE001
-        raise OnboardingError("qr_render_unavailable", f"二维码渲染失败：{type(exc).__name__}") from exc
-    return image_path
+    raise OnboardingError("qr_render_unavailable", "二维码图片不可用，请重新获取")
 

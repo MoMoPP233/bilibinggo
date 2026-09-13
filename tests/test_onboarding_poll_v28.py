@@ -98,11 +98,19 @@ def test_case1_start_remote_url_and_key_from_same_response(
         lambda: ("https://passport.bilibili.com/h5-app/passport/login/scan?x=1", "key-1"),
     )
     result = onboarding_start_remote()
-    staged = _session_file(root, result["onboarding_id"])
-    assert result["qr_url"] == staged["qr_url"] == "https://passport.bilibili.com/h5-app/passport/login/scan?x=1"
-    assert staged["qr_key"] == "key-1"
+    staged_path = root / "shared" / "onboarding" / f"{result['onboarding_id']}.json"
+    staged_text = staged_path.read_text(encoding="utf-8")
+    # V31：普通 session JSON 不含 qr_url/qr_key 明文
+    assert "scan?x=1" not in staged_text
+    assert "key-1" not in staged_text
+    assert '"qr_url"' not in staged_text
+    assert '"qr_key"' not in staged_text
+    assert json.loads(staged_text)["has_qr_key"] is True
+    secret = root / "shared" / "onboarding" / ".secrets" / f"{result['onboarding_id']}.qr_key"
+    assert secret.read_text(encoding="utf-8") == "key-1"
     assert "cookie" not in result
     assert "qrcode_key" not in result
+    assert "qr_url" not in result
 
 
 def test_case2_poll_request_carries_qrcode_key(
@@ -182,14 +190,28 @@ def test_case6_success_stages_cookie_header_string(
     session = onboarding_create(qr_url="https://qr.test/1", qr_key="k")
     result = onboarding_poll(session["onboarding_id"])
     assert result["status"] == "success"
-    staged = _session_file(root, session["onboarding_id"])
+    staged_text = (
+        root / "shared" / "onboarding" / f"{session['onboarding_id']}.json"
+    ).read_text(encoding="utf-8")
+    # V31：Cookie 不进普通 JSON；只记 has_cookie
+    assert "SESSDATA" not in staged_text
+    assert "bili_jct" not in staged_text
+    assert "DedeUserID" not in staged_text
+    assert '"cookie"' not in staged_text
+    staged = json.loads(staged_text)
     assert staged["status"] == "scanned"
-    cookie = staged["cookie"]
+    assert staged["has_cookie"] is True
+    cookie = (
+        root / "shared" / "onboarding" / ".secrets" / f"{session['onboarding_id']}.cookie"
+    ).read_text(encoding="utf-8")
     assert isinstance(cookie, str)
     assert "SESSDATA=sess-1" in cookie
     assert "DedeUserID=90001" in cookie
     assert "{'SESSDATA'" not in cookie  # 不得把 dict repr 当成 Cookie header
-    assert _session_file(root, session["onboarding_id"])["qr_key"] == "k"
+    # 扫码成功后 qr_key secret 立即删除（gate 16）
+    assert not (
+        root / "shared" / "onboarding" / ".secrets" / f"{session['onboarding_id']}.qr_key"
+    ).exists()
 
 
 def test_case7_expired_marks_session_failed(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,8 +402,12 @@ def test_case18_incomplete_cookie_fails_without_profile(
         onboarding_poll(session["onboarding_id"])
     assert exc.value.code == "cookie_incomplete"
     staged = _session_file(root, session["onboarding_id"])
-    assert staged["status"] == "waiting"
-    assert not staged.get("cookie")
+    # V31：cookie incomplete 为终态失败，且不留下 cookie/qr_key secret
+    assert staged["status"] == "failed"
+    assert staged["has_cookie"] is False
+    secrets_dir = root / "shared" / "onboarding" / ".secrets"
+    assert not (secrets_dir / f"{session['onboarding_id']}.cookie").exists()
+    assert not (secrets_dir / f"{session['onboarding_id']}.qr_key").exists()
     assert [p["profile_id"] for p in list_profiles()] == ["account-1"]
 
 

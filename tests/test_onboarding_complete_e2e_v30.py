@@ -137,7 +137,30 @@ def _db_integrity(db: Path) -> str:
 def test_new_uid_complete_creates_profile_and_switch_succeeds(
     root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    onboarding_id = _scan_to_staged(root, monkeypatch)
+    _install_bilibili(monkeypatch)
+    onboarding_dir = root / "shared" / "onboarding"
+    secrets_dir = onboarding_dir / ".secrets"
+
+    start = client.post("/api/accounts/onboarding/start")
+    assert start.status_code == 200, start.text
+    onboarding_id = start.json()["result"]["onboarding_id"]
+    assert onboarding_id
+    # V31：start 后普通 JSON 无 qrcode_key，secret 在 sidecar
+    session_text = (onboarding_dir / f"{onboarding_id}.json").read_text(encoding="utf-8")
+    assert "k-1" not in session_text
+    assert '"qr_key"' not in session_text
+    assert (secrets_dir / f"{onboarding_id}.qr_key").read_text(encoding="utf-8") == "k-1"
+
+    poll = client.post(f"/api/accounts/onboarding/{onboarding_id}/poll")
+    assert poll.status_code == 200, poll.text
+    assert poll.json()["result"]["status"] == "success"
+    # V31：poll success 后普通 JSON 无 Cookie；cookie sidecar 存在，qr_key 已删除
+    session_text = (onboarding_dir / f"{onboarding_id}.json").read_text(encoding="utf-8")
+    assert "sess-1" not in session_text
+    assert "90001" not in session_text
+    assert '"cookie"' not in session_text
+    assert (secrets_dir / f"{onboarding_id}.cookie").is_file()
+    assert not (secrets_dir / f"{onboarding_id}.qr_key").exists()
 
     complete = client.post(COMPLETE_PATH, json={"onboarding_id": onboarding_id})
     assert complete.status_code == 200, complete.text
@@ -146,6 +169,13 @@ def test_new_uid_complete_creates_profile_and_switch_succeeds(
     assert result["created_new"] is True
     assert result["reused_existing"] is False
     assert result["restart_required"] is True
+    assert "uid" not in result
+    # V31：complete 后全部 onboarding secret 清理，receipt sanitized
+    assert not (secrets_dir / f"{onboarding_id}.cookie").exists()
+    assert not (secrets_dir / f"{onboarding_id}.qr_key").exists()
+    receipt = (onboarding_dir / f"{onboarding_id}.json").read_text(encoding="utf-8")
+    assert "sess-1" not in receipt
+    assert "90001" not in receipt
 
     profile_dir = root / "profiles" / "account-2"
     assert (profile_dir / "profile.json").is_file()
@@ -187,6 +217,10 @@ def test_existing_uid_reuses_profile_without_duplicate(
     assert result["reused_existing"] is True
     assert not (root / "profiles" / "account-2").exists()
     assert len([p for p in (root / "profiles").iterdir() if p.is_dir()]) == 1
+    # V31：existing UID 路径同样清理全部 onboarding secret
+    secrets_dir = root / "shared" / "onboarding" / ".secrets"
+    assert not (secrets_dir / f"{onboarding_id}.cookie").exists()
+    assert not (secrets_dir / f"{onboarding_id}.qr_key").exists()
 
     _patch_idle(monkeypatch)
     switch = client.post("/api/profiles/account-1/switch")

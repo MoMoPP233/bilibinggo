@@ -643,6 +643,7 @@ _ONBOARDING_POLL_ERROR_MAP: dict[str, tuple[ErrorCode, int | None]] = {
     "session_expired": (ErrorCode.NOT_FOUND, None),
     "session_closed": (ErrorCode.VALIDATION_ERROR, None),
     "session_incomplete": (ErrorCode.VALIDATION_ERROR, None),
+    "session_secret_missing": (ErrorCode.VALIDATION_ERROR, None),
     "poll_network_error": (ErrorCode.INTERNAL, 503),
     "poll_upstream_error": (ErrorCode.INTERNAL, 503),
     "poll_http_error": (ErrorCode.INTERNAL, 502),

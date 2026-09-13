@@ -298,16 +298,19 @@ def test_remote_start_reuses_login_generate_primitive(root: Path, monkeypatch) -
     result = onboarding_start_remote()
 
     assert result["onboarding_id"]
-    assert result["qr_url"].startswith("https://")
     assert "cookie" not in result
     assert "qrcode_key" not in result
-    staged = json.loads(
-        (root / "shared" / "onboarding" / f"{result['onboarding_id']}.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert staged["qr_url"].startswith("https://")
-    assert staged["qr_key"] == "key-1"
+    assert "qr_url" not in result  # qr_url 只用于渲染 PNG，不进 API/JSON
+    staged_path = root / "shared" / "onboarding" / f"{result['onboarding_id']}.json"
+    staged_text = staged_path.read_text(encoding="utf-8")
+    assert "key-1" not in staged_text
+    assert '"qr_key"' not in staged_text
+    assert '"qr_url"' not in staged_text
+    staged = json.loads(staged_text)
+    assert staged["has_qr_key"] is True
+    assert staged["has_cookie"] is False
+    secret = root / "shared" / "onboarding" / ".secrets" / f"{result['onboarding_id']}.qr_key"
+    assert secret.read_text(encoding="utf-8") == "key-1"
     assert _old_cookie(root) == before
     assert save_calls == []
 

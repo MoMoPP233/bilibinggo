@@ -81,13 +81,21 @@ def test_a_expired_staged_session_credentials_deleted(root: Path) -> None:
         onboarding_id, "SESSDATA=secret;bili_jct=secret2", now=int(time.time())
     )
     path = _onboarding_dir(root) / f"{onboarding_id}.json"
-    assert "secret" in path.read_text(encoding="utf-8")
+    # V31：普通 session JSON 不含 secret；secret 在 .secrets sidecar
+    assert "secret" not in path.read_text(encoding="utf-8")
+    secrets_dir = _onboarding_dir(root) / ".secrets"
+    cookie_secret = secrets_dir / f"{onboarding_id}.cookie"
+    qr_key_secret = secrets_dir / f"{onboarding_id}.qr_key"
+    assert "secret" in cookie_secret.read_text(encoding="utf-8")
+    assert qr_key_secret.exists()
     _age_session(root, onboarding_id, SESSION_TTL_SECONDS + 120)
 
     removed = onboarding_sweep_expired()
 
     assert onboarding_id in removed
     assert not path.exists()
+    assert not cookie_secret.exists()
+    assert not qr_key_secret.exists()
 
 
 def test_b_expired_session_qr_png_deleted(root: Path) -> None:
@@ -134,8 +142,12 @@ def test_d_complete_success_removes_sensitive_staging(root: Path, monkeypatch) -
 
     result = onboarding_complete(onboarding_id)
 
-    assert result == fake_result
+    # V31：uid（DedeUserID）不进入 receipt / 返回体
+    assert result == {k: v for k, v in fake_result.items() if k != "uid"}
     assert not png.exists()
+    secrets_dir = _onboarding_dir(root) / ".secrets"
+    assert not (secrets_dir / f"{onboarding_id}.cookie").exists()
+    assert not (secrets_dir / f"{onboarding_id}.qr_key").exists()
 
 
 def test_e_receipt_duplicate_complete_idempotent(root: Path, monkeypatch) -> None:
@@ -157,7 +169,11 @@ def test_e_receipt_duplicate_complete_idempotent(root: Path, monkeypatch) -> Non
     first = onboarding_complete(onboarding_id)
     second = onboarding_complete(onboarding_id)
 
-    assert second == first == fake_result
+    expected = {k: v for k, v in fake_result.items() if k != "uid"}
+    assert second == first == expected
+    # 重复 complete 不要求 secret 重新存在（已删除）
+    secrets_dir = _onboarding_dir(root) / ".secrets"
+    assert not (secrets_dir / f"{onboarding_id}.cookie").exists()
 
 
 def test_f_receipt_contains_no_credentials(root: Path, monkeypatch) -> None:
