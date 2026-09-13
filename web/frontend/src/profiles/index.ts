@@ -334,6 +334,7 @@ export async function runOnboardingFlow(): Promise<void> {
       throw new Error("创建扫码会话失败：响应缺少 onboarding_id");
     }
     const onboardingId = started.onboarding_id;
+    document.querySelectorAll(".onboarding-qr-modal").forEach((element) => element.remove());
     showToast(ONBOARDING_APP_HINT, "info");
     const modal = document.createElement("div");
     modal.className = "onboarding-qr-modal";
@@ -392,6 +393,12 @@ export async function runOnboardingFlow(): Promise<void> {
     // 二维码确认展示后才轮询；只使用 onboarding_id，绝不接触 Cookie/UID。
     let result: { profile_id: string; created_new: boolean } | null = null;
     let terminal = false;
+    const failOnboarding = (message: string, reason = ""): void => {
+      terminal = true;
+      if (statusEl) statusEl.textContent = message;
+      modal.querySelector("#onboarding-qr-img")?.remove();
+      showToast(reason || message, "error");
+    };
     for (let round = 0; round < ONBOARDING_MAX_POLL_ROUNDS && !terminal; round += 1) {
       await Promise.race([sleepOnboarding(ONBOARDING_POLL_INTERVAL_MS), closeSignal]);
       if (!isActive(modal)) return;
@@ -407,30 +414,37 @@ export async function runOnboardingFlow(): Promise<void> {
       const status = String(poll.status || "");
       if (status === "success") {
         if (statusEl) statusEl.textContent = "登录成功，正在完成账号创建…";
-        const completeRaced = await Promise.race([
-          fetchJSON<ApiEnvelope<OnboardingCompleteResult>>(
-            `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/complete`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ onboarding_id: onboardingId }),
-            },
-          ).then((value) => ({ kind: "complete" as const, value })),
-          closeSignal.then(() => ({ kind: "closed" as const })),
-        ]);
-        if (completeRaced.kind !== "complete" || !isActive(modal)) return;
-        const completed = readEnvelopeResult(completeRaced.value, "完成登录");
-        const profileId = String(completed.profile_id || "").trim();
+        let completed: OnboardingCompleteResult | null = null;
+        try {
+          const completeRaced = await Promise.race([
+            fetchJSON<ApiEnvelope<OnboardingCompleteResult>>(
+              "/api/accounts/onboarding/complete",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ onboarding_id: onboardingId }),
+              },
+            ).then((value) => ({ kind: "complete" as const, value })),
+            closeSignal.then(() => ({ kind: "closed" as const })),
+          ]);
+          if (completeRaced.kind !== "complete" || !isActive(modal)) return;
+          completed = readEnvelopeResult(completeRaced.value, "完成登录");
+        } catch (error) {
+          failOnboarding("账号创建失败，请重新获取二维码后重试", errorMessageOnboarding(error));
+          break;
+        }
+        const profileId = String(completed?.profile_id || "").trim();
         if (!profileId) {
-          throw new Error("完成登录失败：响应缺少 profile_id");
+          failOnboarding("账号创建失败：响应缺少 profile_id，请重新获取二维码后重试");
+          break;
         }
         onboardingFlowToken += 1; // 成功：使任何陈旧续作失效
-        result = { profile_id: profileId, created_new: Boolean(completed.created_new) };
+        result = { profile_id: profileId, created_new: Boolean(completed?.created_new) };
         terminal = true;
         if (statusEl) {
           statusEl.textContent = result.created_new
-            ? "账号登录成功，正在创建独立账号数据…正在切换账号并重启…"
-            : "该 B站账号已经存在，正在更新登录状态并切换…";
+            ? "账号创建成功，正在切换账号并重启…"
+            : "该 B站账号已存在，正在更新登录状态并切换…";
         }
       } else if (status === "scanned") {
         if (statusEl) statusEl.textContent = "已扫码，请在手机端确认登录";
@@ -454,12 +468,26 @@ export async function runOnboardingFlow(): Promise<void> {
     }
     window.setTimeout(() => modal.remove(), 2500);
     if (result) {
-      // 触发现有安全 restart（不热切）；重启后新 runtime 绑定目标 Profile。
-      await fetchJSON(`/api/profiles/${encodeURIComponent(result.profile_id)}/switch`, {
-        method: "POST",
-      }).catch(() => undefined);
-      showToast("账号已就绪，正在切换并重启…", "success");
-      await loadProfiles();
+      // complete 已写入 active pointer；switch 只触发 supervisor 优雅重启（不热切）。
+      let restartRequested = false;
+      try {
+        await fetchJSON(`/api/profiles/${encodeURIComponent(result.profile_id)}/switch`, {
+          method: "POST",
+        });
+        restartRequested = true;
+      } catch {
+        restartRequested = false;
+      }
+      if (restartRequested) {
+        showToast("账号已就绪，正在切换并重启…", "success");
+      } else {
+        showToast("账号已创建成功，但自动重启失败，请手动重启 Binggo。", "error");
+      }
+      try {
+        await loadProfiles();
+      } catch {
+        // 账号创建与重启请求已完成，列表刷新失败不得改变账号状态
+      }
       window.setTimeout(() => window.location.reload(), 3000);
     }
   } catch (error) {
