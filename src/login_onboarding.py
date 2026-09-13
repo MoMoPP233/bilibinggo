@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import shutil
@@ -29,7 +28,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-_logger = logging.getLogger("login_onboarding")
+try:
+    from src.app_logging import get_logger
+except ImportError:  # pragma: no cover
+    import logging
+
+    def get_logger(name: str) -> logging.Logger:
+        return logging.getLogger(name)
+
+_logger = get_logger("login_onboarding")
 
 from src.data_paths import (
     get_active_profile_path,
@@ -47,7 +54,6 @@ from src.profile_writer_lease import (
     profile_writer_lease,
 )
 from src.secure_files import write_text_secret
-import httpx
 
 _ACCOUNT_ID_RE = re.compile(r"^account-([1-9][0-9]*)$")
 _UID_RE = re.compile(r"(?:^|;\s*)DedeUserID=([^;\s]+)")
@@ -528,7 +534,22 @@ def onboarding_status_public(onboarding_id: str) -> dict[str, Any]:
 # QR 网络层（真实流程使用；测试通过注入/monkeypatch 保持离线）
 # ---------------------------------------------------------------------------
 
-_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+_ONBOARDING_COOKIE_REQUIRED_KEYS = ("SESSDATA", "bili_jct", "DedeUserID")
+
+
+def _log_poll_failure(onboarding_id: str, stage: str, exc: Exception) -> None:
+    """脱敏记录 poll 失败：短 session id + 类型 + HTTP 状态 + attempt，绝不记录 qrcode_key/Cookie。"""
+    http_status = getattr(exc, "http_status", None)
+    error_type = getattr(exc, "last_exception_type", "") or type(exc).__name__
+    attempts = int(getattr(exc, "attempts", 1) or 1)
+    _logger.warning(
+        "onboarding qr poll failed: session=%s stage=%s type=%s http_status=%s attempt=%s",
+        str(onboarding_id)[:8],
+        stage,
+        error_type,
+        http_status if http_status is not None else "-",
+        attempts,
+    )
 
 
 def onboarding_start_remote() -> dict[str, Any]:
@@ -544,7 +565,14 @@ def onboarding_start_remote() -> dict[str, Any]:
 
 
 def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
-    """轮询扫码状态；成功时 Cookie 只写入 staging session（不写任何 Profile）。"""
+    """轮询扫码状态；成功时 Cookie 只写入 staging session（不写任何 Profile）。
+
+    请求语义与 legacy QR poll 完全共享（PASSPORT_HEADERS/timeout/有限重试/4xx 分类）。
+    状态：0 → success（Cookie staging）；86090 → scanned（等待手机确认）；
+    86101 → waiting；86038/-2/86039 → expired；未知 → protocol_error 并结束。
+    """
+    from src import bilibili_login as blogin
+
     session = _read_session(onboarding_id)
     if session.get("status") in ("completed", "failed"):
         return onboarding_status_public(onboarding_id)
@@ -553,33 +581,81 @@ def onboarding_poll(onboarding_id: str) -> dict[str, Any]:
     qr_key = str(session.get("qr_key") or "")
     if not qr_key:
         raise OnboardingError("session_closed", "会话缺少 qr_key")
-    try:
-        with httpx.Client(follow_redirects=True, timeout=12.0) as client:
-            resp = client.get(
-                _QR_POLL_URL,
-                params={"qrcode_key": qr_key, "source": "main-fe-header"},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            status = (body or {}).get("data") or {}
-            state = status.get("code")
-            if state == 0:
-                from src import bilibili_login as blogin
 
-                cookie = blogin._collect_login_cookies(client, resp, body)
-                onboarding_store_scanned_cookie(onboarding_id, cookie, now=int(time.time()))
-                return {"onboarding_id": onboarding_id, "status": "scanned", "need_confirm": True}
-            if state in (-2, 86038, 86039):
-                onboarding_fail(onboarding_id, reason="二维码已过期")
-                return {"onboarding_id": onboarding_id, "status": "failed", "reason": "expired"}
-            if state in (86090, 86101, None):
-                return {"onboarding_id": onboarding_id, "status": "waiting"}
-            # 其它状态视为等待
+    client = blogin.create_passport_client()
+    try:
+        try:
+            body, resp = blogin.poll_qrcode_request(client, qr_key)
+        except blogin.QrPollError as exc:
+            _log_poll_failure(onboarding_id, "transport", exc)
+            if exc.category == "http_error":
+                raise OnboardingError(
+                    "poll_http_error",
+                    f"B站拒绝查询扫码状态（HTTP {exc.http_status}），请重新获取二维码",
+                ) from exc
+            if exc.category == "upstream_error":
+                raise OnboardingError(
+                    "poll_upstream_error",
+                    "暂时无法查询扫码状态，请重新获取二维码",
+                ) from exc
+            if exc.category == "protocol_error":
+                raise OnboardingError(
+                    "poll_protocol_error",
+                    "登录状态查询失败（B站响应异常），请重新获取二维码",
+                ) from exc
+            raise OnboardingError(
+                "poll_network_error",
+                "暂时无法查询扫码状态，请重新获取二维码",
+            ) from exc
+
+        state = blogin._poll_status(body)
+        if state == blogin.POLL_SUCCESS:
+            try:
+                raw_cookie = blogin._collect_login_cookies(client, resp, body)
+            except Exception as exc:  # noqa: BLE001 - Cookie 收集失败必须显式分类
+                _log_poll_failure(onboarding_id, "cookie", exc)
+                raise OnboardingError(
+                    "cookie_incomplete", "登录 Cookie 收集失败，请重新扫码"
+                ) from exc
+            missing = [
+                key
+                for key in _ONBOARDING_COOKIE_REQUIRED_KEYS
+                if not str(raw_cookie.get(key) or "").strip()
+            ]
+            if missing:
+                _logger.warning(
+                    "onboarding qr poll cookie incomplete: session=%s missing=%s",
+                    str(onboarding_id)[:8],
+                    ",".join(missing),
+                )
+                raise OnboardingError("cookie_incomplete", "登录 Cookie 不完整，请重新扫码")
+            essential = {k: v for k, v in raw_cookie.items() if k in blogin.ESSENTIAL_KEYS}
+            cookie_str = blogin.cookies_to_header(essential or raw_cookie)
+            onboarding_store_scanned_cookie(onboarding_id, cookie_str, now=int(time.time()))
+            return {"onboarding_id": onboarding_id, "status": "success", "need_confirm": True}
+
+        if state in (-2, blogin.POLL_EXPIRED, 86039):
+            onboarding_fail(onboarding_id, reason="expired")
+            return {"onboarding_id": onboarding_id, "status": "expired", "reason": "expired"}
+
+        if state == blogin.POLL_SCANNED:
+            return {"onboarding_id": onboarding_id, "status": "scanned"}
+
+        if state == blogin.POLL_WAITING:
             return {"onboarding_id": onboarding_id, "status": "waiting"}
-    except OnboardingError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise OnboardingError("poll_failed", f"扫码轮询失败（{type(exc).__name__}）") from exc
+
+        onboarding_fail(onboarding_id, reason="unknown_status")
+        _logger.warning(
+            "onboarding qr poll unknown status: session=%s status=%s",
+            str(onboarding_id)[:8],
+            state,
+        )
+        raise OnboardingError(
+            "poll_protocol_error",
+            f"登录状态查询失败（B站返回未知状态 {state}），请重新获取二维码",
+        )
+    finally:
+        client.close()
 
 
 def onboarding_qr_image_path(onboarding_id: str) -> Path:

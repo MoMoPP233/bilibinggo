@@ -33,6 +33,12 @@ PASSPORT_HEADERS = {
 }
 
 QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+
+PASSPORT_TIMEOUT_SECONDS = 20.0
+QR_POLL_TIMEOUT_SECONDS = 12.0
+QR_POLL_MAX_ATTEMPTS = 3
+QR_POLL_RETRY_BACKOFF_SECONDS = 0.4
 
 POLL_WAITING = 86101
 POLL_SCANNED = 86090
@@ -63,14 +69,15 @@ def _safe_response_body_summary(response: httpx.Response, limit: int = 200) -> s
     )
 
 
+def create_passport_client(*, timeout: float = PASSPORT_TIMEOUT_SECONDS) -> httpx.Client:
+    """统一的 passport 请求 client（PASSPORT_HEADERS + follow_redirects）。"""
+    return httpx.Client(headers=PASSPORT_HEADERS, follow_redirects=True, timeout=timeout)
+
+
 def generate_qrcode(client: httpx.Client | None = None) -> tuple[str, str]:
     """Generate one login QR payload without polling or writing Profile state."""
     owns_client = client is None
-    transport = client or httpx.Client(
-        headers=PASSPORT_HEADERS,
-        follow_redirects=True,
-        timeout=20.0,
-    )
+    transport = client or create_passport_client()
     try:
         try:
             response = transport.get(
@@ -307,28 +314,118 @@ def _request_json(
     raise BilibiliLoginError("网络请求失败，请检查网络后重试") from last_exc
 
 
-def _poll_request(
+class QrPollError(BilibiliLoginError):
+    """共享 QR 轮询失败（结构化分类，由 legacy/onboarding 各自映射为用户语义）。"""
+
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        attempts: int,
+        http_status: int | None = None,
+        last_exception: Exception | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = str(category)
+        self.attempts = int(attempts)
+        self.http_status = http_status
+        self.last_exception = last_exception
+
+    @property
+    def last_exception_type(self) -> str:
+        return type(self.last_exception).__name__ if self.last_exception is not None else ""
+
+
+def poll_qrcode_request(
     client: httpx.Client,
     qrcode_key: str,
+    *,
+    max_attempts: int = QR_POLL_MAX_ATTEMPTS,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[dict, httpx.Response]:
+    """共享 QR 轮询请求语义（legacy login 与 M7 onboarding 唯一实现）。
+
+    - 仅对 transport/timeout 与 HTTP 5xx 做有限重试（短退避）
+    - HTTP 4xx 立即失败并保留 http_status（不猜测重试）
+    - 非 JSON / 非对象响应 → protocol_error
+    """
+    attempts = max(1, int(max_attempts))
+    do_sleep = sleep or time.sleep
     last_exc: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(1, attempts + 1):
         try:
-            poll = client.get(
-                "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+            response = client.get(
+                QR_POLL_URL,
                 params={"qrcode_key": qrcode_key, "source": "main-fe-header"},
+                timeout=QR_POLL_TIMEOUT_SECONDS,
             )
-            poll.raise_for_status()
-            body = poll.json()
-            if not isinstance(body, dict):
-                raise ValueError("轮询响应不是 JSON 对象")
-            return body, poll
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
             last_exc = exc
-            if attempt + 1 < 3:
-                logger.warning("扫码轮询失败，重试 %s/3: %s", attempt + 1, exc)
-                time.sleep(0.4 * (attempt + 1))
-    raise BilibiliLoginError("扫码轮询失败，请检查网络后重试") from last_exc
+            status = int(exc.response.status_code)
+            if status < 500:
+                raise QrPollError(
+                    "http_error",
+                    f"B站拒绝扫码状态查询（HTTP {status}）",
+                    attempts=attempt,
+                    http_status=status,
+                    last_exception=exc,
+                ) from exc
+            if attempt < attempts:
+                logger.warning("扫码轮询上游异常，重试 %s/%s: status=%s", attempt, attempts, status)
+                do_sleep(QR_POLL_RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            raise QrPollError(
+                "upstream_error",
+                f"B站扫码状态查询异常（HTTP {status}）",
+                attempts=attempt,
+                http_status=status,
+                last_exception=exc,
+            ) from exc
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt < attempts:
+                logger.warning(
+                    "扫码轮询网络异常，重试 %s/%s: %s", attempt, attempts, type(exc).__name__
+                )
+                do_sleep(QR_POLL_RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            raise QrPollError(
+                "network_error",
+                "扫码轮询失败，请检查网络后重试",
+                attempts=attempt,
+                last_exception=exc,
+            ) from exc
+        try:
+            body = response.json()
+        except (ValueError, TypeError) as exc:
+            raise QrPollError(
+                "protocol_error",
+                "B站扫码状态响应不是有效 JSON",
+                attempts=attempt,
+                http_status=int(getattr(response, "status_code", 0) or 0) or None,
+                last_exception=exc,
+            ) from exc
+        if not isinstance(body, dict):
+            raise QrPollError(
+                "protocol_error",
+                "B站扫码状态响应不是 JSON 对象",
+                attempts=attempt,
+                http_status=int(getattr(response, "status_code", 0) or 0) or None,
+            )
+        return body, response
+    raise QrPollError(  # pragma: no cover - 防御性兜底
+        "network_error",
+        "扫码轮询失败，请检查网络后重试",
+        attempts=attempts,
+        last_exception=last_exc,
+    )
+
+
+def _poll_request(client: httpx.Client, qrcode_key: str) -> tuple[dict, httpx.Response]:
+    """legacy 兼容包装：与 onboarding 共享同一 QR poll 请求语义。"""
+    return poll_qrcode_request(client, qrcode_key)
 
 
 def _generate_qrcode_image(url: str, out_path: Path) -> bool:
@@ -385,7 +482,7 @@ def login_with_qrcode(
     on_status_change: Callable[[str, str], None] | None = None,
 ) -> str:
     ensure_user_dirs()
-    client = httpx.Client(headers=PASSPORT_HEADERS, follow_redirects=True, timeout=20.0)
+    client = create_passport_client()
 
     def _check_cancelled() -> None:
         if cancel_event and cancel_event.is_set():
@@ -437,7 +534,7 @@ def login_with_qrcode(
             body, poll = _poll_request(client, qrcode_key)
             status = _poll_status(body)
             if status != POLL_WAITING:
-                logger.info("扫码轮询 status=%s qrcode_key=%s…", status, qrcode_key[:12])
+                logger.info("扫码轮询 status=%s", status)
             else:
                 logger.debug("扫码轮询 status=%s", status)
 

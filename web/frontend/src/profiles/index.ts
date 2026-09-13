@@ -264,8 +264,41 @@ export function bindProfiles(): void {
 
 const onboardingStartBtn = document.getElementById("profile-onboarding-start") as HTMLButtonElement | null;
 
+const ONBOARDING_POLL_INTERVAL_MS = 2000;
+const ONBOARDING_MAX_POLL_ROUNDS = 120;
+const ONBOARDING_QR_TIMEOUT_MS = 15000;
+const ONBOARDING_APP_HINT = "请使用哔哩哔哩 App 扫码，并在手机端确认登录";
+
+let onboardingFlowToken = 0;
+
+type ApiEnvelope<T> = { ok?: boolean; result?: T };
+
+type OnboardingPollResult = {
+  onboarding_id?: string;
+  status?: string;
+  reason?: string;
+};
+
+type OnboardingCompleteResult = {
+  profile_id?: string;
+  created_new?: boolean;
+  reused_existing?: boolean;
+  display_name?: string;
+  uid?: string;
+  restart_required?: boolean;
+};
+
 function errorMessageOnboarding(error: unknown): string {
   return String(error && typeof error === "object" && "message" in error ? (error as { message: string }).message : error);
+}
+
+/** Backend onboarding routes 返回 {ok, result}；这里强制解包，缺 result 视为协议错误。 */
+function readEnvelopeResult<T>(response: ApiEnvelope<T> | null | undefined, action: string): T {
+  const result = response && typeof response === "object" ? response.result : undefined;
+  if (!result || typeof result !== "object") {
+    throw new Error(`${action}失败：响应缺少 result`);
+  }
+  return result;
 }
 
 async function sleepOnboarding(ms: number): Promise<void> {
@@ -275,22 +308,33 @@ async function sleepOnboarding(ms: number): Promise<void> {
 export async function runOnboardingFlow(): Promise<void> {
   if (mutating) return;
   mutating = true;
+  const flowToken = ++onboardingFlowToken;
   if (onboardingStartBtn) onboardingStartBtn.disabled = true;
-  let onboardingId = "";
+  let closeRequested = false;
+  let closeResolve: (() => void) | null = null;
+  const closeSignal = new Promise<void>((resolve) => {
+    closeResolve = resolve;
+  });
+  const requestClose = (): void => {
+    if (closeRequested) return;
+    closeRequested = true;
+    onboardingFlowToken += 1; // 本 flow 所有 in-flight 结果立即失效
+    closeResolve?.();
+  };
+  const isActive = (modal: HTMLElement): boolean =>
+    flowToken === onboardingFlowToken && !closeRequested && document.body.contains(modal);
+
   try {
-    const response = await fetchJSON<{
-      ok: boolean;
-      result: { onboarding_id: string; qr_url: string };
-    }>(
+    const startResponse = await fetchJSON<ApiEnvelope<{ onboarding_id: string; qr_url: string }>>(
       "/api/accounts/onboarding/start",
       { method: "POST" },
     );
-    const started = response.result;
-    if (!started?.onboarding_id) {
+    const started = readEnvelopeResult(startResponse, "创建扫码会话");
+    if (!started.onboarding_id) {
       throw new Error("创建扫码会话失败：响应缺少 onboarding_id");
     }
-    onboardingId = started.onboarding_id;
-    showToast("请在浏览器中完成扫码", "info");
+    const onboardingId = started.onboarding_id;
+    showToast(ONBOARDING_APP_HINT, "info");
     const modal = document.createElement("div");
     modal.className = "onboarding-qr-modal";
     modal.style.cssText =
@@ -299,13 +343,17 @@ export async function runOnboardingFlow(): Promise<void> {
       `<div class="panel" style="min-width:320px;text-align:center;padding:18px">
          <h3 class="section-title">扫码登录新账号</h3>
          <img id="onboarding-qr-img" alt="登录二维码" style="width:220px;height:220px;image-rendering:pixelated" />
-         <p class="caption" id="onboarding-status">等待扫码…</p>
+         <p class="caption" id="onboarding-status">${ONBOARDING_APP_HINT}</p>
          <button type="button" class="btn btn-ghost btn-compact btn-pill" id="onboarding-close">取消</button>
        </div>`;
     document.body.appendChild(modal);
     const img = modal.querySelector("#onboarding-qr-img") as HTMLImageElement | null;
     const statusEl = modal.querySelector("#onboarding-status");
     const closeBtn = modal.querySelector("#onboarding-close");
+    closeBtn?.addEventListener("click", () => {
+      requestClose();
+      modal.remove();
+    }, { once: true });
     const qrReady = await new Promise<boolean>((resolve) => {
       let settled = false;
       const finish = (ready: boolean): void => {
@@ -321,7 +369,7 @@ export async function runOnboardingFlow(): Promise<void> {
       };
       const timeoutId = window.setTimeout(
         () => fail("二维码加载超时，请关闭后重试。"),
-        15000,
+        ONBOARDING_QR_TIMEOUT_MS,
       );
       closeBtn?.addEventListener("click", () => {
         modal.remove();
@@ -339,44 +387,70 @@ export async function runOnboardingFlow(): Promise<void> {
       );
       img.src = `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/qr`;
     });
-    if (!qrReady) return;
+    if (!qrReady || !isActive(modal)) return;
 
     // 二维码确认展示后才轮询；只使用 onboarding_id，绝不接触 Cookie/UID。
-    let result: { profile_id: string; created_new: boolean; reused_existing: boolean } | null = null;
+    let result: { profile_id: string; created_new: boolean } | null = null;
     let terminal = false;
-    for (let round = 0; round < 120 && !terminal; round += 1) {
-      await sleepOnboarding(2000);
-      if (!document.body.contains(modal)) break;
-      const poll = await fetchJSON<{ status: string; need_confirm?: boolean }>(
-        `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/poll`,
-        { method: "POST" },
-      );
-      if (poll.status === "scanned") {
-        if (statusEl) statusEl.textContent = "扫码成功，正在确认…";
-        const completed = await fetchJSON<{
-          profile_id: string;
-          created_new: boolean;
-          reused_existing: boolean;
-          display_name: string;
-          uid: string;
-          restart_required: boolean;
-        }>(`/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/complete`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ onboarding_id: onboardingId }),
-        });
-        result = completed;
+    for (let round = 0; round < ONBOARDING_MAX_POLL_ROUNDS && !terminal; round += 1) {
+      await Promise.race([sleepOnboarding(ONBOARDING_POLL_INTERVAL_MS), closeSignal]);
+      if (!isActive(modal)) return;
+      const pollRaced = await Promise.race([
+        fetchJSON<ApiEnvelope<OnboardingPollResult>>(
+          `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/poll`,
+          { method: "POST" },
+        ).then((value) => ({ kind: "poll" as const, value })),
+        closeSignal.then(() => ({ kind: "closed" as const })),
+      ]);
+      if (pollRaced.kind !== "poll" || !isActive(modal)) return;
+      const poll = readEnvelopeResult(pollRaced.value, "登录状态查询");
+      const status = String(poll.status || "");
+      if (status === "success") {
+        if (statusEl) statusEl.textContent = "登录成功，正在完成账号创建…";
+        const completeRaced = await Promise.race([
+          fetchJSON<ApiEnvelope<OnboardingCompleteResult>>(
+            `/api/accounts/onboarding/${encodeURIComponent(onboardingId)}/complete`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ onboarding_id: onboardingId }),
+            },
+          ).then((value) => ({ kind: "complete" as const, value })),
+          closeSignal.then(() => ({ kind: "closed" as const })),
+        ]);
+        if (completeRaced.kind !== "complete" || !isActive(modal)) return;
+        const completed = readEnvelopeResult(completeRaced.value, "完成登录");
+        const profileId = String(completed.profile_id || "").trim();
+        if (!profileId) {
+          throw new Error("完成登录失败：响应缺少 profile_id");
+        }
+        onboardingFlowToken += 1; // 成功：使任何陈旧续作失效
+        result = { profile_id: profileId, created_new: Boolean(completed.created_new) };
         terminal = true;
         if (statusEl) {
-          statusEl.textContent = completed.created_new
+          statusEl.textContent = result.created_new
             ? "账号登录成功，正在创建独立账号数据…正在切换账号并重启…"
             : "该 B站账号已经存在，正在更新登录状态并切换…";
         }
-      } else if (poll.status === "failed" || poll.status === "expired") {
+      } else if (status === "scanned") {
+        if (statusEl) statusEl.textContent = "已扫码，请在手机端确认登录";
+      } else if (status === "waiting") {
+        // 正常等待：不提示错误
+      } else if (status === "expired") {
         terminal = true;
-        if (statusEl) statusEl.textContent = "登录失败或二维码已过期，请重试。";
+        if (statusEl) statusEl.textContent = "二维码已过期，请重新获取";
         modal.querySelector("#onboarding-qr-img")?.remove();
+      } else if (status === "failed") {
+        terminal = true;
+        if (statusEl) statusEl.textContent = "登录失败，请重新获取二维码";
+        modal.querySelector("#onboarding-qr-img")?.remove();
+      } else {
+        throw new Error("登录状态查询失败：响应缺少有效状态");
       }
+    }
+    if (!terminal) {
+      if (statusEl) statusEl.textContent = "登录超时，请重新获取二维码";
+      showToast("登录超时，请重新获取二维码", "error");
     }
     window.setTimeout(() => modal.remove(), 2500);
     if (result) {

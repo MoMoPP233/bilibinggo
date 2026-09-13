@@ -637,6 +637,20 @@ class OnboardingCompleteRequest(BaseModel):
     nickname: str = ""
 
 
+# V28：onboarding poll 错误分类 → HTTP 语义（上游网络/5xx=503，平台拒绝/协议=502）
+_ONBOARDING_POLL_ERROR_MAP: dict[str, tuple[ErrorCode, int | None]] = {
+    "session_missing": (ErrorCode.NOT_FOUND, None),
+    "session_expired": (ErrorCode.NOT_FOUND, None),
+    "session_closed": (ErrorCode.VALIDATION_ERROR, None),
+    "session_incomplete": (ErrorCode.VALIDATION_ERROR, None),
+    "poll_network_error": (ErrorCode.INTERNAL, 503),
+    "poll_upstream_error": (ErrorCode.INTERNAL, 503),
+    "poll_http_error": (ErrorCode.INTERNAL, 502),
+    "poll_protocol_error": (ErrorCode.INTERNAL, 502),
+    "cookie_incomplete": (ErrorCode.INTERNAL, 502),
+}
+
+
 @app.post("/api/accounts/onboarding/start", tags=["stable"])
 def api_onboarding_start() -> dict[str, Any]:
     from src.login_onboarding import OnboardingError, onboarding_start_remote
@@ -679,7 +693,10 @@ def api_onboarding_poll(onboarding_id: str) -> dict[str, Any]:
     try:
         return {"ok": True, "result": onboarding_poll(onboarding_id)}
     except OnboardingError as exc:
-        raise AppError(ErrorCode.NOT_FOUND, str(exc)) from exc
+        code, status_code = _ONBOARDING_POLL_ERROR_MAP.get(
+            exc.code, (ErrorCode.INTERNAL, None)
+        )
+        raise AppError(code, str(exc), status_code=status_code) from exc
 
 
 @app.post("/api/accounts/onboarding/complete", tags=["stable"])
