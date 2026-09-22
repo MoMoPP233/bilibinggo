@@ -22,10 +22,10 @@ _PROXY_PAIRS = (
     ("HTTP_PROXY", "http_proxy"),
     ("HTTPS_PROXY", "https_proxy"),
     ("ALL_PROXY", "all_proxy"),
+    ("NO_PROXY", "no_proxy"),
 )
-# Windows 环境变量大小写不敏感：内部统一以小写规范名保存/恢复，避免同变量双写互相覆盖。
-_PROXY_ENV_KEYS = ("http_proxy", "https_proxy", "all_proxy")
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"})
+_NO_PROXY_ALL = "*"
 
 
 class ExternalNetworkBlocked(RuntimeError):
@@ -72,6 +72,7 @@ def _check_target(*, family: int, address: Any, what: str) -> None:
 
 _orig_connect = socket.socket.connect
 _orig_connect_ex = socket.socket.connect_ex
+_orig_create_connection = socket.create_connection
 _orig_getaddrinfo = socket.getaddrinfo
 _orig_gethostbyname = socket.gethostbyname
 _orig_gethostbyname_ex = socket.gethostbyname_ex
@@ -86,6 +87,31 @@ def _guarded_connect(self: socket.socket, address: Any, *args: Any, **kwargs: An
 def _guarded_connect_ex(self: socket.socket, address: Any, *args: Any, **kwargs: Any) -> int:
     _check_target(family=getattr(self, "family", socket.AF_INET), address=address, what="connect_ex")
     return _orig_connect_ex(self, address, *args, **kwargs)
+
+
+def _guarded_create_connection(
+    address: Any,
+    timeout: float | None = socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: Any = None,
+) -> socket.socket:
+    """Reject non-loopback targets before create_connection performs DNS."""
+    if not isinstance(address, tuple) or not address:
+        raise ExternalNetworkBlocked(
+            f"External network access is forbidden in tests: "
+            f"create_connection bad address={address!r}"
+        )
+    kind = _host_kind(str(address[0]) if address[0] is not None else None)
+    if kind is not None:
+        raise ExternalNetworkBlocked(
+            f"External network access is forbidden in tests: "
+            f"host={kind} port={address[1]} create_connection. "
+            "Mock/fake this request instead."
+        )
+    return _orig_create_connection(
+        address,
+        timeout=timeout,
+        source_address=source_address,
+    )
 
 
 def _guarded_getaddrinfo(
@@ -132,14 +158,17 @@ def install_offline_guard() -> None:
     """安装 fail-closed guard（幂等）。在 pytest_configure 中最早调用。"""
     global _installed
     if _installed:
+        _force_no_proxy()
         return
     _installed = True
     socket.socket.connect = _guarded_connect  # type: ignore[method-assign]
     socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign]
+    socket.create_connection = _guarded_create_connection
     socket.getaddrinfo = _guarded_getaddrinfo
     socket.gethostbyname = _guarded_gethostbyname
     socket.gethostbyname_ex = _guarded_gethostbyname_ex
     _strip_proxy_env()
+    _force_no_proxy()
 
 
 def strip_proxy_env() -> dict[str, str | None]:
@@ -161,6 +190,12 @@ def strip_proxy_env() -> dict[str, str | None]:
 
 def _strip_proxy_env() -> None:
     _orig_proxy_env.update(strip_proxy_env())
+
+
+def _force_no_proxy() -> None:
+    """Disable environment/system proxies without changing user settings."""
+    os.environ["NO_PROXY"] = _NO_PROXY_ALL
+    os.environ["no_proxy"] = _NO_PROXY_ALL
 
 
 def restore_proxy_env() -> None:
