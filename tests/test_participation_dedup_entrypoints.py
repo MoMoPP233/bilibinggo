@@ -173,11 +173,13 @@ def test_completed_dedup_skip_reason_survives_another_target_failure(monkeypatch
     monkeypatch.setattr(actions, "_execute_participate", execute)
     cancel = threading.Event()
 
-    with pytest.raises(RuntimeError, match="真正的参与失败"):
-        actions.run_action("participate_triple", {}, on_progress=on_progress, cancel_event=cancel)
+    payload = actions.run_action("participate_triple", {}, on_progress=on_progress, cancel_event=cancel)
 
-    assert cancel.is_set()
+    assert cancel.is_set() is False
     assert skip_reported.is_set()
+    assert payload["ok"] is True
+    assert payload["result"]["skipped_count"] == 1
+    assert payload["result"]["failed"] == 1
     assert f"需确认目标: {skip_message}" in events[-1]["message"]
     assert "需确认目标: 已取消" not in events[-1]["message"]
     assert "需确认目标: 已停止" not in events[-1]["message"]

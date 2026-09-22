@@ -6,6 +6,7 @@ import pytest
 
 from web.actions import run_action
 from web.activity_service import (
+    TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
     build_triple_progress_plan,
     participate_step_budget,
     pick_triple_participate_targets,
@@ -225,7 +226,7 @@ def test_run_action_participate_triple_concurrent(monkeypatch: pytest.MonkeyPatc
     assert len(payload["result"]["items"]) == 2
 
 
-def test_run_action_participate_triple_fail_fast_stops_other_targets() -> None:
+def test_run_action_participate_triple_local_failure_isolated() -> None:
     import time
 
     targets = [_row(_id(401), can_participate=True), _row(_id(402), can_participate=True)]
@@ -258,15 +259,18 @@ def test_run_action_participate_triple_fail_fast_stops_other_targets() -> None:
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
-        with pytest.raises(RuntimeError, match="模拟参与失败"):
-            run_action("participate_triple", {}, on_progress=on_progress)
+        payload = run_action("participate_triple", {}, on_progress=on_progress)
 
     combined = "\n".join(progress_messages)
     assert "失败" in combined
-    assert "已停止" in combined
+    assert "已停止" not in combined
+    assert payload["ok"] is True
+    assert payload["result"]["joined"] == 1
+    assert payload["result"]["failed"] == 1
+    assert payload["result"]["unknown"] == 0
 
 
-def test_run_action_participate_triple_rejects_joined_with_failed_core_action() -> None:
+def test_run_action_participate_triple_records_failed_core_action_as_item_failure() -> None:
     targets = [_row(_id(201), can_participate=True)]
     fake_payload = {
         "dynamic_id": _id(201),
@@ -284,8 +288,12 @@ def test_run_action_participate_triple_rejects_joined_with_failed_core_action() 
         patch("web.actions.refresh_local_activity_statuses"),
         patch("web.actions.BilibiliClient"),
     ):
-        with pytest.raises(RuntimeError):
-            run_action("participate_triple", {}, on_progress=lambda **_kwargs: None)
+        payload = run_action("participate_triple", {}, on_progress=lambda **_kwargs: None)
+
+    assert payload["ok"] is True
+    assert payload["result"]["joined"] == 0
+    assert payload["result"]["failed"] == 1
+    assert payload["result"]["items"][0]["result_class"] == "failed_local"
 
 
 def test_run_action_participate_triple_uses_mixed_progress_budget() -> None:
@@ -429,3 +437,70 @@ def test_run_action_participate_triple_cancelled_before_start() -> None:
     with patch("web.actions.pick_triple_participate_targets", return_value=[_row(_id(1), can_participate=True)]):
         with pytest.raises(ValueError, match="已取消"):
             run_action("participate_triple", {}, cancel_event=cancel_event)
+
+
+def test_triple_partial_failure_summary_and_following_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    targets = [_row(_id(i), can_participate=True) for i in (601, 602, 603)]
+    calls: list[str] = []
+
+    def fake_execute(dynamic_id: str, on_step, **_kwargs) -> dict:
+        calls.append(dynamic_id)
+        if dynamic_id == _id(601):
+            raise RuntimeError("活动已结束")
+        on_step(1, 5, "进行中", "like")
+        return {
+            "dynamic_id": dynamic_id,
+            "status": "joined",
+            "message": "完成",
+            "actions": _interact_actions(),
+            "lottery_type": "互动抽奖",
+        }
+
+    with (
+        patch("web.actions.pick_triple_participate_targets", return_value=targets),
+        patch("web.actions._execute_participate", side_effect=fake_execute),
+        patch("web.actions.resolve_participate_lottery_type", return_value="互动抽奖"),
+        patch("web.actions.invalidate_activity_cache"),
+        patch("web.actions.refresh_local_activity_statuses"),
+    ):
+        payload = run_action("participate_triple", {}, on_progress=lambda **_kwargs: None)
+
+    assert set(calls) == {_id(601), _id(602), _id(603)}
+    assert payload["ok"] is True
+    assert payload["result"]["joined"] == 2
+    assert payload["result"]["failed"] == 1
+    assert payload["result"]["skipped_count"] == 0
+    assert payload["result"]["unknown"] == 0
+    assert payload["result"]["not_attempted"] == 0
+    assert payload["result"]["items"][0]["result_class"] == "failed_local"
+
+
+def test_triple_local_failure_backoff_and_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from web import activity_service
+
+    rows = [
+        {**_row(_id(701), can_participate=True), "last_participation": {
+            "status": "failed",
+            "recorded_at": 1000,
+            "context_snapshot": {"result_class": "failed_local", "backoff_until": 1000 + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS},
+        }},
+        _row(_id(702), can_participate=True),
+        _row(_id(703), can_participate=True),
+    ]
+    monkeypatch.setattr(activity_service.time, "time", lambda: 1000 + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS - 1)
+    assert [row["dynamic_id"] for row in activity_service._pick_triple_from_rows(rows)] == [_id(702), _id(703)]
+
+    monkeypatch.setattr(activity_service.time, "time", lambda: 1000 + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS + 1)
+    assert [row["dynamic_id"] for row in activity_service._pick_triple_from_rows(rows)] == [_id(701), _id(702), _id(703)]
+
+
+def test_triple_unknown_barrier_never_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    from web import activity_service
+
+    row = {**_row(_id(801), can_participate=True), "last_participation": {
+        "status": "failed",
+        "recorded_at": 1000,
+        "context_snapshot": {"result_class": "unknown", "unknown_action": "favorite"},
+    }}
+    monkeypatch.setattr(activity_service.time, "time", lambda: 1000 + 10 * 24 * 3600)
+    assert activity_service._pick_triple_from_rows([row, _row(_id(802), can_participate=True)]) == [_row(_id(802), can_participate=True)]

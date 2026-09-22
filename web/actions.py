@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import io
+import json
 import re
 import threading
 import time
@@ -9,14 +10,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Callable, Mapping
 
+import httpx
+
 from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
+from src.bilibili_request_budget import RequestBudgetExhausted
 from src.bilibili_login import login_with_qrcode
 from src.log_span import PhaseSpanTracker, log_span
 from src.lottery_actions import ActionResult, ParticipationRiskBreaker, bind_participation_risk_breaker, current_participation_risk_breaker, reset_participation_risk_breaker
 from src.lottery_classifier import PARTICIPATABLE_TYPES
 from src.participation import participate_activity
-from src.participation_log import participation_succeeded
+from src.participation_log import (
+    TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
+    ParticipationActionRecord,
+    append_action_record,
+    participation_succeeded,
+)
 from src.platform_risk import risk_code_of as _risk_code_of
 from src.pipeline.refresh_all_pipeline import PipelineResult, run_new_links_pipeline, run_refresh_all_pipeline
 from src.sources import (
@@ -58,6 +67,14 @@ PARTICIPATION_DEDUP_SKIP_REASONS = frozenset({
 })
 
 
+class ParticipationItemFailure(RuntimeError):
+    """A single candidate failed without requesting batch cancellation."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = dict(payload)
+        super().__init__(str(payload.get("message") or "参与失败"))
+
+
 def _deserialize_payload_actions(payload: dict[str, Any]) -> list[ActionResult]:
     actions: list[ActionResult] = []
     for item in payload.get("actions") or []:
@@ -93,7 +110,7 @@ def _require_participate_success(payload: dict[str, Any]) -> None:
     if status == "skipped":
         raise RuntimeError(str(payload.get("message") or "该活动不可参与"))
     if status != "joined" or not _payload_joined_success(payload):
-        raise RuntimeError(str(payload.get("message") or "参与失败"))
+        raise ParticipationItemFailure(payload)
 
 
 def _is_participation_dedup_skip(payload: dict[str, Any]) -> bool:
@@ -109,6 +126,115 @@ def _normalize_participate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return {**payload, "skipped": True}
     _require_participate_success(payload)
     return dict(payload)
+
+
+def _triple_transport_unknown(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.HTTPError, json.JSONDecodeError)):
+        return True
+    return isinstance(exc, RuntimeError) and isinstance(
+        exc.__cause__, (httpx.HTTPError, json.JSONDecodeError)
+    )
+
+
+def _triple_global_stop_reason(
+    exc: BaseException,
+    cancel_event: threading.Event | None,
+) -> str | None:
+    if cancel_event is not None and cancel_event.is_set():
+        return "user_cancel"
+    if _risk_code_of(exc) is not None:
+        return "platform_risk"
+    if isinstance(exc, RequestBudgetExhausted):
+        return "budget_exhausted"
+    # Structured auth failures are global; ordinary RuntimeError messages are
+    # deliberately not treated as auth by substring matching.
+    code = getattr(exc, "code", None)
+    if code in {-101, 401}:
+        return "auth"
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 401:
+        return "auth"
+    text = str(exc)
+    if text.startswith("profile_writer_busy:") or any(
+        marker in text
+        for marker in (
+            "参与期间登录账号发生变化",
+            "运行期间 Profile 发生变化",
+            "运行中的 Profile 已变化",
+            "运行时 Profile 不存在",
+        )
+    ):
+        return "authority"
+    return None
+
+
+def _triple_failure_payload(
+    *,
+    dynamic_id: str,
+    lottery_type: str,
+    message: str,
+    result_class: str,
+    unknown_action: str | None = None,
+) -> dict[str, Any]:
+    recorded_at = int(time.time())
+    snapshot: dict[str, Any] = {"result_class": result_class}
+    if result_class == "failed_local":
+        snapshot["backoff_until"] = recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS
+    if unknown_action:
+        snapshot["unknown_action"] = unknown_action
+    return {
+        "dynamic_id": dynamic_id,
+        "lottery_type": lottery_type,
+        "status": "failed",
+        "message": sanitize_log(message)[:240] or "参与失败",
+        "action_text": "",
+        "actions": [],
+        "context_snapshot": snapshot,
+        "result_class": result_class,
+    }
+
+
+def _persist_triple_failure(
+    payload: dict[str, Any],
+    *,
+    recorded_at: int | None = None,
+) -> None:
+    """Persist a worker-level failure when the guarded service had no result."""
+    snapshot = payload.get("context_snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    result_class = str(payload.get("result_class") or snapshot.get("result_class") or "")
+    if result_class not in {"failed_local", "unknown"}:
+        return
+    stamp = int(recorded_at if recorded_at is not None else time.time())
+    snapshot = dict(snapshot)
+    if result_class == "failed_local":
+        snapshot.setdefault("backoff_until", stamp + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS)
+    payload["context_snapshot"] = snapshot
+    payload["result_class"] = result_class
+    try:
+        append_action_record(
+            ParticipationActionRecord(
+                recorded_at=stamp,
+                dynamic_id=str(payload.get("dynamic_id") or ""),
+                lottery_type=str(payload.get("lottery_type") or ""),
+                status="failed",
+                message=str(payload.get("message") or "参与失败"),
+                action_text="",
+                actions=list(payload.get("actions") or []),
+                context_snapshot=snapshot,
+            )
+        )
+    except Exception as exc:
+        # A local logging failure must not turn an item-local outcome into a
+        # batch cancellation. The normal service path persists under its DB
+        # lock; this fallback only covers worker-level exceptions in tests or
+        # unexpected wrappers.
+        logger.warning(
+            "记录三连单项失败结果失败 dynamic_id=%s error=%s",
+            payload.get("dynamic_id"),
+            sanitize_log(str(exc))[:160],
+        )
 
 
 def _participate_dynamic_payload(
@@ -1744,6 +1870,10 @@ def _run_action_impl(
                     "from_auto": from_auto,
                     "joined": 0,
                     "failed": 0,
+                    "unknown": 0,
+                    "not_attempted": 0,
+                    "skipped_count": 0,
+                    "stop_reason": None,
                     "items": [],
                     "targets": [],
                 },
@@ -1761,6 +1891,10 @@ def _run_action_impl(
                     "from_auto": from_auto,
                     "joined": 0,
                     "failed": 0,
+                    "unknown": 0,
+                    "not_attempted": 0,
+                    "skipped_count": 0,
+                    "stop_reason": None,
                     "items": [],
                     "targets": [],
                 },
@@ -1860,15 +1994,60 @@ def _run_action_impl(
             def on_step(step: int, total: int, message: str, _action_name: str) -> None:
                 _report_task_progress(dynamic_id, step, total, message)
 
-            payload = _participate_dynamic_payload(
-                dynamic_id,
-                on_step,
-                lottery_type_hint=target_lottery_type,
-            )
+            try:
+                payload = _participate_dynamic_payload(
+                    dynamic_id,
+                    on_step,
+                    lottery_type_hint=target_lottery_type,
+                )
+            except ParticipationItemFailure as exc:
+                payload = dict(exc.payload)
+                result_class = str(
+                    payload.get("result_class")
+                    or (payload.get("context_snapshot") or {}).get("result_class")
+                    or "failed_local"
+                )
+                if result_class not in {"unknown", "failed_local"}:
+                    result_class = "failed_local"
+                payload["result_class"] = result_class
+                _persist_triple_failure(payload)
+            except Exception as exc:
+                global_stop = _triple_global_stop_reason(exc, cancel_event)
+                if global_stop is not None:
+                    if active_breaker is not None and global_stop != "user_cancel":
+                        if global_stop == "platform_risk":
+                            code = _risk_code_of(exc)
+                            if code is not None:
+                                active_breaker.trigger(code)
+                        else:
+                            active_breaker.trigger_global_stop(exc)
+                    raise
+                result_class = "unknown" if _triple_transport_unknown(exc) else "failed_local"
+                payload = _triple_failure_payload(
+                    dynamic_id=dynamic_id,
+                    lottery_type=target_lottery_type or "",
+                    message=str(exc),
+                    result_class=result_class,
+                )
+                _persist_triple_failure(payload)
 
             skipped = _is_participation_dedup_skip(payload)
+            result_class = str(payload.get("result_class") or "")
+            if skipped:
+                result_class = "skipped"
+            elif not result_class:
+                result_class = "joined" if str(payload.get("status") or "") == "joined" else "failed_local"
+            payload["result_class"] = result_class
             with progress_lock:
-                task_states[dynamic_id] = str(payload.get("message") or ("已跳过" if skipped else "参与成功"))
+                if skipped:
+                    state_message = str(payload.get("message") or "已跳过")
+                elif result_class == "unknown":
+                    state_message = str(payload.get("message") or "结果未知，已锁定")
+                elif result_class == "failed_local" or payload.get("status") == "failed":
+                    state_message = str(payload.get("message") or "单项失败")
+                else:
+                    state_message = str(payload.get("message") or "参与成功")
+                task_states[dynamic_id] = state_message
                 completed_target_ids.add(dynamic_id)
             plan_entry = progress_plan.get(dynamic_id)
             if plan_entry:
@@ -1880,6 +2059,7 @@ def _run_action_impl(
                 "activity_title": title,
                 "lottery_type": str(payload.get("lottery_type") or target.get("lottery_type") or ""),
                 "payload": payload,
+                "result_class": result_class,
             }
 
         results: list[dict[str, Any]] = []
@@ -1897,55 +2077,94 @@ def _run_action_impl(
                     ): str(target.get("dynamic_id") or "")
                     for target in targets
                 }
-                failures: dict[str, Exception] = {}
+                global_failures: dict[str, Exception] = {}
                 try:
                     for future in as_completed(future_to_id):
                         dynamic_id = future_to_id[future]
+                        if future.cancelled():
+                            continue
                         if cancel_event and cancel_event.is_set():
                             raise ValueError("任务已取消")
                         try:
                             results.append(future.result())
                         except Exception as exc:
-                            # 记录全部失败而不是立刻抛出：并行 worker 的普通失败
-                            # 不能掩盖同批兄弟 worker 命中的第一条平台风控。
-                            failures[dynamic_id] = exc
-                            if cancel_event is not None:
-                                cancel_event.set()
-                            with progress_lock:
-                                task_states[dynamic_id] = f"失败：{exc}"
-                            _mark_other_tasks_stopped(dynamic_id, reason="已停止（其他活动失败）")
-                            _emit_triple_progress(log_append=f"{dynamic_id}：失败")
-                            for pending in future_to_id:
-                                pending.cancel()
+                            global_stop = _triple_global_stop_reason(exc, cancel_event)
+                            if global_stop is None:
+                                # Worker-level exceptions are converted inside
+                                # _participate_triple_target. Keep this guard
+                                # for an unexpected wrapper so one bad item
+                                # still cannot cancel its siblings.
+                                payload = _triple_failure_payload(
+                                    dynamic_id=dynamic_id,
+                                    lottery_type="",
+                                    message=str(exc),
+                                    result_class=(
+                                        "unknown" if _triple_transport_unknown(exc) else "failed_local"
+                                    ),
+                                )
+                                _persist_triple_failure(payload)
+                                results.append({
+                                    "dynamic_id": dynamic_id,
+                                    "activity_title": dynamic_id,
+                                    "lottery_type": "",
+                                    "payload": payload,
+                                    "result_class": payload["result_class"],
+                                })
+                                with progress_lock:
+                                    task_states[dynamic_id] = str(payload["message"])
+                                completed_target_ids.add(dynamic_id)
+                                _emit_triple_progress(log_append=f"{dynamic_id}：{payload['message']}")
+                            else:
+                                global_failures[dynamic_id] = exc
+                                # Future.cancel() only removes work that has
+                                # not started. Running workers remain governed
+                                # by the shared risk breaker before mutation.
+                                for pending in future_to_id:
+                                    if pending is not future:
+                                        pending.cancel()
+                                with progress_lock:
+                                    task_states[dynamic_id] = f"已停止：{global_stop}"
+                                _emit_triple_progress(log_append=f"{dynamic_id}：{global_stop}")
                 finally:
                     if cancel_event and cancel_event.is_set():
-                        _mark_other_tasks_stopped("", reason="已取消")
                         _emit_triple_progress()
-                if failures:
-                    # 风险优先级：同一批内有任何明确平台风控就以风控作为本 Job 结果。
+                if global_failures:
+                    # Risk has priority when multiple workers observe the same
+                    # breaker. Do not set cancel_event here: that event belongs
+                    # exclusively to user/scheduler cancellation.
                     risk_error = next(
-                        (exc for exc in failures.values() if _risk_code_of(exc) is not None),
+                        (exc for exc in global_failures.values() if _risk_code_of(exc) is not None),
                         None,
                     )
-                    raise risk_error if risk_error is not None else next(iter(failures.values()))
+                    raise risk_error if risk_error is not None else next(iter(global_failures.values()))
         finally:
             reset_participation_risk_breaker(_breaker_token)
 
-        refresh_local_activity_statuses()
         results.sort(key=lambda item: target_ids.index(item["dynamic_id"]))
         log_blocks = [format_participation_log(item["payload"]) for item in results]
         skipped_count = sum(_is_participation_dedup_skip(item["payload"]) for item in results)
-        joined_count = len(results) - skipped_count
+        unknown_count = sum(item.get("result_class") == "unknown" for item in results)
+        failed_count = sum(item.get("result_class") == "failed_local" for item in results)
+        joined_count = sum(item.get("result_class") == "joined" for item in results)
+        if joined_count:
+            refresh_local_activity_statuses()
         message = (
-            f"三连参与完成：成功 {joined_count} 个，已跳过 {skipped_count} 个"
-            if skipped_count else f"三连参与完成：{joined_count} 个活动全部成功"
+            f"三连参与完成：成功 {joined_count} 个，失败 {failed_count} 个，"
+            f"跳过 {skipped_count} 个，结果未知 {unknown_count} 个"
         )
-        progress(step=total_steps, total=total_steps, message=message, log_append=message)
-        logger.info("三连参与完成 joined=%s skipped=%s", joined_count, skipped_count)
+        detail_message = f"{message} | {_progress_snapshot()}"
+        progress(step=total_steps, total=total_steps, message=detail_message, log_append=message)
+        logger.info(
+            "三连参与完成 joined=%s skipped=%s failed=%s unknown=%s",
+            joined_count,
+            skipped_count,
+            failed_count,
+            unknown_count,
+        )
         invalidate_activity_cache()
         return {
             "ok": True,
-            "message": message,
+            "message": detail_message,
             "result": {
                 "targets": [
                     {
@@ -1958,7 +2177,10 @@ def _run_action_impl(
                 "items": [item["payload"] for item in results],
                 "joined": joined_count,
                 "skipped_count": skipped_count,
-                "failed": 0,
+                "failed": failed_count,
+                "unknown": unknown_count,
+                "not_attempted": 0,
+                "stop_reason": None,
                 "skipped": bool(results) and skipped_count == len(results),
                 "from_auto": from_auto,
             },

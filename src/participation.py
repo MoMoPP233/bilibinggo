@@ -11,6 +11,7 @@ import httpx
 
 from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient
+from src.bilibili_request_budget import RequestBudgetExhausted
 from src.lottery_actions import (
     ACTION_INTERVAL_SEC,
     DEFAULT_PARTICIPATE_TEXT,
@@ -24,6 +25,7 @@ from src.lottery_actions import (
     is_following,
     resolve_sender_uid,
     _api_code,
+    _raise_payload_auth,
     _raise_payload_risk,
     _risk_error_from_exc,
 )
@@ -36,6 +38,7 @@ from src.lottery_api import (
 from src.participation_log import (
     ParticipationActionRecord,
     ParticipationOutcome,
+    TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
     participation_succeeded,
     append_action_record_unlocked,
     serialize_actions,
@@ -60,6 +63,47 @@ RESERVE_RESERVED_STATUS = 2
 RESERVE_PARTICIPATE_STEPS = 2
 _execution_uid: ContextVar[str | None] = ContextVar("participation_uid", default=None)
 
+
+def _mutation_result_unknown(exc: BaseException) -> bool:
+    """Return whether a started mutation has an indeterminate remote result.
+
+    BilibiliClient wraps transport/JSON failures in RuntimeError with the
+    original exception as ``__cause__``.  Business responses are represented
+    as ActionResult(ok=False) and therefore do not enter this path.
+    """
+    if isinstance(exc, (httpx.HTTPError, json.JSONDecodeError)):
+        return True
+    return isinstance(exc, RuntimeError) and isinstance(
+        exc.__cause__, (httpx.HTTPError, json.JSONDecodeError)
+    )
+
+
+def _global_participation_reason(exc: BaseException) -> str | None:
+    if isinstance(exc, RequestBudgetExhausted):
+        return "budget_exhausted"
+    if getattr(exc, "code", None) in {-101, 401}:
+        return "auth"
+    if getattr(getattr(exc, "response", None), "status_code", None) == 401:
+        return "auth"
+    text = str(exc)
+    if text.startswith("profile_writer_busy:") or any(
+        marker in text
+        for marker in (
+            "参与期间登录账号发生变化",
+            "运行期间 Profile 发生变化",
+            "运行中的 Profile 已变化",
+            "运行时 Profile 不存在",
+        )
+    ):
+        return "authority"
+    return None
+
+
+def _check_shared_mutation_breaker() -> None:
+    breaker = current_participation_risk_breaker()
+    if breaker is not None:
+        breaker.check()
+
 @dataclass
 class ParticipateResult:
     dynamic_id: str
@@ -83,6 +127,9 @@ class ParticipateResult:
         if self.status == "skipped" and self.context_snapshot.get("dedup_reason"):
             payload["skipped"] = True
             payload["skip_reason"] = self.context_snapshot["dedup_reason"]
+        result_class = self.context_snapshot.get("result_class")
+        if result_class:
+            payload["result_class"] = result_class
         return payload
 
 
@@ -149,15 +196,23 @@ def _persist_result(
         result.actions,
         lottery_type=result.lottery_type,
     )
+    recorded_at = int(time.time())
+    snapshot = dict(result.context_snapshot or {})
+    if result.status == "failed" and snapshot.get("result_class") == "failed_local":
+        snapshot.setdefault(
+            "backoff_until",
+            recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
+        )
+    result.context_snapshot = snapshot
     record = ParticipationActionRecord(
-        recorded_at=int(time.time()),
+        recorded_at=recorded_at,
         dynamic_id=result.dynamic_id,
         lottery_type=result.lottery_type,
         status=result.status,
         message=result.message,
         action_text=result.action_text,
         actions=serialize_actions(result.actions),
-        context_snapshot=result.context_snapshot,
+        context_snapshot=snapshot,
     )
     with user_data_lock():
         append_action_record_unlocked(record, uid=_execution_uid.get())
@@ -243,7 +298,7 @@ def participate_five_action_lottery(
                 message="未找到互动抽奖信息",
                 action_text=text,
                 actions=[],
-                context_snapshot={},
+                context_snapshot={"result_class": "failed_local"},
             )
             _persist_result(result=result, persist=persist, dry_run=dry_run)
             return result
@@ -304,6 +359,11 @@ def participate_five_action_lottery(
     )
     reader.raise_if_failed()
     completed_actions: list[ActionResult] = []
+    mutation_action: list[str | None] = [None]
+
+    def on_mutation_start(action: str) -> None:
+        mutation_action[0] = action
+
     try:
         actions, context = execute_full_participation(
             reader,
@@ -314,31 +374,44 @@ def participate_five_action_lottery(
             on_step=on_step,
             context=context,
             on_action=completed_actions.append,
+            on_mutation_start=on_mutation_start,
         )
     except Exception as exc:
         # 明确平台风控：保留已完成动作的记录，触发共享 breaker，并把风险上抛给
         # JobRunner（唯一 6h cooldown 出口），不能被普通失败语义吞掉/覆盖。
         risk = _risk_error_from_exc(exc)
-        if risk is not None:
+        global_reason = _global_participation_reason(exc)
+        if risk is not None or global_reason is not None:
             breaker = current_participation_risk_breaker()
             if breaker is not None:
-                breaker.trigger(risk.code)
+                if risk is not None:
+                    breaker.trigger(risk.code)
             result = ParticipateResult(
                 dynamic_id=dynamic_id,
                 lottery_type=lottery_type,
                 status="failed",
-                message=str(risk),
+                message=str(risk or exc),
                 action_text=text,
                 actions=completed_actions,
-                context_snapshot=_context_snapshot(context, extra={**text_meta, "notice": _notice_snapshot(notice)}),
+                context_snapshot=_context_snapshot(
+                    context,
+                    extra={
+                        **text_meta,
+                        "notice": _notice_snapshot(notice),
+                        "result_class": "global_risk" if risk is not None else f"global_{global_reason}",
+                    },
+                ),
             )
             _persist_result(result=result, persist=persist, dry_run=dry_run)
-            raise risk from exc
+            if risk is not None:
+                raise risk from exc
+            raise
         # Keep completed actions even when a later request fails. Unexpected
         # exceptions still propagate after preserving the diagnostic record.
         message = str(exc).strip() or "参与失败"
         if "无法获取动态详情" in message:
             message = "无法获取动态详情，请稍后重试"
+        unknown = mutation_action[0] is not None and _mutation_result_unknown(exc)
         result = ParticipateResult(
             dynamic_id=dynamic_id,
             lottery_type=lottery_type,
@@ -346,7 +419,15 @@ def participate_five_action_lottery(
             message=message,
             action_text=text,
             actions=completed_actions,
-            context_snapshot=_context_snapshot(context, extra={**text_meta, "notice": _notice_snapshot(notice)}),
+            context_snapshot=_context_snapshot(
+                context,
+                extra={
+                    **text_meta,
+                    "notice": _notice_snapshot(notice),
+                    "result_class": "unknown" if unknown else "failed_local",
+                    **({"unknown_action": mutation_action[0]} if unknown else {}),
+                },
+            ),
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         if not isinstance(exc, (RuntimeError, httpx.HTTPError, json.JSONDecodeError)):
@@ -372,6 +453,8 @@ def participate_five_action_lottery(
         context,
         extra={"notice": _notice_snapshot(notice), **text_meta},
     )
+    if status == "failed":
+        snapshot.setdefault("result_class", "failed_local")
     result = ParticipateResult(
         dynamic_id=dynamic_id,
         lottery_type=lottery_type,
@@ -460,6 +543,7 @@ def _reserve_click(
     message = str(payload.get("message") or payload.get("msg") or "")
     if "已预约" in message:
         return ActionResult("reserve", True, "已预约")
+    _raise_payload_auth(payload, "预约")
     _raise_payload_risk(payload, "预约")
     return ActionResult("reserve", False, f"code={code} {message}".strip())
 
@@ -503,7 +587,7 @@ def participate_reserve_lottery(
             message=str(exc),
             action_text="",
             actions=[],
-            context_snapshot=_notice_snapshot(notice),
+            context_snapshot={**_notice_snapshot(notice), "result_class": "failed_local"},
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         return result
@@ -526,6 +610,7 @@ def participate_reserve_lottery(
                 "reserve_total": reserve_info["reserve_total"],
                 "button_status": reserve_info["button_status"],
                 "title": reserve_info["title"],
+                "result_class": "failed_local",
             },
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
@@ -533,6 +618,9 @@ def participate_reserve_lottery(
 
     referer = str(reserve_info["referer"])
     follow_risk: Exception | None = None
+    follow_global: Exception | None = None
+    follow_global_reason: str | None = None
+    follow_unknown = False
 
     if on_step:
         on_step(1, total_steps, f"正在关注（1/{total_steps}）", "follow")
@@ -551,13 +639,20 @@ def participate_reserve_lottery(
             if followed:
                 follow_action = ActionResult("follow", True, f"uid={sender_uid} 已关注，跳过")
             else:
+                _check_shared_mutation_breaker()
                 follow_action = follow_user(client, uid=sender_uid, csrf=csrf, referer=referer)
     except RuntimeError as exc:
         risk = _risk_error_from_exc(exc)
+        global_reason = _global_participation_reason(exc)
         if risk is not None:
             follow_risk = risk
             follow_action = ActionResult("follow", False, str(risk))
+        elif global_reason is not None:
+            follow_global = exc
+            follow_global_reason = global_reason
+            follow_action = ActionResult("follow", False, str(exc).strip() or "关注失败")
         else:
+            follow_unknown = _mutation_result_unknown(exc)
             follow_action = ActionResult("follow", False, str(exc).strip() or "关注失败")
 
     actions: list[ActionResult] = [follow_action]
@@ -574,6 +669,11 @@ def participate_reserve_lottery(
     )
 
     if not follow_action.ok:
+        follow_result_class = (
+            "global_risk" if follow_risk is not None else
+            (f"global_{follow_global_reason}" if follow_global is not None else
+             ("unknown" if follow_unknown else "failed_local"))
+        )
         result = ParticipateResult(
             dynamic_id=dynamic_id,
             lottery_type="预约抽奖",
@@ -581,7 +681,7 @@ def participate_reserve_lottery(
             message=follow_action.detail,
             action_text="",
             actions=actions,
-            context_snapshot=snapshot,
+            context_snapshot={**snapshot, "result_class": follow_result_class},
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         if follow_risk is not None:
@@ -589,14 +689,19 @@ def participate_reserve_lottery(
             if breaker is not None:
                 breaker.trigger(getattr(follow_risk, "code", -352))
             raise follow_risk
+        if follow_global is not None:
+            raise follow_global
         return result
 
+    reserve_mutation_started = False
     try:
         if not dry_run:
             time.sleep(ACTION_INTERVAL_SEC)
 
         if on_step:
             on_step(2, total_steps, f"正在预约（2/{total_steps}）", "reserve")
+        _check_shared_mutation_breaker()
+        reserve_mutation_started = True
         reserve_action = _reserve_click(
             client,
             dynamic_id=dynamic_id,
@@ -624,15 +729,34 @@ def participate_reserve_lottery(
             message=message,
             action_text="",
             actions=actions,
-            context_snapshot=snapshot,
+            context_snapshot={
+                **snapshot,
+                **({"result_class": "failed_local"} if status == "failed" else {}),
+            },
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         return result
     except Exception as exc:
         # 明确平台风控：保留已发起动作记录并触发共享 breaker，把风险上抛给 JobRunner。
         risk = _risk_error_from_exc(exc)
-        if risk is None:
-            raise
+        global_reason = _global_participation_reason(exc)
+        if risk is None and global_reason is None:
+            unknown = reserve_mutation_started and _mutation_result_unknown(exc)
+            result = ParticipateResult(
+                dynamic_id=dynamic_id,
+                lottery_type="预约抽奖",
+                status="failed",
+                message=str(exc).strip() or "预约失败",
+                action_text="",
+                actions=actions,
+                context_snapshot={
+                    **snapshot,
+                    "result_class": "unknown" if unknown else "failed_local",
+                    **({"unknown_action": "reserve"} if unknown else {}),
+                },
+            )
+            _persist_result(result=result, persist=persist, dry_run=dry_run)
+            return result
         breaker = current_participation_risk_breaker()
         if breaker is not None:
             breaker.trigger(risk.code)
@@ -640,13 +764,18 @@ def participate_reserve_lottery(
             dynamic_id=dynamic_id,
             lottery_type="预约抽奖",
             status="failed",
-            message=str(risk),
+            message=str(risk or exc),
             action_text="",
             actions=actions,
-            context_snapshot=snapshot,
+            context_snapshot={
+                **snapshot,
+                "result_class": "global_risk" if risk is not None else f"global_{global_reason}",
+            },
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
-        raise risk from exc
+        if risk is not None:
+            raise risk from exc
+        raise
 
 
 def _participate_activity_unlocked(

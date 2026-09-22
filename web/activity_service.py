@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from src.activity_status import resolve_activity_status
@@ -9,7 +10,10 @@ from src.db.uids import participation_uid
 from src.draw_reminder import matches_draw_window_filter
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
 from src.lottery_time import format_timestamp, is_activity_past_end, lottery_time_text
-from src.participation_log import load_action_entries_for_uid
+from src.participation_log import (
+    TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
+    load_action_entries_for_uid,
+)
 from src.participation_store import ParticipationRecord, load_participations
 from src.participation_guard import load_blocked_guard_ids
 from src.sources.common import is_valid_dynamic_id
@@ -161,6 +165,23 @@ def _normalize_activity(
     heat_missing = not repost_fetched or (
         repost_count == 0 and not item.get("repost_zero_confirmed")
     )
+    last_participation = (
+        {
+            "status": last_action.get("status"),
+            "message": last_action.get("message"),
+            "recorded_at": last_action.get("recorded_at"),
+            "actions": last_action.get("actions"),
+        }
+        if last_action
+        else None
+    )
+    # Keep the existing public shape stable for ordinary history records, but
+    # expose the structured triple outcome when one exists so selection can
+    # distinguish local backoff from an unknown mutation barrier.
+    if last_participation is not None:
+        context_snapshot = last_action.get("context_snapshot")
+        if isinstance(context_snapshot, dict) and context_snapshot.get("result_class"):
+            last_participation["context_snapshot"] = context_snapshot
     return {
         "dynamic_id": dynamic_id,
         "source_url": str(item.get("source_url") or ""),
@@ -178,14 +199,7 @@ def _normalize_activity(
         "skipped": bool(item.get("skipped")),
         "skip_reason": str(item.get("skip_reason") or ""),
         "can_participate": can_participate,
-        "last_participation": {
-            "status": last_action.get("status") if last_action else None,
-            "message": last_action.get("message") if last_action else None,
-            "recorded_at": last_action.get("recorded_at") if last_action else None,
-            "actions": last_action.get("actions") if last_action else None,
-        }
-        if last_action
-        else None,
+        "last_participation": last_participation,
     }
 
 
@@ -373,6 +387,24 @@ def _pick_triple_from_rows(
             continue
         if not row.get("can_participate"):
             continue
+        last = row.get("last_participation")
+        snapshot = last.get("context_snapshot") if isinstance(last, dict) else None
+        result_class = snapshot.get("result_class") if isinstance(snapshot, dict) else None
+        if result_class in {"unknown", "global_risk", "pending", "suspected"}:
+            # Unknown or guarded mutations are fail-closed barriers.  A local
+            # failure is handled below and may become eligible after backoff.
+            continue
+        if result_class == "failed_local":
+            try:
+                recorded_at = int(last.get("recorded_at") or 0) if isinstance(last, dict) else 0
+                backoff_until = int(
+                    snapshot.get("backoff_until")
+                    or (recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS if recorded_at else 0)
+                )
+            except (TypeError, ValueError):
+                backoff_until = 0
+            if backoff_until > int(time.time()):
+                continue
         dynamic_id = str(row.get("dynamic_id") or "").strip()
         if not is_valid_dynamic_id(dynamic_id) or dynamic_id in seen_ids:
             continue

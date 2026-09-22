@@ -159,8 +159,16 @@ class ParticipationRiskError(RuntimeError):
         self.code = int(code)
 
 
+class ParticipationAuthError(RuntimeError):
+    """The platform explicitly rejected the current login identity."""
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = int(code)
+        super().__init__(message)
+
+
 class ParticipationRiskBreaker:
-    """单次 Job / participation batch 内的共享风控断路器。
+    """单次 Job / participation batch 内的共享远程停止断路器。
 
     生命周期只属于当前这一次批量参与：由 run_action 创建并逐层传入，
     不落全局/Profile 状态，不污染下一个 Job、另一 Profile 或手工任务。
@@ -170,11 +178,19 @@ class ParticipationRiskBreaker:
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._code: int | None = None
+        self._stop_exception: BaseException | None = None
 
     def trigger(self, code: int) -> None:
         with self._lock:
             if not self._event.is_set():
                 self._code = int(code)
+                self._event.set()
+
+    def trigger_global_stop(self, exc: BaseException) -> None:
+        """Publish a non-risk stop so sibling workers fail closed before mutation."""
+        with self._lock:
+            if not self._event.is_set():
+                self._stop_exception = exc
                 self._event.set()
 
     def triggered(self) -> bool:
@@ -186,6 +202,9 @@ class ParticipationRiskBreaker:
             return
         with self._lock:
             code = self._code
+            stop_exception = self._stop_exception
+        if stop_exception is not None:
+            raise stop_exception
         raise ParticipationRiskError(
             code if code is not None else -352,
             f"API error {code if code is not None else -352}: 已检测到平台风控，停止当前目标",
@@ -213,6 +232,15 @@ def _raise_payload_risk(payload: dict, label: str) -> None:
     message = str(payload.get("message") or payload.get("msg") or "").strip()
     detail = f"{message}（{label}）" if message else f"{label}触发平台风控"
     raise ParticipationRiskError(code, f"API error {code}: {detail}")
+
+
+def _raise_payload_auth(payload: dict, label: str) -> None:
+    code = _api_code(payload)
+    if code not in {-101, 401}:
+        return
+    message = _api_message(payload)
+    detail = f"{message}（{label}）" if message else f"{label}登录失效"
+    raise ParticipationAuthError(code, f"API error {code}: {detail}")
 
 
 def _raise_exc_risk(exc: Exception, breaker: ParticipationRiskBreaker | None = None) -> None:
@@ -521,6 +549,7 @@ def like_dynamic(client: BilibiliClient, *, dynamic_id: str, csrf: str, referer:
         return ActionResult("like", True, "")
     if code == 65006:
         return ActionResult("like", True, "已赞过")
+    _raise_payload_auth(payload, "点赞")
     _raise_payload_risk(payload, "点赞")
     return ActionResult("like", False, f"code={code} {_api_message(payload)}".strip())
 
@@ -537,6 +566,7 @@ def follow_user(client: BilibiliClient, *, uid: int, csrf: str, referer: str) ->
         return ActionResult("follow", True, f"uid={uid}")
     if code == 22014:
         return ActionResult("follow", True, f"uid={uid} 已关注")
+    _raise_payload_auth(payload, "关注")
     _raise_payload_risk(payload, "关注")
     return ActionResult("follow", False, f"code={code} {_api_message(payload)}".strip())
 
@@ -586,6 +616,7 @@ def favorite_dynamic(
         return ActionResult("favorite", False, message or "收藏状态未确认，未继续查询")
     if code in (65006, 75008):
         return ActionResult("favorite", True, message or "已收藏")
+    _raise_payload_auth(payload, "收藏")
     _raise_payload_risk(payload, "收藏")
     return ActionResult("favorite", False, f"code={code} {message}".strip())
 
@@ -640,6 +671,7 @@ def repost_dynamic(
         return ActionResult("repost", True, content[:80])
     mark_repost_unknown(my_uid, dynamic_id)
     if isinstance(payload, dict):
+        _raise_payload_auth(payload, "转发")
         _raise_payload_risk(payload, "转发")
     detail = f"code={_api_code(payload)} {_api_message(payload)}" if isinstance(payload, dict) else "无效响应"
     return ActionResult("repost", False, f"转发结果未确认，已阻止自动重试：{detail}".strip())
@@ -665,6 +697,7 @@ def comment_dynamic(
         return ActionResult("comment", True, message[:80])
     if code == 12051:
         return ActionResult("comment", True, "已有相同评论")
+    _raise_payload_auth(payload, "评论")
     _raise_payload_risk(payload, "评论")
     return ActionResult("comment", False, f"code={code} {_api_message(payload)}".strip())
 
@@ -679,6 +712,7 @@ def execute_full_participation(
     on_step: Callable[[int, int, str, ActionName], None] | None = None,
     context: DynamicContext | None = None,
     on_action: Callable[[ActionResult], None] | None = None,
+    on_mutation_start: Callable[[ActionName], None] | None = None,
     risk_breaker: ParticipationRiskBreaker | None = None,
 ) -> tuple[list[ActionResult], DynamicContext]:
     text = (action_text or DEFAULT_PARTICIPATE_TEXT).strip() or DEFAULT_PARTICIPATE_TEXT
@@ -739,16 +773,22 @@ def execute_full_participation(
         """执行单个远程参与动作：风控即触发 breaker 并立即停止当前目标。"""
         if risk_breaker is not None:
             risk_breaker.check()
+        if on_mutation_start is not None:
+            # This callback runs immediately before the non-idempotent request.
+            # Callers use it to distinguish read failures from unknown writes.
+            on_mutation_start(current_action[0])
         try:
             append_action(action())
         except Exception as exc:
             _raise_exc_risk(exc, risk_breaker)
             raise
 
+    current_action: list[ActionName] = ["like"]
     report_step(1, "like")
     if context.liked:
         append_action(ActionResult("like", True, "已点赞，跳过"))
     else:
+        current_action[0] = "like"
         mutation(lambda: like_dynamic(client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
 
@@ -756,6 +796,7 @@ def execute_full_participation(
     if context.followed:
         append_action(ActionResult("follow", True, f"uid={context.sender_uid} 已关注，跳过"))
     else:
+        current_action[0] = "follow"
         mutation(lambda: follow_user(client, uid=context.sender_uid, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
 
@@ -765,6 +806,7 @@ def execute_full_participation(
     elif context.favorited:
         append_action(ActionResult("favorite", True, "已收藏，跳过"))
     else:
+        current_action[0] = "favorite"
         mutation(
             lambda: favorite_dynamic(
                 client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer,
@@ -777,6 +819,7 @@ def execute_full_participation(
     if context.reposted:
         append_action(ActionResult("repost", True, "已转发，跳过"))
     else:
+        current_action[0] = "repost"
         mutation(
             lambda: repost_dynamic(
                 client,
@@ -793,6 +836,7 @@ def execute_full_participation(
     if context.commented:
         append_action(ActionResult("comment", True, "已评论，跳过"))
     else:
+        current_action[0] = "comment"
         mutation(
             lambda: comment_dynamic(
                 client,

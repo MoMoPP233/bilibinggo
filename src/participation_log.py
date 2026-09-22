@@ -19,6 +19,9 @@ INTERACT_REQUIRED_ACTIONS = ("like", "follow", "favorite", "repost")
 RESERVE_REQUIRED_ACTIONS = ("follow", "reserve")
 COMMENT_OPTIONAL_ERROR_CODES = {12078}
 _MAX_ENTRIES_PER_UID = 500
+# A deterministic item-local failure should not monopolize the next few triple
+# slots, but it must remain retryable after a bounded delay.
+TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS = 60 * 60
 
 
 @dataclass
