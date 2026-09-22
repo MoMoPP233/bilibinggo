@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import Any
@@ -163,6 +164,32 @@ def known_activity_ids() -> set[str]:
     with session_scope() as session:
         rows = session.exec(select(ActivityRow.dynamic_id)).all()
         return {str(item) for item in rows if item}
+
+
+def known_activity_aliases() -> set[str]:
+    """Return observed wrapper IDs retained in activity payload metadata.
+
+    This is intentionally a local compatibility read.  It lets a canonical
+    re-observation honor an old wrapper row without rewriting or merging that
+    historical row.
+    """
+    aliases: set[str] = set()
+    with session_scope() as session:
+        rows = session.exec(select(ActivityRow.payload_json)).all()
+    for raw_payload in rows:
+        try:
+            payload = json.loads(raw_payload or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("observed_wrapper_dynamic_id", "observed_wrapper_ids"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                aliases.update(str(item).strip() for item in value if str(item).strip())
+            elif value:
+                aliases.add(str(value).strip())
+    return aliases
 
 
 def activity_exists(dynamic_id: str) -> bool:

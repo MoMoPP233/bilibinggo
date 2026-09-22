@@ -7,6 +7,7 @@
 - 风控（-352/-509/429/rate-limit/risk-control/风控/限流）向上抛，由 AutoScheduler 走全局 6h 冷却；
   不把风控当成“空 Feed / 0 条”。
 - 复用现有 run_new_links_pipeline（含去重、分类、详情、明确已结束过滤、入库），不另造分类器。
+- Following Feed 只补当前账号关注 Feed 中的非 forward 原创动态；自身动态与所有转发动态均跳过。
 - checkpoint 推进语义（V16）：只要本轮存在“仍需要以后重试的未完成候选”
   （正文不可读取），就保留进入本轮前的旧 checkpoint，让该候选下一轮可再次进入流水线；
   终态安全项（404 链接失效、充电/非抽奖等 skip、详情提取失败、扫描开始前已结束过滤、
@@ -18,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import re
 import tempfile
@@ -26,6 +28,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.bilibili_client import BilibiliClient
+from src.bilibili_auth import get_login_uid
+from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
 from src.pipeline.refresh_all_pipeline import run_new_links_pipeline
 from src.sources.common import opus_link
 
@@ -93,9 +97,40 @@ def following_feed_info() -> dict[str, Any]:
         "last_seen_dynamic_id": state.get("last_seen_dynamic_id"),
         "last_found": state.get("last_found"),
         "last_added": state.get("last_added"),
+        "accepted": int(state.get("accepted") or 0),
+        "inserted": int(state.get("inserted") or 0),
         "last_status": str(state.get("last_status") or "waiting"),
         "last_error": str(state.get("last_error") or ""),
+        "self_skipped": int(state.get("self_skipped") or 0),
+        "forward_unresolved_skipped": int(
+            state.get("forward_unresolved_skipped") or 0
+        ),
+        "forward_skipped": int(state.get("forward_skipped") or 0),
+        "canonical_duplicate_skipped": int(
+            state.get("canonical_duplicate_skipped") or 0
+        ),
     }
+
+
+def _feed_items(payload: object) -> list[tuple[str, dict[str, Any] | None]]:
+    """Return valid IDs with their first-party feed item when available."""
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    items = data.get("items") if isinstance(data, dict) else payload.get("items")
+    if not isinstance(items, list):
+        return []
+    result: list[tuple[str, dict[str, Any] | None]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        dynamic_id = str(item.get("id_str") or item.get("dynamic_id") or "").strip()
+        if not _VALID_DYNAMIC_ID.fullmatch(dynamic_id) or dynamic_id in seen:
+            continue
+        seen.add(dynamic_id)
+        result.append((dynamic_id, item))
+    return result
 
 
 def _item_ids(payload: object) -> list[str]:
@@ -103,25 +138,18 @@ def _item_ids(payload: object) -> list[str]:
 
     本轮不假定一定需要翻页参数/offset；V1 只处理第一页。
     """
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data")
-    items = data.get("items") if isinstance(data, dict) else payload.get("items")
-    if not isinstance(items, list):
-        return []
-    ids: list[str] = []
-    seen: set[str] = set()
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        dynamic_id = str(item.get("id_str") or "").strip()
-        if not _VALID_DYNAMIC_ID.fullmatch(dynamic_id):
-            continue
-        if dynamic_id in seen:
-            continue
-        seen.add(dynamic_id)
-        ids.append(dynamic_id)
-    return ids
+    return [dynamic_id for dynamic_id, _ in _feed_items(payload)]
+
+
+def _pipeline_accepts_identity_map() -> bool:
+    try:
+        signature = inspect.signature(run_new_links_pipeline)
+    except (TypeError, ValueError):
+        return False
+    return "identity_by_raw" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
 
 
 def _slice_before_checkpoint(ids: list[str], checkpoint: str | None) -> list[str]:
@@ -204,6 +232,21 @@ def scan_following_feed(
         state["last_scan_at"] = now
         state["last_found"] = 0
         state["last_added"] = 0
+        state["accepted"] = 0
+        state["inserted"] = 0
+        for key in (
+            "self_skipped",
+            "forward_unresolved_skipped",
+            "forward_skipped",
+            "canonical_duplicate_skipped",
+        ):
+            state[key] = 0
+        for key in (
+            "unfollowed_original_skipped",
+            "relationship_unavailable_skipped",
+            "relationship_snapshot_status",
+        ):
+            state.pop(key, None)
         _write_state(state)
         if on_progress is not None:
             on_progress(1, 1, message)
@@ -223,21 +266,75 @@ def scan_following_feed(
     if items and not _item_ids(payload):
         return fail("关注动态 Feed 返回非空列表但无法解析出任何有效动态 ID")
 
-    page_ids = _item_ids(payload)[:FOLLOW_FEED_MAX_ITEMS]
+    page_items = _feed_items(payload)[:FOLLOW_FEED_MAX_ITEMS]
+    page_ids = [dynamic_id for dynamic_id, _ in page_items]
     checkpoint = state.get("last_seen_dynamic_id")
     processed = _slice_before_checkpoint(page_ids, str(checkpoint) if checkpoint else None)
+    item_by_id = {dynamic_id: item for dynamic_id, item in page_items}
+
+    # Following Feed is already scoped by the platform to the current account's
+    # followed-feed.  V33 deliberately does not inspect relationship fields or
+    # chase repost originals: only non-forward originals are in this source's
+    # scope.
+    current_uid = get_login_uid()
+    identity_by_raw: dict[str, CanonicalIdentity] = {}
+    for dynamic_id in processed:
+        item = item_by_id.get(dynamic_id)
+        if not isinstance(item, dict) or not ("type" in item or "modules" in item):
+            continue
+        identity = resolve_dynamic_identity(item, dynamic_id)
+        identity_by_raw[dynamic_id] = identity
+    if identity_by_raw and current_uid is None:
+        return fail("无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint")
+
+    self_skipped = 0
+    forward_unresolved_skipped = 0
+    forward_skipped = 0
+    canonical_duplicate_skipped = 0
+    accepted_ids: list[str] = []
+    accepted_identities: dict[str, CanonicalIdentity] = {}
+    canonical_seen: set[str] = set()
+    for dynamic_id in processed:
+        identity = identity_by_raw.get(dynamic_id)
+        # Older feed fixtures only contain id_str.  Keep their legacy input
+        # shape; detailed pipeline resolution still applies to those IDs.
+        if identity is None:
+            accepted_ids.append(dynamic_id)
+            continue
+        if current_uid is not None and identity.wrapper_author_uid == str(current_uid):
+            self_skipped += 1
+            if identity.is_forward:
+                forward_skipped += 1
+            continue
+        if identity.is_forward:
+            forward_skipped += 1
+            if identity.unresolved_reason:
+                forward_unresolved_skipped += 1
+            continue
+        canonical_id = identity.canonical_dynamic_id
+        if canonical_id and canonical_id in canonical_seen:
+            # The public pipeline also dedupes after resolution; this local
+            # check avoids a needless classification request for the wrapper.
+            canonical_duplicate_skipped += 1
+            continue
+        if canonical_id:
+            canonical_seen.add(canonical_id)
+        accepted_ids.append(dynamic_id)
+        accepted_identities[dynamic_id] = identity
 
     scan_started_at = int(time.time())
-    urls = [opus_link(dynamic_id) for dynamic_id in processed]
+    urls = [opus_link(dynamic_id) for dynamic_id in accepted_ids]
     if on_progress is not None:
         on_progress(0, max(1, len(urls)), f"关注动态共 {len(urls)} 条新候选，正在复用公共流水线…")
 
-    pipeline = run_new_links_pipeline(
-        urls,
-        workers=1,
-        scan_started_at=scan_started_at,
-        on_progress=on_progress,
-    )
+    pipeline_kwargs: dict[str, Any] = {
+        "workers": 1,
+        "scan_started_at": scan_started_at,
+        "on_progress": on_progress,
+    }
+    if accepted_identities and _pipeline_accepts_identity_map():
+        pipeline_kwargs["identity_by_raw"] = accepted_identities
+    pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
 
     found = len(processed)
     added = int(getattr(pipeline, "persisted_count", 0) or 0)
@@ -272,6 +369,18 @@ def scan_following_feed(
     state["last_scan_at"] = now
     state["last_found"] = found
     state["last_added"] = added
+    state["accepted"] = len(accepted_ids)
+    state["inserted"] = added
+    state["self_skipped"] = self_skipped
+    state["forward_unresolved_skipped"] = forward_unresolved_skipped
+    state["forward_skipped"] = forward_skipped
+    state["canonical_duplicate_skipped"] = canonical_duplicate_skipped
+    for key in (
+        "unfollowed_original_skipped",
+        "relationship_unavailable_skipped",
+        "relationship_snapshot_status",
+    ):
+        state.pop(key, None)
     state["last_status"] = "success"
     state["last_error"] = ""
     _write_state(state)
@@ -284,7 +393,13 @@ def scan_following_feed(
         "status": "success",
         "scanned_items": len(page_ids),
         "found": found,
+        "accepted": len(accepted_ids),
         "added": added,
+        "inserted": added,
         "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0),
+        "self_skipped": self_skipped,
+        "forward_unresolved_skipped": forward_unresolved_skipped,
+        "forward_skipped": forward_skipped,
+        "canonical_duplicate_skipped": canonical_duplicate_skipped,
         "message": f"关注动态补漏完成：发现 {found} 条，新增 {added} 条",
     }

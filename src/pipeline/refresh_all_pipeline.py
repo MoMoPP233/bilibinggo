@@ -7,6 +7,7 @@ from typing import Any, Callable, Literal, Mapping
 from src.activity_store import append_activities, known_activity_ids
 from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
+from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
 from src.llm_resilience import (
     LlmProviderBreaker,
     LlmProviderUnavailable,
@@ -179,6 +180,7 @@ def run_new_links_pipeline(
     workers: int = 4,
     on_progress: ProgressCallback | None = None,
     scan_started_at: int | None = None,
+    identity_by_raw: Mapping[str, CanonicalIdentity] | None = None,
 ) -> PipelineResult:
     """Step 2～5：仅处理新链接（内存流转，末步落库）。
 
@@ -205,6 +207,27 @@ def run_new_links_pipeline(
         )
 
     participations = load_participations()
+    # Keep old raw wrapper evidence fail-closed while new canonical rows are
+    # introduced.  All of these stores are Profile-local.
+    protected_ids: set[str] = {
+        dynamic_id
+        for dynamic_id, record in participations.items()
+        if getattr(record, "user_status", "") == "已参加"
+    }
+    try:
+        from src.db.uids import participation_uid
+        from src.participation_guard import list_confirmed_guards, load_blocked_guard_ids
+
+        current_participation_uid = participation_uid()
+        protected_ids.update(load_blocked_guard_ids(current_participation_uid))
+        protected_ids.update(
+            record.dynamic_id
+            for record in list_confirmed_guards(current_participation_uid)
+        )
+    except Exception:
+        # A missing legacy guard table is handled by schema bootstrap; a read
+        # failure must not turn a source refresh into an unsafe auto-entry.
+        logger.debug("读取参与保护状态失败，继续使用可用的本地保护证据", exc_info=True)
     skip_reasons: dict[str, int] = {}
     tasks: list[tuple[str, LotteryType]] = []
     classify_outcome_by_id: dict[str, ClassifyOutcome] = {}
@@ -335,6 +358,64 @@ def run_new_links_pipeline(
             "partial_reason": partial_reason or (breaker.stop_reason if partial else ""),
         }
 
+    # Canonicalize only after classification has exposed the first-party
+    # detail item.  This keeps source-specific Following policy above the
+    # shared pipeline while making every source converge on one DB identity.
+    canonical_tasks: list[tuple[str, LotteryType]] = []
+    canonical_outcomes: dict[str, ClassifyOutcome] = {}
+    canonical_identity_by_id: dict[str, CanonicalIdentity] = {}
+    canonical_seen: set[str] = set()
+    canonical_duplicate_count = 0
+    known_after_classification = known_activity_ids()
+    legacy_alias_ids: set[str] = set()
+    try:
+        from src.activity_store import known_activity_aliases
+
+        legacy_alias_ids = known_activity_aliases()
+    except Exception:
+        logger.debug("读取活动历史 wrapper 别名失败，继续使用 canonical ID", exc_info=True)
+
+    for raw_dynamic_id, lottery_type in tasks:
+        outcome = classify_outcome_by_id[raw_dynamic_id]
+        identity = (identity_by_raw or {}).get(raw_dynamic_id)
+        if identity is None:
+            identity = resolve_dynamic_identity(outcome.detail_item, raw_dynamic_id)
+        if identity.is_forward and identity.unresolved_reason:
+            skip_reasons[identity.unresolved_reason] = (
+                skip_reasons.get(identity.unresolved_reason, 0) + 1
+            )
+            continue
+        canonical_id = identity.canonical_dynamic_id or raw_dynamic_id
+        if not canonical_id:
+            skip_reasons["forward_identity_unresolved"] = (
+                skip_reasons.get("forward_identity_unresolved", 0) + 1
+            )
+            continue
+        if (
+            canonical_id in known_after_classification
+            or canonical_id in canonical_seen
+            or raw_dynamic_id in legacy_alias_ids
+            or raw_dynamic_id in protected_ids
+            or canonical_id in protected_ids
+        ):
+            canonical_duplicate_count += 1
+            continue
+        canonical_seen.add(canonical_id)
+        outcome.dynamic_id = canonical_id
+        if identity.canonical_item is not None:
+            outcome.detail_item = identity.canonical_item
+        if canonical_id != raw_dynamic_id:
+            # A notice keyed by the wrapper cannot safely be reused for the
+            # original.  The enrichment stage will resolve the canonical ID.
+            outcome.lottery_notice = None
+            outcome.notice_business_type = None
+            outcome.notice_business_id = None
+        canonical_tasks.append((canonical_id, lottery_type))
+        canonical_outcomes[canonical_id] = outcome
+        canonical_identity_by_id[canonical_id] = identity
+
+    tasks = canonical_tasks
+    classify_outcome_by_id = canonical_outcomes
     worker_count = max(1, min(workers, len(tasks) if tasks else 1))
 
     if not tasks:
@@ -352,7 +433,7 @@ def run_new_links_pipeline(
             persisted_count=0,
             skip_reasons=skip_reasons,
             invalid_link_count=dedupe.invalid_link_count,
-            duplicate_link_count=dedupe.duplicate_link_count,
+            duplicate_link_count=dedupe.duplicate_link_count + canonical_duplicate_count,
             existing_count=dedupe.existing_count,
             non_lottery_count=non_lottery_count,
             other_skipped_count=other_skipped_count,
@@ -489,6 +570,18 @@ def run_new_links_pipeline(
                         )
 
                     row = apply_initial_status(activity.to_dict())
+                    identity = canonical_identity_by_id.get(activity.dynamic_id)
+                    if identity is not None and (
+                        identity.raw_dynamic_id != identity.canonical_dynamic_id
+                        or identity.canonical_author_uid is not None
+                    ):
+                        row["canonical_author_uid"] = identity.canonical_author_uid
+                        row["source_kind"] = "canonicalized_dynamic"
+                        if identity.raw_dynamic_id != identity.canonical_dynamic_id:
+                            row["observed_wrapper_dynamic_id"] = (
+                                identity.observed_wrapper_dynamic_id
+                            )
+                            row["observed_wrapper_author_uid"] = identity.wrapper_author_uid
                     enriched_rows.append(row)
                     done += 1
 
@@ -539,7 +632,7 @@ def run_new_links_pipeline(
         persisted_count=persisted,
         skip_reasons=skip_reasons,
         invalid_link_count=dedupe.invalid_link_count,
-        duplicate_link_count=dedupe.duplicate_link_count,
+        duplicate_link_count=dedupe.duplicate_link_count + canonical_duplicate_count,
         existing_count=dedupe.existing_count,
         non_lottery_count=non_lottery_count,
         other_skipped_count=other_skipped_count,
