@@ -45,6 +45,12 @@ def test_get_summary_counts_are_consistent(tmp_path, monkeypatch) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr("web.activity_service.load_participations", lambda: {})
     monkeypatch.setattr("web.activity_service.load_payload", lambda: payload)
+    monkeypatch.setattr("web.activity_service._load_blocked_activity_ids", lambda: set())
+    monkeypatch.setattr("web.activity_service._load_source_snapshot", lambda _source: {})
+    monkeypatch.setattr(
+        "web.activity_service.get_last_pipeline_persisted",
+        lambda: {"action": "", "persisted_count": 0, "synced_at": None},
+    )
 
     summary = get_summary()
     status = summary["user_status_counts"]

@@ -875,6 +875,9 @@ export function restartParticipationResultProgress() {
 }
 
 export function renderParticipationStepResults(result) {
+  if (payloadDedupSkipped(result)) {
+    return `<p class="caption">已跳过</p>`;
+  }
   const actions = result?.actions || [];
   if (!actions.length) {
     const message = sanitizeUserText(result?.message || "");
@@ -906,13 +909,12 @@ export function renderTripleParticipationResults(result) {
       statusLabel = "成功";
       statusClass = "success";
     } else if (payloadDedupSkipped(payload)) {
-      statusLabel = ["repost_pending", "repost_unknown", "repost_suspected"].includes(payload.skip_reason)
-        ? "需确认（已跳过）" : "已跳过";
+      statusLabel = "已跳过";
     } else if (status === "failed" || (status === "joined" && !payloadJoinedSuccess(payload))) {
       statusLabel = "失败";
       statusClass = "failed";
     }
-    const message = sanitizeUserText(payload?.message || "");
+    const message = payloadDedupSkipped(payload) ? "" : sanitizeUserText(payload?.message || "");
     return `
       <div class="participation-result-item">
         <div class="participation-result-item-title" title="${escapeHtml(title)}">${escapeHtml(truncateText(title, 42))}</div>

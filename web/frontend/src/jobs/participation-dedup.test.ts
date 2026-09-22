@@ -57,11 +57,13 @@ describe("participation dedup results", () => {
     });
   });
 
-  it("renders uncertain skips as needing confirmation without a failure result", async () => {
+  it("renders uncertain skips as a neutral skip without a failure result", async () => {
     const { renderTripleParticipationResults } = await import("./index");
     const html = renderTripleParticipationResults({ items: [joined(), skipped()] });
-    expect(html).toContain("需确认（已跳过）");
-    expect(html).toContain("转发状态待确认");
+    expect(html).toContain("已跳过");
+    expect(html).not.toContain("需确认");
+    expect(html).not.toContain("人工确认");
+    expect(html).not.toContain("转发状态待确认");
     expect(html).not.toContain('participation-result-status failed');
   });
 

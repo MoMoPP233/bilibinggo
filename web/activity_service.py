@@ -215,11 +215,25 @@ def _load_activities_payload() -> dict:
     return load_payload()
 
 
+def _load_blocked_activity_ids() -> set[str]:
+    """Return uncertain participation IDs for the current Profile.
+
+    This is deliberately a presentation-layer read.  The durable guard rows
+    remain available to the participation flow and internal diagnostics; the
+    ordinary activity view simply has no user-facing category for them.
+    """
+    return load_blocked_guard_ids(participation_uid())
+
+
 def get_summary() -> dict[str, Any]:
     enriched = _load_activities_payload()
     participations = load_participations()
+    blocked_ids = _load_blocked_activity_ids()
     activities = [
-        item for item in (enriched.get("activities") or []) if _participatable_stored(item)
+        item
+        for item in (enriched.get("activities") or [])
+        if _participatable_stored(item)
+        and str(item.get("dynamic_id") or "") not in blocked_ids
     ]
     status_counts = {"已结束": 0, "已参加": 0, "未参加": 0}
     draw_counts = {"active": 0, "ended": 0}
@@ -315,7 +329,7 @@ def _filtered_activity_rows(
     action_map = _load_participation_actions()
     participations = load_participations()
     items = [item for item in (enriched.get("activities") or []) if isinstance(item, dict)]
-    blocked_ids = load_blocked_guard_ids(participation_uid())
+    blocked_ids = _load_blocked_activity_ids()
 
     normalized: list[dict[str, Any]] = []
     draw_window_value = (draw_window or "").strip().lower()
@@ -323,6 +337,11 @@ def _filtered_activity_rows(
         draw_window_value = ""
     for item in items:
         dynamic_id = str(item.get("dynamic_id") or "")
+        if dynamic_id in blocked_ids:
+            # pending/unknown/suspected are protected backend states, not a
+            # normal activity status.  Keep them out of every ordinary list
+            # query so search, filters, sorting and pagination share one set.
+            continue
         participation = participations.get(dynamic_id)
         if draw_window_value and not matches_draw_window_filter(
             item, participation, draw_window_value
@@ -333,12 +352,6 @@ def _filtered_activity_rows(
         if not _should_list_activity(item, activity_status, can_participate):
             continue
         row = _normalize_activity(item, action_map, participation)
-        if dynamic_id in blocked_ids:
-            # Keep the activity and its real history visible; only suppress new
-            # participation until its uncertain repost state is reviewed.
-            row["can_participate"] = False
-            row["participation_blocked"] = True
-            row["skip_reason"] = "转发状态待确认，已暂停参与以避免重复操作"
         normalized.append(row)
 
     if draw_window_value:
@@ -508,7 +521,7 @@ def list_activities(
     )
     total = len(normalized)
     page = max(1, page)
-    page_size = ACTIVITY_PAGE_SIZE
+    page_size = max(1, min(int(page_size), ACTIVITY_PAGE_SIZE))
     start = (page - 1) * page_size
     page_items = normalized[start : start + page_size]
     triple_targets = build_triple_target_preview(_pick_triple_from_rows(normalized))

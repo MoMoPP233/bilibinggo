@@ -119,7 +119,7 @@ def test_triple_skip_does_not_cancel_other_target_or_count_as_joined(monkeypatch
     assert marked == []
 
 
-def test_blocked_targets_remain_visible_with_history_but_are_not_selected(monkeypatch) -> None:
+def test_blocked_targets_are_hidden_but_are_not_selected(monkeypatch) -> None:
     items = [
         {"dynamic_id": dynamic_id, "lottery_type": "转发抽奖", "activity_status": "未参加", "status_classified": True, "draw_status": "active"}
         for dynamic_id in (FIRST_ID, SECOND_ID)
@@ -137,14 +137,9 @@ def test_blocked_targets_remain_visible_with_history_but_are_not_selected(monkey
 
     monkeypatch.setattr(activity_service, "load_blocked_guard_ids", blocked)
     rows = activity_service._filtered_activity_rows(status="未参加")
-    blocked_row = next(row for row in rows if row["dynamic_id"] == FIRST_ID)
 
     assert seen_uids == ["123"]
-    assert blocked_row["participation_blocked"] is True
-    assert blocked_row["can_participate"] is False
-    assert "待确认" in blocked_row["skip_reason"]
-    assert blocked_row["activity_status"] == "未参加"
-    assert blocked_row["last_participation"] == history
+    assert [row["dynamic_id"] for row in rows] == [SECOND_ID]
     assert [row["dynamic_id"] for row in activity_service._pick_triple_from_rows(rows)] == [SECOND_ID]
 
 
