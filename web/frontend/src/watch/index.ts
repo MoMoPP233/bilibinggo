@@ -5,7 +5,7 @@
 import { state } from "../state";
 import { fetchJSON } from "../api/client";
 import { isLoggedIn } from "../account/index";
-import { sourceGrid, watchAddBtn, watchAddForm, watchAddMidError, watchAddMidInput, watchLastSynced, watchMetricCount, watchMetricLinks, watchNextWindow, watchUserGrid, watchUsersBadge, watchWindowCap } from "../dom";
+import { sourceCount, sourceGrid, watchAddBtn, watchAddForm, watchAddMidError, watchAddMidInput, watchLastSynced, watchMetricCount, watchMetricLinks, watchNextWindow, watchUserGrid, watchUsersBadge, watchWindowCap } from "../dom";
 import { bindActionButtons } from "../jobs/index";
 import { showToast } from "../shell/toast";
 import { formatUnixTimestamp, formatWatchWindow, formatWindowDays } from "../utils/format";
@@ -213,7 +213,14 @@ export function bindWatchUsers() {
 }
 
 export function renderSources(sources) {
-  sourceGrid.innerHTML = (sources || [])
+  const collectionSources = (sources || []).filter((source) => {
+    const id = String(source?.id || "").trim().toUpperCase();
+    return id !== "DS-9" && id !== "DS9";
+  });
+  if (sourceCount) {
+    sourceCount.textContent = `共 ${collectionSources.length} 个数据源`;
+  }
+  sourceGrid.innerHTML = collectionSources
     .map((source, index) => {
       const links = [];
       if (source.space_url) {

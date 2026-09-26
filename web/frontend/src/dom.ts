@@ -11,6 +11,8 @@ export const statsGrid = document.getElementById("stats-grid");
 
 export const sourceGrid = document.getElementById("source-grid");
 
+export const sourceCount = document.getElementById("source-count");
+
 export const watchUserGrid = document.getElementById("watch-user-grid");
 
 export const watchUsersBadge = document.getElementById("watch-users-badge");

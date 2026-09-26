@@ -417,14 +417,14 @@
           </div>
         </section>
 
-        <section class="view-section" id="section-sources" data-title="数据源" data-subtitle="UP 合集与监控用户动态双通道增量发现活动，历史记录全部保留。">
+        <section class="view-section" id="section-sources" data-title="数据源" data-subtitle="管理数据源、监控用户动态与话题。">
           <div class="sources-stack">
             <article class="panel watch-panel" id="watch-panel">
               <div class="watch-panel-head">
                 <div class="watch-panel-intro">
                   <p class="eyebrow">补充数据源</p>
                   <h2 class="section-title">监控用户动态</h2>
-                  <p class="section-desc watch-panel-desc">从常转发抽奖活动的 B 站用户空间拉取转发动态，弥补合集漏抓与较新活动。</p>
+                  <p class="section-desc watch-panel-desc">监控指定用户，自动发现新动态。</p>
                 </div>
                 <button type="button" class="btn btn-primary btn-pill watch-sync-btn" data-action="refresh_watch">更新监控用户动态</button>
               </div>
@@ -485,7 +485,7 @@
                 <div>
                   <p class="eyebrow">合集数据源</p>
                   <h2 class="section-title">UP 合集</h2>
-                  <p class="section-desc">检查新专栏 → 分类 → 拉取详情 → 入库，仅处理新增链接。逐源严格串行，一个源完整导入后才更新下一个。</p>
+                  <p class="section-desc">从不同合集采集抽奖内容。</p>
                 </div>
                 <div class="action-row">
                   <button type="button" class="btn btn-primary btn-pill" id="update-all-sources-btn">一键更新全部数据源（串行）</button>
@@ -498,6 +498,7 @@
                 </div>
                 <div class="update-all-lanes" id="update-all-lanes" aria-live="polite"></div>
               </div>
+              <p class="caption source-count" id="source-count" aria-live="polite"></p>
               <div class="source-list" id="source-grid"></div>
             </div>
           </div>

@@ -146,7 +146,7 @@ function ensurePanel() {
       <div class="watch-panel-intro">
         <p class="eyebrow">数据源</p>
         <h2 class="section-title">DS9 话题发现</h2>
-        <p class="section-desc">扫描 Bilibili 话题内动态，发现新抽奖候选并交给公共活动流水线。</p>
+        <p class="section-desc">扫描 B 站话题，发现新的抽奖动态。</p>
       </div>
       <div class="action-row">
         <span data-ds9-status class="ds9-status-pill is-idle">未运行</span>
