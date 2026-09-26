@@ -122,7 +122,6 @@ def _intended_actions(now):
         FOLLOWING_FEED_SCAN_HOUR_OFFSET,
         FOLLOWING_FEED_SCAN_MINUTE,
         REFRESH_HOURS,
-        TRIPLE_MINUTES,
         WINNER_SCAN_HOURS,
         WINNER_SCAN_MINUTE,
     )
@@ -140,16 +139,7 @@ def _intended_actions(now):
         actions.append("following_feed_scan")
     if m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS:
         actions.append("winner_deep_scan")
-    dedicated = (
-        (
-            m == FOLLOWING_FEED_SCAN_MINUTE
-            and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
-        )
-        or (m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS)
-        or (m == CLEANUP_MINUTE and h in CLEANUP_HOURS)
-    )
-    if h not in REFRESH_HOURS and m in TRIPLE_MINUTES and not dedicated:
-        actions.append("participate_triple")
+    # V38 随机参与不属于固定分钟表；其让路规则由 jitter 专项覆盖。
     return actions
 
 

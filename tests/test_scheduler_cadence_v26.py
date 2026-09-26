@@ -1,9 +1,10 @@
 """V26 Scheduler Cadence 专项（fake clock / mock，零真实网络/通知/mutation）。
 
-CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 4 / Cleanup 2。
-CASE 5    Triple 最大候选 slot = 60（20 非 refresh 小时 × :15/:30/:45）。
+V38 更新参与/中奖预期；保留 V26 其余 cadence 与全部安全回归。
+CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 1 / Cleanup 2。
+CASE 5    Triple 不再枚举固定 cron slot。
 CASE 6-9  精确时间（refresh/Following/Winner/Cleanup）。
-CASE 10-11 Triple 不在 refresh 小时、不与 dedicated 任务同分钟。
+CASE 10-11 Triple 仅展示已保存计划；固定任务分钟仍优先。
 CASE 12   collision 只 skip（无 fatal / 无补跑 / 无并发）。
 CASE 13-14 旧 persistent slot 不补跑；restart 同 slot 不重复。
 CASE 15   stale generation 无 authority。
@@ -62,14 +63,13 @@ def test_case1_4_24h_counts() -> None:
     counts = Counter(kind for kind, _label, _due in _day_candidates())
     assert counts["refresh"] == 4
     assert counts["following"] == 4
-    assert counts["winner"] == 4
+    assert counts["winner"] == 1
     assert counts["cleanup"] == 2
 
 
-def test_case5_triple_slot_ceiling() -> None:
+def test_case5_triple_has_no_fixed_cron_slots() -> None:
     counts = Counter(kind for kind, _label, _due in _day_candidates())
-    assert counts["participate"] == 60
-    assert counts["participate"] <= 60
+    assert counts["participate"] == 0
     assert counts["refresh"] != 8
     assert counts["cleanup"] != 4
     assert counts["participate"] != 220
@@ -87,7 +87,7 @@ def test_case7_following_exact_times() -> None:
 
 
 def test_case8_winner_keeps_exact_times() -> None:
-    assert _times(_day_candidates(), "winner") == ["05:04", "11:04", "17:04", "23:04"]
+    assert _times(_day_candidates(), "winner") == ["23:55"]
 
 
 def test_case9_cleanup_new_times() -> None:
@@ -97,25 +97,24 @@ def test_case9_cleanup_new_times() -> None:
 # ---------- CASE 10-11: Triple 与 dedicated 错峰 ----------
 
 
-def test_case10_triple_never_in_refresh_hours() -> None:
-    from web.auto_config import REFRESH_HOURS
+def test_case10_triple_shows_only_persisted_next_run() -> None:
+    from web.auto_scheduler import AutoScheduler
 
+    now = datetime(2026, 7, 17, 0, 0, tzinfo=CN_TZ)
+    AutoScheduler(delay_sampler=lambda low, high: 301)._plan_triple(now, None)
     participate = [due for kind, _label, due in _day_candidates() if kind == "participate"]
-    assert participate
-    assert all(due.hour not in REFRESH_HOURS for due in participate)
-    assert {due.minute for due in participate} == {15, 30, 45}
+    assert participate == [now + timedelta(seconds=301)]
 
 
 def test_case11_no_same_minute_between_dedicated_and_triple() -> None:
-    from web.auto_config import TRIPLE_MINUTES
+    from web.auto_scheduler import _dedicated_minute
 
     by_minute: dict[str, set[str]] = {}
     for kind, _label, due in _day_candidates():
         by_minute.setdefault(due.strftime("%H:%M"), set()).add(kind)
     assert all(len(kinds) == 1 for kinds in by_minute.values())
     for kind, _label, due in _day_candidates():
-        if kind == "participate":
-            assert due.minute in TRIPLE_MINUTES
+        assert _dedicated_minute(due)
 
 
 # ---------- CASE 12-15: slot 安全 ----------

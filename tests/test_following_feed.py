@@ -254,7 +254,8 @@ def test_next_scan_crosses_day() -> None:
 def test_cadence_does_not_overlap_refresh_cleanup_triple() -> None:
     from datetime import datetime, timedelta, timezone
 
-    from web.auto_config import REFRESH_HOURS, TRIPLE_MINUTES
+    from web.auto_config import REFRESH_HOURS
+    from web.auto_scheduler import _dedicated_minute
 
     tz = timezone(timedelta(hours=8))
     now = datetime(2026, 7, 17, 11, 0, tzinfo=tz)
@@ -263,7 +264,7 @@ def test_cadence_does_not_overlap_refresh_cleanup_triple() -> None:
         dt = datetime.fromtimestamp(result, tz=tz)
         assert dt.hour % 6 == 1
         assert dt.minute == 3
-        # V26：不落 refresh 整点、也不与 TRIPLE_MINUTES 冲突
+        # V38：固定 following 分钟保持原样；随机参与在该分钟让路。
         assert dt.hour not in REFRESH_HOURS
-        assert dt.minute not in TRIPLE_MINUTES
+        assert _dedicated_minute(dt)
         now = datetime.fromtimestamp(result + 1, tz=tz)

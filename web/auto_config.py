@@ -5,14 +5,14 @@ from __future__ import annotations
 # V26 调度频率（单一事实来源）。
 # refresh_all：00:00/06:00/12:00/18:00（4 次/天）。
 REFRESH_HOURS = frozenset({0, 6, 12, 18})
-# 自动参与：仅非 refresh 小时 :15/:30/:45（20 小时 × 3 = 最多 60 slot/天；
-# 每个 slot 最多处理 PARTICIPATE_TRIPLE_LIMIT=3 个活动 → 上限 180 活动/天）。
-TRIPLE_MINUTES = frozenset({15, 30, 45})
+# V38：上一轮结束后独立等待 240～420 秒，不再使用固定分钟槽。
+TRIPLE_DELAY_MIN_SECONDS = 240
+TRIPLE_DELAY_MAX_SECONDS = 420
 # 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（04:05/16:05，12 小时一次）。
 CLEANUP_MAINTAIN_INTERVAL_HOURS = 12
-# 中奖深检：05:04/11:04/17:04/23:04（4 次/天，保持原有时间）。
-WINNER_SCAN_HOURS = frozenset({5, 11, 17, 23})
-WINNER_SCAN_MINUTE = 4
+# 中奖深检：沿用 CN_TZ，每天 23:55 一次。
+WINNER_SCAN_HOURS = frozenset({23})
+WINNER_SCAN_MINUTE = 55
 # 清理维护：04:05/16:05（2 次/天，12 小时间隔）。
 CLEANUP_HOURS = frozenset({4, 16})
 CLEANUP_MINUTE = 5
@@ -64,7 +64,7 @@ MIN_REMOTE_STAGE_GAP_SECONDS = 60
 AUTO_REMOTE_RISK_COOLDOWN_SECONDS = 20 * 60
 
 # 关注动态补漏 cadence：每 6 小时一次，落在 hour%6==1 的 :03（01:03/07:03/13:03/19:03），
-# 避开公共刷新整点(:00)、cleanup 偶数整点，且 :03 不在 TRIPLE_MINUTES 内。
+# 与公共刷新及 cleanup 分钟错开；随机参与仍让专用分钟优先。
 FOLLOWING_FEED_SCAN_HOUR_INTERVAL = 6
 FOLLOWING_FEED_SCAN_HOUR_OFFSET = 1
 FOLLOWING_FEED_SCAN_MINUTE = 3

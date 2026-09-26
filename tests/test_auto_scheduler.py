@@ -302,10 +302,11 @@ def test_next_slot_before_refresh() -> None:
 
 def test_next_slot_participate_minute() -> None:
     now = datetime(2026, 7, 17, 2, 50, tzinfo=timezone(timedelta(hours=8)))
+    AutoScheduler(delay_sampler=lambda low, high: 301)._plan_triple(now, None)
     slot = _next_slot(now)
     assert slot["kind"] == "participate"
-    assert slot["hour"] == 3
-    assert slot["minute"] == 15
+    assert slot["hour"] == 2
+    assert slot["minute"] == 55
     assert slot["action"] == "participate_triple"
     assert slot["action_label"] == "三连参与"
 def _cn(dt):
@@ -332,12 +333,14 @@ def test_next_auto_task_cleanup_uses_real_0405_slot() -> None:
 
 
 def test_next_auto_task_participate_after_refresh_hour() -> None:
-    task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 10)))
+    now = _cn(datetime(2026, 7, 17, 3, 10))
+    AutoScheduler(delay_sampler=lambda low, high: 300)._plan_triple(now, None)
+    task = next_auto_task(now)
     assert task["label"] == "自动参与"
     assert task["minutes"] == 5
 
 
-def test_next_auto_task_winner_uses_real_0504_slot() -> None:
-    task = next_auto_task(_cn(datetime(2026, 7, 17, 5, 2)))
+def test_next_auto_task_winner_uses_real_2355_slot() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 23, 53)))
     assert task["label"] == "中奖深探"
     assert task["minutes"] == 2

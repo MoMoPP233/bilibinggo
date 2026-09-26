@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import tempfile
 import threading
@@ -16,7 +17,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from src.app_logging import get_logger
 from src.platform_risk import risk_code_of
@@ -35,7 +36,8 @@ from web.auto_config import (
     JOB_POLL_TIMEOUT_SEC,
     MIN_REMOTE_STAGE_GAP_SECONDS,
     REFRESH_HOURS,
-    TRIPLE_MINUTES,
+    TRIPLE_DELAY_MIN_SECONDS,
+    TRIPLE_DELAY_MAX_SECONDS,
     WINNER_SCAN_HOURS,
     WINNER_SCAN_MINUTE,
 )
@@ -69,6 +71,7 @@ _AUTO_SNAPSHOT_LOG_LIMIT = 100
 
 _SLOT_STATE_FILE = "scheduler_slots.json"
 _SLOT_STATE_MAX_TASKS = 8
+_TRIPLE_NEXT_RUN = "triple_next_run"
 _slot_state_lock = threading.Lock()
 
 
@@ -100,6 +103,8 @@ def _read_slot_state(path: Any) -> dict[str, str]:
     if not isinstance(data, dict):
         raise SlotStateError("调度槽位状态文件结构非法，已停止自动远程任务")
     cleaned: dict[str, str] = {}
+    if _TRIPLE_NEXT_RUN in data and not isinstance(data[_TRIPLE_NEXT_RUN], str):
+        raise SlotStateError("自动参与 next_run 结构非法，已停止自动调度")
     for key, value in data.items():
         if isinstance(key, str) and isinstance(value, str):
             cleaned[key] = value
@@ -141,6 +146,8 @@ def _persist_slot_claimed(task: str, slot: str) -> bool:
         if len(state) > _SLOT_STATE_MAX_TASKS:
             # 有界：只保留最近消费的少量 task；key 天然含 task 身份，不会错判当前 slot。
             for key in sorted(state):
+                if key == _TRIPLE_NEXT_RUN:
+                    continue
                 del state[key]
                 if len(state) <= _SLOT_STATE_MAX_TASKS:
                     break
@@ -247,7 +254,8 @@ class SchedulerStatus:
             "next_task": next_auto_task(),
             "schedule": {
                 "refresh_hours": sorted(REFRESH_HOURS),
-                "triple_minutes": sorted(TRIPLE_MINUTES),
+                "triple_minutes": [],  # 兼容旧状态消费者；不再有固定分钟槽。
+                "triple_delay_seconds": [TRIPLE_DELAY_MIN_SECONDS, TRIPLE_DELAY_MAX_SECONDS],
                 "actions": [
                     {"action": key, "label": ACTION_LABELS[key]}
                     for key in ("refresh_all", "refresh_watch", "refresh_status", "participate_triple")
@@ -257,8 +265,15 @@ class SchedulerStatus:
 
 
 class AutoScheduler:
-    def __init__(self, job_runner: JobRunner | None = None) -> None:
+    def __init__(
+        self, job_runner: JobRunner | None = None, *,
+        clock: Callable[[], datetime] | None = None,
+        delay_sampler: Callable[[int, int], int] | None = None,
+    ) -> None:
         self._runner = job_runner or runner
+        self._clock = clock or (lambda: datetime.now(CN_TZ))
+        self._delay_sampler = delay_sampler or random.randint
+        self._triple_tick_lock = threading.Lock()
         self._lock = threading.Lock()
         # 每代调度器拥有自己独立的 stop Event；新代 start 绝不 clear 旧代 Event。
         # 线程运行期间所有停止判定都绑定“自己的代际上下文”，避免旧代被唤醒后继续调度。
@@ -711,7 +726,7 @@ class AutoScheduler:
         self._ctx.stop_event = stop_event
         try:
             while not self._is_stale():
-                now = datetime.now(CN_TZ)
+                now = self._clock()
                 with self._lock:
                     self._status.last_tick_at = _now_iso()
                     slot = _next_slot(now)
@@ -726,7 +741,7 @@ class AutoScheduler:
 
                 # 清理维护调度随 Scheduler 启动；其中自动 DELETE 仍由 per-Profile
                 # auto_delete_enabled 独立授权，默认关闭，维护调度绝不隐式开启它。
-                # V26: 中奖深检保持 05:04/11:04/17:04/23:04（4 次/天）。
+                # V38: 中奖深检每天 23:55；仍仅当前分钟触发，错过不补跑。
                 if now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS:
                     key = f"winner-{now:%Y-%m-%d-%H}"
                     if key not in self._done_winner:
@@ -749,25 +764,7 @@ class AutoScheduler:
                         self._run_following_scan(key)
                         continue
 
-                # 专用分钟排除：following(:03)/winner(:04)/cleanup(:05) 不参与三连。
-                dedicated_minute = (
-                    (
-                        now.minute == FOLLOWING_FEED_SCAN_MINUTE
-                        and now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL
-                        == FOLLOWING_FEED_SCAN_HOUR_OFFSET
-                    )
-                    or (now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS)
-                    or (now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS)
-                )
-                if (
-                    now.hour not in REFRESH_HOURS
-                    and now.minute in TRIPLE_MINUTES
-                    and not dedicated_minute
-                ):
-                    key = f"{now:%Y-%m-%d-%H-%M}"
-                    if key not in self._done_triple:
-                        self._run_triple_slot(key)
-                        continue
+                self._tick_triple(now)
 
                 if self._status.state == "running":
                     self._set_phase("等待下一刻度", "调度器运行中")
@@ -778,6 +775,59 @@ class AutoScheduler:
         except Exception as exc:
             logger.exception("调度器内部未预期错误")
             self._fatal(f"调度器内部不可恢复错误：{friendly_error(exc)}")
+
+    def _plan_triple(self, now: datetime, expected: str | None) -> None:
+        """CAS 保存唯一下一轮；旧代无写权，状态读取绝不抽签。"""
+        with self._lock:
+            if self._context_generation() != self._generation or self._active_stop_event().is_set():
+                return
+            with _slot_state_lock:
+                path = _slot_state_path()
+                state = _read_slot_state(path)
+                if state.get(_TRIPLE_NEXT_RUN) != expected:
+                    return
+                delay = self._delay_sampler(TRIPLE_DELAY_MIN_SECONDS, TRIPLE_DELAY_MAX_SECONDS)
+                if type(delay) is not int or not TRIPLE_DELAY_MIN_SECONDS <= delay <= TRIPLE_DELAY_MAX_SECONDS:
+                    raise SlotStateError("自动参与随机等待时间必须在 240～420 秒之间")
+                state[_TRIPLE_NEXT_RUN] = (now + timedelta(seconds=delay)).isoformat()
+                try:
+                    _write_slot_state_atomic(path, state)
+                except OSError as exc:
+                    raise SlotStateError(f"自动参与 next_run 写入失败：{exc}") from exc
+
+    def _tick_triple(self, now: datetime) -> None:
+        """仅执行已保存计划的到期分钟；错过/已消费只规划未来，绝不补跑。
+
+        复用单线程等待、JobRunner 和 WriterLease。停止/等待超时留下已消费槽；
+        新代等待仍在运行的 Job 结束后再规划，不从未完成的轮次起算间隔。
+        """
+        if self._is_stale() or not self._triple_tick_lock.acquire(blocking=False):
+            return
+        try:
+            state = _read_slot_state(_slot_state_path())
+            raw = state.get(_TRIPLE_NEXT_RUN)
+            due = _triple_due(state)
+            if due is None or state.get("triple") == f"jitter-{raw}":
+                if not self._runner.is_running():
+                    self._plan_triple(now, raw)
+                return
+            if now < due:
+                return
+            if now.replace(second=0, microsecond=0) > due.replace(second=0, microsecond=0):
+                self._log("info", f"自动参与计划 {raw} 已错过，跳过并等待下一轮")
+                self._plan_triple(now, raw)
+                return
+            key = f"jitter-{raw}"
+            if _dedicated_minute(now):
+                # 不抢占原有固定任务；本轮不补跑。
+                if _stale_or_slot_guard(self, "triple", key):
+                    self._log("info", "自动参与与固定任务同分钟，本轮跳过")
+            else:
+                self._run_triple_slot(key)
+            if not self._is_stale() and not self._runner.is_running():
+                self._plan_triple(self._clock(), raw)
+        finally:
+            self._triple_tick_lock.release()
 
     def _run_refresh_batch(self, key: str) -> None:
         if not _stale_or_slot_guard(self, "refresh", key):
@@ -1190,6 +1240,29 @@ def _now_iso() -> str:
     return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _triple_due(state: dict[str, str]) -> datetime | None:
+    raw = state.get(_TRIPLE_NEXT_RUN)
+    if raw is None:
+        return None
+    try:
+        due = datetime.fromisoformat(raw)
+        if due.tzinfo is None:
+            raise ValueError("missing timezone")
+        return due.astimezone(CN_TZ)
+    except (ValueError, OverflowError) as exc:
+        raise SlotStateError("自动参与 next_run 损坏，已停止自动调度") from exc
+
+
+def _dedicated_minute(now: datetime) -> bool:
+    return (
+        (now.hour in REFRESH_HOURS and now.minute == 0)
+        or (now.hour in WINNER_SCAN_HOURS and now.minute == WINNER_SCAN_MINUTE)
+        or (now.hour in CLEANUP_HOURS and now.minute == CLEANUP_MINUTE)
+        or (now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+            and now.minute == FOLLOWING_FEED_SCAN_MINUTE)
+    )
+
+
 def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]]:
     """按 ``_loop`` 的真实 cadence 枚举未来 24 小时任务（纯只读）。"""
     candidates: list[tuple[str, str, datetime]] = []
@@ -1208,16 +1281,15 @@ def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]
             and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
         ):
             candidates.append(("following", "关注补漏", candidate))
-        dedicated = (
-            (
-                m == FOLLOWING_FEED_SCAN_MINUTE
-                and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
-            )
-            or (m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS)
-            or (m == CLEANUP_MINUTE and h in CLEANUP_HOURS)
-        )
-        if h not in REFRESH_HOURS and m in TRIPLE_MINUTES and not dedicated:
-            candidates.append(("participate", "自动参与", candidate))
+    # 只读真实已保存的下一轮，不虚构后续随机时间，也不在页面读取时写文件。
+    try:
+        state = _read_slot_state(_slot_state_path())
+        due = _triple_due(state)
+        if (due is not None and due >= now
+                and state.get("triple") != f"jitter-{state[_TRIPLE_NEXT_RUN]}"):
+            candidates.append(("participate", "自动参与", due))
+    except SlotStateError:
+        pass  # 状态页仍可读；执行入口遇到损坏会 fail-closed。
     return candidates
 
 
