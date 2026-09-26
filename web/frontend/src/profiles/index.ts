@@ -1,5 +1,4 @@
 import { fetchJSON } from "../api/client";
-import { state } from "../state";
 import { openAppConfirm } from "../shell/confirm";
 import { showToast } from "../shell/toast";
 import { setButtonLoading } from "../utils/motion";
@@ -37,7 +36,6 @@ const PROFILE_RESTART_TIMEOUT_MS = 60000;
 const PROFILE_RESTART_POLL_INTERVAL_MS = 650;
 const PROFILE_RESTART_PROBE_TIMEOUT_MS = 2000;
 
-const profileCurrent = document.getElementById("profile-current");
 const profileList = document.getElementById("profile-list");
 const profileRestartNotice = document.getElementById("profile-restart-notice");
 
@@ -98,35 +96,15 @@ function errorMessage(error: unknown): string {
   return sanitizeUserText(raw) || "Profile 操作失败";
 }
 
-function accountValue(key: "uname" | "mid"): string {
-  const value = state.account?.[key];
-  return value === undefined || value === null ? "" : String(value).trim();
-}
-
 function displayName(profile: Profile): string {
   return profile.nickname || `账号 ${profile.profile_id}`;
 }
 
 function renderProfiles(payload: ProfilesPayload): void {
   currentPayload = payload;
-  const runtime = payload.profiles.find(
-    (profile) => profile.profile_id === payload.runtime_profile_id,
-  );
-  const nickname = runtime?.nickname || accountValue("uname") || "尚未登录";
-  const mid = runtime?.mid || accountValue("mid") || "—";
 
   if (profileRestartNotice) {
     profileRestartNotice.hidden = !payload.restart_required;
-  }
-  if (profileCurrent) {
-    profileCurrent.innerHTML = `
-      <p class="profile-current-label">当前运行 Profile</p>
-      <div class="profile-current-grid">
-        <div class="profile-field"><span>昵称</span><strong>${escapeHtml(nickname)}</strong></div>
-        <div class="profile-field"><span>MID</span><strong>${escapeHtml(mid)}</strong></div>
-        <div class="profile-field"><span>Profile ID</span><strong>${escapeHtml(payload.runtime_profile_id)}</strong></div>
-      </div>
-      <p class="caption profile-data-root" title="${escapeHtml(payload.data_root)}">数据目录：${escapeHtml(payload.data_root)}</p>`;
   }
   if (!profileList) return;
   profileList.innerHTML = payload.profiles

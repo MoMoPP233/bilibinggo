@@ -274,12 +274,12 @@
         <div class="topbar-copy">
           <p class="eyebrow">本地控制台</p>
           <h1 class="page-title" id="page-title">概览</h1>
-          <p class="page-subtitle" id="page-subtitle">账号状态、活动统计与快捷操作。</p>
+          <p class="page-subtitle" id="page-subtitle">账号状态与活动统计。</p>
         </div>
       </header>
 
       <main class="content-area">
-        <section class="view-section active" id="section-overview" data-title="概览" data-subtitle="账号状态、活动统计与快捷操作。">
+        <section class="view-section active" id="section-overview" data-title="概览" data-subtitle="账号状态与活动统计。">
           <div class="overview-stack">
             <article class="panel onboarding-panel" id="onboarding-panel" hidden>
               <div class="onboarding-head">
@@ -312,36 +312,23 @@
                 <div>
                   <p class="eyebrow">账号 Profile</p>
                   <h2 class="section-title">多账号数据隔离</h2>
-                  <p class="section-desc">每个 Profile 独立保存账号 Cookie、活动与参与状态。</p>
+                  <p class="section-desc">每个账号独立保存登录状态和活动数据。</p>
                 </div>
                 <button type="button" class="btn btn-primary btn-pill" id="profile-onboarding-start">扫码登录新账号</button>
               </div>
               <div class="profile-restart-notice" id="profile-restart-notice" role="status" hidden>
                 账号配置已切换，请重新启动 Binggo 后生效。
               </div>
-              <div class="profile-current" id="profile-current">
-                <p class="caption">加载 Profile 信息中…</p>
-              </div>
               <div class="profile-list" id="profile-list" aria-label="账号 Profile 列表"></div>
             </article>
 
             <div class="stats-grid" id="stats-grid"></div>
 
-            <article class="panel quick-actions">
-              <h2 class="section-title">快捷操作</h2>
-              <p class="section-desc quick-actions-desc">在数据源页可「一键更新全部数据源」（严格串行）；此处可更新监控用户动态或刷新任务状态，或直接进入活动列表参与抽奖。</p>
-              <div class="action-row quick-actions-row">
-                <button class="btn btn-primary btn-pill" data-action="refresh_watch">更新监控用户动态</button>
-                <button class="btn btn-secondary btn-pill" data-action="refresh_status">刷新任务状态</button>
-                <button class="btn btn-ghost btn-pill" data-section-jump="activities">查看活动列表</button>
-              </div>
-            </article>
-
             <article class="panel participate-settings">
               <div class="participate-settings-head">
                 <div>
                   <h2 class="section-title">参与文案</h2>
-                  <p class="section-desc participate-settings-desc" id="participate-settings-desc">用于转发与评论，建议格式：<strong>@好友昵称 + 一句话</strong>。例如 <code>@小明 好运连连！</code></p>
+                  <p class="section-desc participate-settings-desc" id="participate-settings-desc">设置抽奖评论内容，可随机使用多个模板。</p>
                 </div>
                 <button type="button" class="btn btn-secondary btn-pill" id="reset-participate-text">恢复默认</button>
               </div>
@@ -352,7 +339,7 @@
                 </div>
               </div>
               <p class="participate-mode-note" id="participate-random-note" hidden>
-                参与时拉取活动评论，跳过前 5 条后从第 6～65 条中随机抽取一条作为转发与评论内容；若评论不足，自动使用下方兜底文案。
+                参与时随机使用活动评论；评论不足时使用下方文案。
               </p>
               <div class="participate-text-fields" id="participate-text-fields">
                 <label class="field-label" for="participate-text-input" id="participate-text-label">当前文案</label>
@@ -369,7 +356,7 @@
               <div class="settings-panel-head">
                 <div class="settings-panel-intro">
                   <h2 class="section-title">LLM 配置</h2>
-                  <p class="section-desc">解析<strong>转发抽奖</strong>动态正文，提取奖品与开奖时间。互动 / 预约抽奖不消耗 LLM，推荐使用 <strong>DeepSeek-V4-Flash</strong>。</p>
+                  <p class="section-desc">配置大模型，用于生成互动文案。</p>
                 </div>
               </div>
               <div class="llm-settings-body">
@@ -378,7 +365,7 @@
                     <label class="field-label" for="llm-api-key-input">API Key</label>
                     <span class="field-tag required">必填</span>
                   </div>
-                  <p class="field-help">服务商密钥，保存后仅显示首尾各 4 位，不会明文展示。</p>
+                  <p class="field-help">仅保存在本地。</p>
                   <div class="input-with-action">
                     <input type="password" id="llm-api-key-input" class="form-input" autocomplete="new-password" placeholder="请输入 API Key" />
                     <button type="button" class="btn btn-secondary btn-compact input-action-btn" id="llm-api-key-toggle" aria-label="显示 API Key" aria-pressed="false">显示</button>
@@ -391,7 +378,7 @@
                       <label class="field-label" for="llm-base-url-input">接口地址</label>
                       <span class="field-tag">选填</span>
                     </div>
-                    <p class="field-help">对应本地 <code>llm.env</code> 中的 LLM_BASE_URL，留空即不填写。</p>
+                    <p class="field-help">无需修改时保持默认。</p>
                     <input type="text" id="llm-base-url-input" class="form-input" autocomplete="off" placeholder="请输入 BASE URL" />
                     <p class="caption field-hint" id="llm-base-url-hint"></p>
                   </div>
@@ -400,7 +387,7 @@
                       <label class="field-label" for="llm-model-name-input">模型名称</label>
                       <span class="field-tag required">必填</span>
                     </div>
-                    <p class="field-help">文本模型标识，例如 DeepSeek-V4-Flash。</p>
+                    <p class="field-help">保持当前推荐模型即可。</p>
                     <input type="text" id="llm-model-name-input" class="form-input" placeholder="请输入模型名称" />
                   </div>
                 </div>
@@ -418,73 +405,13 @@
               </div>
             </article>
 
-            <article class="panel project-showcase">
-              <div class="project-showcase-grid">
-                <div class="project-showcase-main">
-                  <div class="project-showcase-intro">
-                    <p class="eyebrow">Open Source</p>
-                    <h2 class="project-showcase-title">bilibinggo</h2>
-                    <p class="project-showcase-desc">聚合 B 站抽奖 UP 合集，增量发现活动、本地管理参与状态，Web 控制台一键参与互动 / 转发 / 预约抽奖。</p>
-                  </div>
-                  <ul class="project-highlights" aria-label="项目能力">
-                    <li class="project-highlight">
-                      <span class="project-highlight-title">本地 SQLite</span>
-                      <span class="project-highlight-text">活动、参与与任务落盘，数据只在你的电脑上</span>
-                    </li>
-                    <li class="project-highlight">
-                      <span class="project-highlight-title">实时进度</span>
-                      <span class="project-highlight-text">SSE 推送任务日志，断线自动回退轮询</span>
-                    </li>
-                    <li class="project-highlight">
-                      <span class="project-highlight-title">本机私有</span>
-                      <span class="project-highlight-text">仅绑定 127.0.0.1，Cookie 与密钥不上传</span>
-                    </li>
-                    <li class="project-highlight">
-                      <span class="project-highlight-title">跨平台包</span>
-                      <span class="project-highlight-text">Windows 安装 / 便携，macOS Apple Silicon</span>
-                    </li>
-                  </ul>
-                  <div class="project-showcase-actions">
-                    <a class="btn btn-primary btn-pill project-btn" href="https://github.com/luovicter-collab/bilibinggo" target="_blank" rel="noopener">访问 GitHub 仓库</a>
-                    <a class="btn btn-secondary btn-pill project-btn" href="https://github.com/luovicter-collab" target="_blank" rel="noopener">作者 victor</a>
-                    <button type="button" class="btn btn-ghost btn-pill" id="export-diagnostics">导出诊断包</button>
-                  </div>
+            <article class="panel developer-tools-panel">
+              <div class="panel-head-row">
+                <div>
+                  <h2 class="section-title">开发者工具</h2>
+                  <p class="section-desc">导出运行诊断信息，方便排查问题。</p>
                 </div>
-                <div class="project-showcase-side">
-                  <div class="project-meta">
-                    <div class="project-meta-row">
-                      <span class="project-info-label">Repository</span>
-                      <span class="project-info-value">luovicter-collab / bilibinggo</span>
-                    </div>
-                    <div class="project-meta-pairs">
-                      <div class="project-meta-item">
-                        <span class="project-info-label">Author</span>
-                        <span class="project-info-value">victor</span>
-                      </div>
-                      <div class="project-meta-item">
-                        <span class="project-info-label">License</span>
-                        <span class="project-info-value">MIT</span>
-                      </div>
-                      <div class="project-meta-item">
-                        <span class="project-info-label">Version</span>
-                        <span class="project-info-value" id="runtime-version">—</span>
-                      </div>
-                      <div class="project-meta-item">
-                        <span class="project-info-label">Runtime</span>
-                        <span class="project-info-value" id="runtime-label">—</span>
-                      </div>
-                    </div>
-                    <div class="project-meta-row project-meta-row--path">
-                      <span class="project-info-label">数据目录</span>
-                      <span class="project-info-value project-meta-path" id="runtime-data-dir" title="">—</span>
-                    </div>
-                  </div>
-                  <div class="project-showcase-side-actions">
-                    <button type="button" class="btn btn-secondary btn-pill btn-compact" id="check-updates">检查更新</button>
-                    <a class="btn btn-ghost btn-pill btn-compact" id="open-releases" href="https://github.com/luovicter-collab/bilibinggo/releases" target="_blank" rel="noopener">Releases</a>
-                  </div>
-                  <p class="caption" id="runtime-health-hint" hidden></p>
-                </div>
+                <button type="button" class="btn btn-secondary btn-pill" id="export-diagnostics">导出诊断包</button>
               </div>
             </article>
           </div>
