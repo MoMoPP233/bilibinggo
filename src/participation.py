@@ -51,7 +51,12 @@ from src.participation_guard import (
     mark_repost_suspected,
     participation_gate,
 )
-from src.participate_preflight import ActivityAlreadyJoined, ensure_activity_participatable
+from src.participate_preflight import (
+    ActivityAlreadyJoined,
+    InvalidActivityError,
+    ensure_activity_participatable,
+)
+from src.invalid_activities import invalidate_stored_activity, is_self_follow_failure
 from src.user_data_lock import user_data_lock
 from src.participate_text import resolve_participate_text_for_activity
 from src.fetch_activity_info import mark_enriched_joined
@@ -76,6 +81,75 @@ def _mutation_result_unknown(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and isinstance(
         exc.__cause__, (httpx.HTTPError, json.JSONDecodeError)
     )
+
+
+def _pre_mutation_network_error(exc: BaseException) -> bool:
+    """Classify transport failure while still in the read/preflight phase."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            status_code = getattr(current.response, "status_code", None)
+            # Auth/rate-limit responses are actionable global conditions, not
+            # transient queueable reads.  Keep the existing auth/risk paths.
+            if status_code in {401, 403, 429}:
+                return False
+        if isinstance(current, (httpx.HTTPError, json.JSONDecodeError)):
+            return True
+        current = current.__cause__ or current.__context__
+    text = str(exc).strip().lower()
+    return isinstance(exc, RuntimeError) and any(
+        marker in text
+        for marker in ("网络请求失败", "connecterror", "connection refused", "ssl:", "timed out")
+    )
+
+
+def _network_requeue_result(
+    *,
+    dynamic_id: str,
+    lottery_type: str,
+    persist: bool,
+    dry_run: bool,
+) -> ParticipateResult:
+    result = ParticipateResult(
+        dynamic_id=dynamic_id,
+        lottery_type=lottery_type,
+        status="failed",
+        message="网络请求失败，已重新回到队列",
+        action_text="",
+        actions=[],
+        context_snapshot={"result_class": "failed_local", "requeue": True},
+    )
+    _persist_result(result=result, persist=persist, dry_run=dry_run)
+    return result
+
+
+def _invalid_result(
+    *,
+    dynamic_id: str,
+    lottery_type: str,
+    message: str,
+    reason: str,
+    actions: list[ActionResult] | None = None,
+    action_text: str = "",
+    context_snapshot: dict[str, Any] | None = None,
+    persist: bool,
+    dry_run: bool,
+) -> ParticipateResult:
+    result = ParticipateResult(
+        dynamic_id=dynamic_id,
+        lottery_type=lottery_type,
+        status="failed",
+        message=message,
+        action_text=action_text,
+        actions=list(actions or []),
+        context_snapshot={**(context_snapshot or {}), "result_class": "invalid_activity", "invalid_reason": reason},
+    )
+    _persist_result(result=result, persist=persist, dry_run=dry_run)
+    if persist and not dry_run:
+        invalidate_stored_activity(dynamic_id, reason=reason)
+    return result
 
 
 def _global_participation_reason(exc: BaseException) -> str | None:
@@ -198,7 +272,7 @@ def _persist_result(
     )
     recorded_at = int(time.time())
     snapshot = dict(result.context_snapshot or {})
-    if result.status == "failed" and snapshot.get("result_class") == "failed_local":
+    if result.status == "failed" and snapshot.get("result_class") == "failed_local" and not snapshot.get("requeue"):
         snapshot.setdefault(
             "backoff_until",
             recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
@@ -218,6 +292,8 @@ def _persist_result(
         append_action_record_unlocked(record, uid=_execution_uid.get())
         if joined:
             set_participation_unlocked(result.dynamic_id, "已参加", uid=_execution_uid.get())
+        elif result.status == "failed" and snapshot.get("result_class") == "failed_local" and snapshot.get("requeue"):
+            set_participation_unlocked(result.dynamic_id, "未参加", uid=_execution_uid.get())
     if joined:
         mark_enriched_joined(result.dynamic_id)
 
@@ -275,8 +351,18 @@ def participate_five_action_lottery(
     notice: dict | None = None
     sender_uid: int | None = None
 
-    detail_item = fetch_dynamic_detail(reader, dynamic_id)
-    reader.raise_if_failed()
+    try:
+        detail_item = fetch_dynamic_detail(reader, dynamic_id)
+        reader.raise_if_failed()
+    except Exception as exc:
+        if _pre_mutation_network_error(exc):
+            return _network_requeue_result(
+                dynamic_id=dynamic_id,
+                lottery_type=lottery_type,
+                persist=persist,
+                dry_run=dry_run,
+            )
+        raise
     if not detail_item:
         raise RuntimeError("无法获取动态详情，请稍后重试")
     if is_upower_dynamic(detail_item):
@@ -288,8 +374,18 @@ def participate_five_action_lottery(
         return result
 
     if lottery_type == "互动抽奖":
-        resolved = fetch_notice_for_interact(reader, dynamic_id)
-        reader.raise_if_failed()
+        try:
+            resolved = fetch_notice_for_interact(reader, dynamic_id)
+            reader.raise_if_failed()
+        except Exception as exc:
+            if _pre_mutation_network_error(exc):
+                return _network_requeue_result(
+                    dynamic_id=dynamic_id,
+                    lottery_type=lottery_type,
+                    persist=persist,
+                    dry_run=dry_run,
+                )
+            raise
         if not resolved:
             result = ParticipateResult(
                 dynamic_id=dynamic_id,
@@ -328,13 +424,25 @@ def participate_five_action_lottery(
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         return result
 
-    context = build_dynamic_context(
-        reader, dynamic_id=dynamic_id, sender_uid=sender_uid, action_text="",
-        detail_item=detail_item, notice=notice,
-        repost_confirmed=bool(guard and guard.repost_status == "confirmed"),
-        check_comment=False, check_follow=False,
-    )
-    reader.raise_if_failed()
+    try:
+        context = build_dynamic_context(
+            reader, dynamic_id=dynamic_id, sender_uid=sender_uid, action_text="",
+            detail_item=detail_item, notice=notice,
+            repost_confirmed=bool(guard and guard.repost_status == "confirmed"),
+            check_comment=False, check_follow=False,
+        )
+        reader.raise_if_failed()
+    except InvalidActivityError:
+        raise
+    except Exception as exc:
+        if _pre_mutation_network_error(exc):
+            return _network_requeue_result(
+                dynamic_id=dynamic_id,
+                lottery_type=lottery_type,
+                persist=persist,
+                dry_run=dry_run,
+            )
+        raise
     if context.reposted is True:
         if not dry_run:
             confirm_repost(uid, dynamic_id)
@@ -348,16 +456,30 @@ def participate_five_action_lottery(
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         return result
 
-    # 疑似参与直接退出，不为这个分支额外查询关注、评论或生成文案。
-    context.followed = is_following(reader, uid=context.sender_uid, referer=context.referer)
-    reader.raise_if_failed()
-    # 只有确定要继续参与时才生成文案/检查评论，复用当前目标的读取快照。
-    text, text_meta = _resolve_action_text(reader, dynamic_id=dynamic_id, action_text=action_text)
-    context.commented = has_comment(
-        reader, rid=context.comment_rid, comment_type=context.comment_type,
-        action_text=text, referer=context.referer,
-    )
-    reader.raise_if_failed()
+    try:
+        # Only after the suspected-participation branch is cleared do we read
+        # follow/comment state and resolve the action text.
+        context.followed = is_following(reader, uid=context.sender_uid, referer=context.referer)
+        reader.raise_if_failed()
+        text, text_meta = _resolve_action_text(reader, dynamic_id=dynamic_id, action_text=action_text)
+        context.commented = has_comment(
+            reader,
+            rid=context.comment_rid,
+            comment_type=context.comment_type,
+            action_text=text,
+            referer=context.referer,
+        )
+        reader.raise_if_failed()
+    except Exception as exc:
+        if _pre_mutation_network_error(exc):
+            return _network_requeue_result(
+                dynamic_id=dynamic_id,
+                lottery_type=lottery_type,
+                persist=persist,
+                dry_run=dry_run,
+            )
+        raise
+
     completed_actions: list[ActionResult] = []
     mutation_action: list[str | None] = [None]
 
@@ -412,6 +534,16 @@ def participate_five_action_lottery(
         if "无法获取动态详情" in message:
             message = "无法获取动态详情，请稍后重试"
         unknown = mutation_action[0] is not None and _mutation_result_unknown(exc)
+        if unknown:
+            action_label = {
+                "like": "点赞",
+                "follow": "关注",
+                "favorite": "收藏",
+                "repost": "转发",
+                "comment": "评论",
+                "reserve": "预约",
+            }.get(str(mutation_action[0] or "操作"), "操作")
+            message = f"{action_label}结果未知，已停止自动重试"
         result = ParticipateResult(
             dynamic_id=dynamic_id,
             lottery_type=lottery_type,
@@ -434,6 +566,26 @@ def participate_five_action_lottery(
             raise
         return result
 
+    self_follow_failure = next(
+        (item for item in actions if item.action == "follow" and not item.ok and is_self_follow_failure(item.detail)),
+        None,
+    )
+    if self_follow_failure is not None:
+        return _invalid_result(
+            dynamic_id=dynamic_id,
+            lottery_type=lottery_type,
+            message="不能关注自己，活动已删除",
+            reason="self_follow_22001",
+            actions=actions,
+            action_text=text,
+            context_snapshot=_context_snapshot(
+                context,
+                extra={**text_meta, "notice": _notice_snapshot(notice)},
+            ),
+            persist=persist,
+            dry_run=dry_run,
+        )
+
     if dry_run:
         status: ParticipationOutcome = "dry_run"
         message = "预演完成，未实际请求 B 站"
@@ -454,7 +606,32 @@ def participate_five_action_lottery(
         extra={"notice": _notice_snapshot(notice), **text_meta},
     )
     if status == "failed":
-        snapshot.setdefault("result_class", "failed_local")
+        # Some non-idempotent actions (notably repost) convert a transport
+        # exception into a failed ActionResult after persisting their guard.
+        # Preserve that uncertainty as an unknown barrier instead of treating
+        # it as an ordinary local failure eligible for retry.
+        unknown_action = next(
+            (
+                item.action
+                for item in actions
+                if not item.ok and "结果未知" in str(item.detail or "")
+            ),
+            None,
+        )
+        if unknown_action:
+            action_label = {
+                "like": "点赞",
+                "follow": "关注",
+                "favorite": "收藏",
+                "repost": "转发",
+                "comment": "评论",
+                "reserve": "预约",
+            }.get(str(unknown_action), "操作")
+            message = f"{action_label}结果未知，已停止自动重试"
+            snapshot["result_class"] = "unknown"
+            snapshot["unknown_action"] = unknown_action
+        else:
+            snapshot.setdefault("result_class", "failed_local")
     result = ParticipateResult(
         dynamic_id=dynamic_id,
         lottery_type=lottery_type,
@@ -557,6 +734,7 @@ def participate_reserve_lottery(
     on_step: Callable[[int, int, str, str], None] | None = None,
 ) -> ParticipateResult:
     notice: dict | None = None
+    notice_error: Exception | None = None
     try:
         resolved = fetch_notice_for_reserve(client, dynamic_id)
         if resolved:
@@ -574,12 +752,27 @@ def participate_reserve_lottery(
                 )
                 _persist_result(result=result, persist=persist, dry_run=dry_run)
                 return result
-    except RuntimeError:
+    except RuntimeError as exc:
         notice = None
+        notice_error = exc
+        if _pre_mutation_network_error(exc):
+            return _network_requeue_result(
+                dynamic_id=dynamic_id,
+                lottery_type="预约抽奖",
+                persist=persist,
+                dry_run=dry_run,
+            )
 
     try:
         reserve_info = _resolve_reserve_info(client, dynamic_id)
     except (RuntimeError, ValueError) as exc:
+        if _pre_mutation_network_error(exc) or (notice_error is not None and _pre_mutation_network_error(notice_error)):
+            return _network_requeue_result(
+                dynamic_id=dynamic_id,
+                lottery_type="预约抽奖",
+                persist=persist,
+                dry_run=dry_run,
+            )
         result = ParticipateResult(
             dynamic_id=dynamic_id,
             lottery_type="预约抽奖",
@@ -621,6 +814,7 @@ def participate_reserve_lottery(
     follow_global: Exception | None = None
     follow_global_reason: str | None = None
     follow_unknown = False
+    follow_network = False
 
     if on_step:
         on_step(1, total_steps, f"正在关注（1/{total_steps}）", "follow")
@@ -652,7 +846,8 @@ def participate_reserve_lottery(
             follow_global_reason = global_reason
             follow_action = ActionResult("follow", False, str(exc).strip() or "关注失败")
         else:
-            follow_unknown = _mutation_result_unknown(exc)
+            follow_network = _pre_mutation_network_error(exc)
+            follow_unknown = not follow_network and _mutation_result_unknown(exc)
             follow_action = ActionResult("follow", False, str(exc).strip() or "关注失败")
 
     actions: list[ActionResult] = [follow_action]
@@ -669,6 +864,24 @@ def participate_reserve_lottery(
     )
 
     if not follow_action.ok:
+        if follow_network:
+            return _network_requeue_result(
+                dynamic_id=dynamic_id,
+                lottery_type="预约抽奖",
+                persist=persist,
+                dry_run=dry_run,
+            )
+        if is_self_follow_failure(follow_action.detail):
+            return _invalid_result(
+                dynamic_id=dynamic_id,
+                lottery_type="预约抽奖",
+                message="不能关注自己，活动已删除",
+                reason="self_follow_22001",
+                actions=actions,
+                context_snapshot=snapshot,
+                persist=persist,
+                dry_run=dry_run,
+            )
         follow_result_class = (
             "global_risk" if follow_risk is not None else
             (f"global_{follow_global_reason}" if follow_global is not None else
@@ -736,17 +949,21 @@ def participate_reserve_lottery(
         )
         _persist_result(result=result, persist=persist, dry_run=dry_run)
         return result
+
     except Exception as exc:
         # 明确平台风控：保留已发起动作记录并触发共享 breaker，把风险上抛给 JobRunner。
         risk = _risk_error_from_exc(exc)
         global_reason = _global_participation_reason(exc)
         if risk is None and global_reason is None:
             unknown = reserve_mutation_started and _mutation_result_unknown(exc)
+            message = str(exc).strip() or "预约失败"
+            if unknown:
+                message = "预约结果未知，已停止自动重试"
             result = ParticipateResult(
                 dynamic_id=dynamic_id,
                 lottery_type="预约抽奖",
                 status="failed",
-                message=str(exc).strip() or "预约失败",
+                message=message,
                 action_text="",
                 actions=actions,
                 context_snapshot={
@@ -914,6 +1131,24 @@ def participate_activity(
                             )
                             _persist_result(result=result, persist=persist, dry_run=dry_run)
                             return result
+                        except InvalidActivityError as exc:
+                            return _invalid_result(
+                                dynamic_id=dynamic_id,
+                                lottery_type=lottery_type,
+                                message="无法打开活动链接，活动已删除",
+                                reason=exc.reason,
+                                persist=persist,
+                                dry_run=dry_run,
+                            )
+                        except Exception as exc:
+                            if _pre_mutation_network_error(exc):
+                                return _network_requeue_result(
+                                    dynamic_id=dynamic_id,
+                                    lottery_type=lottery_type,
+                                    persist=persist,
+                                    dry_run=dry_run,
+                                )
+                            raise
                     checked_step(0, RESERVE_PARTICIPATE_STEPS if lottery_type == "预约抽奖" else 5,
                                  "检查当前目标参与状态…", "check")
                     return _participate_activity_unlocked(
@@ -923,7 +1158,20 @@ def participate_activity(
                     )
             finally:
                 _execution_uid.reset(token)
+    except InvalidActivityError as exc:
+        return _invalid_result(
+            dynamic_id=dynamic_id,
+            lottery_type=lottery_type,
+            message="无法打开活动链接，活动已删除",
+            reason=exc.reason,
+            persist=persist,
+            dry_run=dry_run,
+        )
     except ParticipationBusyError:
         return _dedup_skip(
             dynamic_id, lottery_type, "participation_busy", "当前账号正在处理这个动态，已跳过重复请求",
         )
+    # Read-phase transport failures are classified at each boundary that can
+    # prove no mutation has started.  Do not classify an arbitrary escaped
+    # exception here: it may come from a non-idempotent mutation whose result
+    # is unknown and must remain fail-closed.

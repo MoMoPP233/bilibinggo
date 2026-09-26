@@ -29,6 +29,7 @@ from src.pipeline.classify_step import ClassifyOutcome, classify_new_link
 from src.pipeline.status_step import apply_initial_status
 from src.sources.common import CheckResult, normalize_activity_id
 from src.dead_links import is_http_not_found
+from src.invalid_activities import invalid_activity_ids
 
 logger = get_logger("pipeline")
 
@@ -189,6 +190,11 @@ def run_new_links_pipeline(
     """
     dedupe = _dedupe_new_dynamic_ids(raw_urls)
     dynamic_ids = dedupe.dynamic_ids
+    invalid_ids = invalid_activity_ids()
+    skipped_invalid = sum(dynamic_id in invalid_ids for dynamic_id in dynamic_ids)
+    if invalid_ids:
+        dynamic_ids = [dynamic_id for dynamic_id in dynamic_ids if dynamic_id not in invalid_ids]
+    skip_reasons: dict[str, int] = {"invalid_activity": skipped_invalid} if skipped_invalid else {}
 
     if not dynamic_ids:
         return PipelineResult(
@@ -197,12 +203,13 @@ def run_new_links_pipeline(
             raw_link_count=len(raw_urls),
             new_link_count=0,
             classified_count=0,
-            skipped_count=0,
+            skipped_count=sum(skip_reasons.values()),
             enriched_count=0,
             persisted_count=0,
             invalid_link_count=dedupe.invalid_link_count,
             duplicate_link_count=dedupe.duplicate_link_count,
             existing_count=dedupe.existing_count,
+            skip_reasons=skip_reasons,
             message="无新链接，流水线结束",
         )
 
@@ -228,7 +235,6 @@ def run_new_links_pipeline(
         # A missing legacy guard table is handled by schema bootstrap; a read
         # failure must not turn a source refresh into an unsafe auto-entry.
         logger.debug("读取参与保护状态失败，继续使用可用的本地保护证据", exc_info=True)
-    skip_reasons: dict[str, int] = {}
     tasks: list[tuple[str, LotteryType]] = []
     classify_outcome_by_id: dict[str, ClassifyOutcome] = {}
     total = len(dynamic_ids)
@@ -395,6 +401,8 @@ def run_new_links_pipeline(
             canonical_id in known_after_classification
             or canonical_id in canonical_seen
             or raw_dynamic_id in legacy_alias_ids
+            or raw_dynamic_id in invalid_ids
+            or canonical_id in invalid_ids
             or raw_dynamic_id in protected_ids
             or canonical_id in protected_ids
         ):

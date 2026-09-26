@@ -11,6 +11,7 @@ import httpx
 
 from src.bilibili_auth import get_login_uid, require_login
 from src.bilibili_client import BilibiliClient, api_code
+from src.invalid_activities import is_self_follow_failure
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
 from src.platform_risk import API_RISK_CODES, risk_code_of as _risk_code_of
 from src.sources.common import opus_link
@@ -799,6 +800,12 @@ def execute_full_participation(
         current_action[0] = "follow"
         mutation(lambda: follow_user(client, uid=context.sender_uid, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
+
+    # A confirmed self-follow business error permanently invalidates the
+    # activity. Stop before later account mutations; the participation layer
+    # records the tombstone and removes the activity.
+    if actions and actions[-1].action == "follow" and not actions[-1].ok and is_self_follow_failure(actions[-1].detail):
+        return actions, context
 
     report_step(3, "favorite")
     if not context.favorite_available:

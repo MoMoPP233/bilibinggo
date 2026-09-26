@@ -198,6 +198,19 @@ def sanitize_log(log: str) -> str:
 
 
 def format_participation_log(payload: dict[str, Any]) -> str:
+    snapshot = payload.get("context_snapshot")
+    if isinstance(snapshot, dict):
+        result_class = str(payload.get("result_class") or snapshot.get("result_class") or "")
+        if result_class == "invalid_activity":
+            reason = str(snapshot.get("invalid_reason") or "")
+            if reason == "self_follow_22001":
+                return "不能关注自己，活动已删除"
+            return "无法打开活动链接，活动已删除"
+        if result_class == "failed_local" and snapshot.get("requeue"):
+            return "网络请求失败，已重新回到队列"
+        if result_class == "unknown":
+            unknown_action = PARTICIPATE_ACTION_LABELS.get(str(snapshot.get("unknown_action") or ""), "操作")
+            return f"{unknown_action}结果未知，已停止自动重试"
     lines: list[str] = []
     for item in payload.get("actions") or []:
         if not isinstance(item, dict):

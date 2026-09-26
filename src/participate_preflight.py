@@ -27,6 +27,21 @@ class ActivityAlreadyJoined(RuntimeError):
         self.item = item
 
 
+class InvalidActivityError(RuntimeError):
+    """The activity is permanently unusable and must not be rediscovered."""
+
+    def __init__(self, message: str, *, reason: str = "invalid_link") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _raise_client_failure(client: BilibiliClient) -> None:
+    """Expose buffered read transport failures before classifying empty data."""
+    checker = getattr(client, "raise_if_failed", None)
+    if callable(checker):
+        checker()
+
+
 def _load_activity_item(dynamic_id: str) -> dict | None:
     payload = load_previous_output(ENRICHED_OUTPUT_PATH) or {}
     for item in payload.get("activities") or []:
@@ -63,13 +78,15 @@ def _sync_live_fields(
     # Cached account state must not become positive evidence for this request.
     item["platform_participated"] = None
     detail = fetch_dynamic_detail(client, dynamic_id)
+    _raise_client_failure(client)
     if not detail:
-        raise RuntimeError("无法打开活动链接，请稍后重试")
+        raise InvalidActivityError("无法打开活动链接，请稍后重试", reason="invalid_link")
     if is_upower_dynamic(detail):
         raise RuntimeError("充电专属抽奖，不参与")
 
     if lottery_type == "互动抽奖":
         resolved = fetch_notice_for_interact(client, dynamic_id)
+        _raise_client_failure(client)
         if not resolved:
             raise RuntimeError("无法获取抽奖信息，活动可能已结束或不可参与")
         notice, _, _ = resolved
@@ -81,6 +98,7 @@ def _sync_live_fields(
         try:
             resolved = fetch_notice_for_reserve(client, dynamic_id, detail_item=detail)
         except RuntimeError:
+            _raise_client_failure(client)
             resolved = None
         if resolved:
             notice, _, _ = resolved

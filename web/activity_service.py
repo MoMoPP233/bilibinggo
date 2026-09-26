@@ -15,6 +15,7 @@ from src.participation_log import (
     load_action_entries_for_uid,
 )
 from src.participation_store import ParticipationRecord, load_participations
+from src.invalid_activities import invalid_activity_ids
 from src.participation_guard import load_blocked_guard_ids
 from src.sources.common import is_valid_dynamic_id
 from src.state_store import DATA_DIR, get_last_pipeline_persisted
@@ -229,11 +230,13 @@ def get_summary() -> dict[str, Any]:
     enriched = _load_activities_payload()
     participations = load_participations()
     blocked_ids = _load_blocked_activity_ids()
+    invalid_ids = invalid_activity_ids()
     activities = [
         item
         for item in (enriched.get("activities") or [])
         if _participatable_stored(item)
         and str(item.get("dynamic_id") or "") not in blocked_ids
+        and str(item.get("dynamic_id") or "") not in invalid_ids
     ]
     status_counts = {"已结束": 0, "已参加": 0, "未参加": 0}
     draw_counts = {"active": 0, "ended": 0}
@@ -330,6 +333,7 @@ def _filtered_activity_rows(
     participations = load_participations()
     items = [item for item in (enriched.get("activities") or []) if isinstance(item, dict)]
     blocked_ids = _load_blocked_activity_ids()
+    invalid_ids = invalid_activity_ids()
 
     normalized: list[dict[str, Any]] = []
     draw_window_value = (draw_window or "").strip().lower()
@@ -337,7 +341,7 @@ def _filtered_activity_rows(
         draw_window_value = ""
     for item in items:
         dynamic_id = str(item.get("dynamic_id") or "")
-        if dynamic_id in blocked_ids:
+        if dynamic_id in blocked_ids or dynamic_id in invalid_ids:
             # pending/unknown/suspected are protected backend states, not a
             # normal activity status.  Keep them out of every ordinary list
             # query so search, filters, sorting and pagination share one set.
@@ -400,6 +404,9 @@ def _pick_triple_from_rows(
             continue
         if not row.get("can_participate"):
             continue
+        dynamic_id = str(row.get("dynamic_id") or "").strip()
+        if not is_valid_dynamic_id(dynamic_id) or dynamic_id in seen_ids:
+            continue
         last = row.get("last_participation")
         snapshot = last.get("context_snapshot") if isinstance(last, dict) else None
         result_class = snapshot.get("result_class") if isinstance(snapshot, dict) else None
@@ -408,19 +415,17 @@ def _pick_triple_from_rows(
             # failure is handled below and may become eligible after backoff.
             continue
         if result_class == "failed_local":
-            try:
-                recorded_at = int(last.get("recorded_at") or 0) if isinstance(last, dict) else 0
-                backoff_until = int(
-                    snapshot.get("backoff_until")
-                    or (recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS if recorded_at else 0)
-                )
-            except (TypeError, ValueError):
-                backoff_until = 0
-            if backoff_until > int(time.time()):
-                continue
-        dynamic_id = str(row.get("dynamic_id") or "").strip()
-        if not is_valid_dynamic_id(dynamic_id) or dynamic_id in seen_ids:
-            continue
+            if not (isinstance(snapshot, dict) and snapshot.get("requeue")):
+                try:
+                    recorded_at = int(last.get("recorded_at") or 0) if isinstance(last, dict) else 0
+                    backoff_until = int(
+                        snapshot.get("backoff_until")
+                        or (recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS if recorded_at else 0)
+                    )
+                except (TypeError, ValueError):
+                    backoff_until = 0
+                if backoff_until > int(time.time()):
+                    continue
         row_lottery_type = str(row.get("lottery_type") or "")
         if row_lottery_type not in PARTICIPATABLE_TYPES:
             continue

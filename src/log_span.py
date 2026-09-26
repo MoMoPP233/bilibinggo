@@ -75,6 +75,7 @@ def log_span(
     component: str | None = None,
     source_id: str | None = None,
     phase: str | None = None,
+    level: int = logging.DEBUG,
     **extra: Any,
 ) -> Iterator[None]:
     log = logger or get_logger("span")
@@ -82,6 +83,7 @@ def log_span(
     log_event(
         log,
         f"span start: {name}",
+        level=level,
         event="span.start",
         component=component,
         source_id=source_id,
@@ -103,7 +105,7 @@ def log_span(
         log_event(
             log,
             f"span end: {name}",
-            level=logging.ERROR if exc_name else logging.INFO,
+            level=logging.ERROR if exc_name else level,
             event="span.end",
             component=component,
             source_id=source_id,
@@ -139,6 +141,7 @@ class PhaseSpanTracker:
         log_event(
             self._logger,
             f"span start: {self._name}",
+            level=logging.DEBUG,
             event="span.start",
             component=self._component,
             phase=phase,
@@ -152,7 +155,7 @@ class PhaseSpanTracker:
         log_event(
             self._logger,
             f"span end: {self._name}",
-            level=logging.ERROR if error_kind else logging.INFO,
+            level=logging.ERROR if error_kind else logging.DEBUG,
             event="span.end",
             component=self._component,
             phase=self._phase,

@@ -1820,7 +1820,7 @@ def _run_action_impl(
             raise ValueError(f"未找到活动 {dynamic_id} 的类型信息，请先一键更新") from exc
         total_steps = participate_step_budget(lottery_type, dynamic_id=dynamic_id)
         progress(step=0, total=total_steps, message="正在检查活动状态…", log_append="正在打开活动链接检查状态…")
-        logger.info("开始参与活动 %s (%s)", dynamic_id, lottery_type)
+        logger.debug("开始参与活动 %s (%s)", dynamic_id, lottery_type)
 
         def on_step(step: int, total: int, message: str, _action_name: str) -> None:
             _raise_if_cancelled(cancel_event)
@@ -1844,7 +1844,7 @@ def _run_action_impl(
             return {"ok": True, "message": message, "result": payload, "log": format_participation_log(payload)}
 
         refresh_local_activity_statuses()
-        logger.info("参与活动成功 %s", dynamic_id)
+        logger.debug("参与活动成功 %s", dynamic_id)
         action_log = format_participation_log(payload)
         invalidate_activity_cache()
         return {
@@ -1900,7 +1900,7 @@ def _run_action_impl(
                 },
             }
 
-        logger.info("三连参与开始：%s", ", ".join(target_titles))
+        logger.debug("三连参与开始：%s", ", ".join(target_titles))
         triple_target_items = build_triple_target_preview(targets)["items"]
         progress(
             step=0,
@@ -2144,17 +2144,33 @@ def _run_action_impl(
         log_blocks = [format_participation_log(item["payload"]) for item in results]
         skipped_count = sum(_is_participation_dedup_skip(item["payload"]) for item in results)
         unknown_count = sum(item.get("result_class") == "unknown" for item in results)
-        failed_count = sum(item.get("result_class") == "failed_local" for item in results)
+        deleted_count = sum(item.get("result_class") == "invalid_activity" for item in results)
+        requeued_count = sum(
+            bool(
+                item.get("result_class") == "failed_local"
+                and isinstance(item.get("payload", {}).get("context_snapshot"), dict)
+                and item["payload"]["context_snapshot"].get("requeue")
+            )
+            for item in results
+        )
+        failed_count = sum(
+            item.get("result_class") == "failed_local" and not (
+                isinstance(item.get("payload", {}).get("context_snapshot"), dict)
+                and item["payload"]["context_snapshot"].get("requeue")
+            )
+            for item in results
+        )
         joined_count = sum(item.get("result_class") == "joined" for item in results)
         if joined_count:
             refresh_local_activity_statuses()
         message = (
-            f"三连参与完成：成功 {joined_count} 个，失败 {failed_count} 个，"
+            f"三连参与完成：成功 {joined_count} 个，删除 {deleted_count} 个，"
+            f"重新排队 {requeued_count} 个，失败 {failed_count} 个，"
             f"跳过 {skipped_count} 个，结果未知 {unknown_count} 个"
         )
         detail_message = f"{message} | {_progress_snapshot()}"
         progress(step=total_steps, total=total_steps, message=detail_message, log_append=message)
-        logger.info(
+        logger.debug(
             "三连参与完成 joined=%s skipped=%s failed=%s unknown=%s",
             joined_count,
             skipped_count,
@@ -2178,6 +2194,8 @@ def _run_action_impl(
                 "joined": joined_count,
                 "skipped_count": skipped_count,
                 "failed": failed_count,
+                "deleted": deleted_count,
+                "requeued": requeued_count,
                 "unknown": unknown_count,
                 "not_attempted": 0,
                 "stop_reason": None,

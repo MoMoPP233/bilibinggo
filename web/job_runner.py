@@ -293,7 +293,7 @@ class JobRunner:
                 "result": {},
             },
         )
-        logger.info("任务启动 job_id=%s action=%s source=%s", job_id, action, source_s)
+        logger.debug("任务启动 job_id=%s action=%s source=%s", job_id, action, source_s)
         thread = threading.Thread(
             target=self._run_worker,
             args=(job_id, action, params, cancel_event),
