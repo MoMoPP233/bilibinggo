@@ -12,6 +12,45 @@ import { formatUnixTimestamp, formatWatchWindow, formatWindowDays } from "../uti
 import { highlightWatchUserChip, setButtonLoading } from "../utils/motion";
 import { escapeHtml } from "../utils/text";
 
+let latestUpdateAllBySourceId = new Map();
+
+function sourceKey(value) {
+  const normalized = String(value || "").trim().toUpperCase().replace(/\s+/g, "");
+  const match = normalized.match(/^DS-?(\d+)$/);
+  return match ? `DS-${match[1]}` : normalized;
+}
+
+function updateAllStatusText(entry) {
+  const status = String(entry?.status || "").toLowerCase();
+  if (status === "success") return "本次完成";
+  if (status === "running") return "更新中";
+  if (status === "cancelled" || status === "canceled" || status === "cancel" || status === "stopped") return "已取消";
+  if (status === "not_run" || status === "waiting") return "未执行";
+  if (status === "failed" || status === "error" || status === "risk") return "更新失败";
+  return "";
+}
+
+function updateAllMeta(entry) {
+  if (!entry) return "";
+  const discovered = Number(entry.discovered_count);
+  const persisted = Number(entry.persisted_count ?? entry.inserted_count ?? entry.new_count);
+  const parts = [];
+  if (Number.isFinite(discovered)) parts.push(`本轮发现 ${discovered}`);
+  if (Number.isFinite(persisted)) parts.push(`新增 ${persisted}`);
+  return parts.join(" · ");
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("binggo:update-all-result", (event) => {
+    const payload = event.detail || {};
+    const entries = Array.isArray(payload.sources) ? payload.sources : [];
+    latestUpdateAllBySourceId = new Map(entries.map((entry) => [sourceKey(entry?.source_id), entry]));
+    if (sourceGrid?.dataset?.sources) {
+      try { renderSources(JSON.parse(sourceGrid.dataset.sources)); } catch { /* ignore stale cache */ }
+    }
+  });
+}
+
 export function clearWatchMidError() {
   if (!watchAddMidInput || !watchAddMidError) return;
   watchAddMidInput.classList.remove("is-invalid");
@@ -220,6 +259,7 @@ export function renderSources(sources) {
   if (sourceCount) {
     sourceCount.textContent = `共 ${collectionSources.length} 个数据源`;
   }
+  if (sourceGrid) sourceGrid.dataset.sources = JSON.stringify(sources || []);
   sourceGrid.innerHTML = collectionSources
     .map((source, index) => {
       const links = [];
@@ -231,6 +271,12 @@ export function renderSources(sources) {
       }
       const statusClass = source.updated ? "fresh" : "cached";
       const statusText = source.updated ? "本次有更新" : "使用缓存";
+      const updateEntry = latestUpdateAllBySourceId.get(sourceKey(source.id));
+      const updateStatus = updateAllStatusText(updateEntry);
+      const updateMeta = updateAllMeta(updateEntry);
+      const updateResult = updateStatus
+        ? `<p class="source-row-update" data-update-all-source-id="${escapeHtml(source.id)}" data-update-all-status="${escapeHtml(String(updateEntry?.status || ""))}"><span>${updateStatus}</span>${updateMeta ? ` · ${escapeHtml(updateMeta)}` : ""}</p>`
+        : "";
       return `
       <article class="source-row" data-source-id="${escapeHtml(source.id)}" style="--row-delay:${index * 40}ms">
         <div class="source-row-index" aria-hidden="true">${escapeHtml(source.id)}</div>
@@ -249,6 +295,7 @@ export function renderSources(sources) {
           </div>
           <p class="source-row-meta"><span class="source-link-count">${source.link_count}</span> 条链接 · ${escapeHtml(source.title || "暂无标题")}</p>
           <p class="source-row-time">最近检查：${escapeHtml(source.checked_at_text || "尚未更新")}</p>
+          ${updateResult}
           <div class="source-links">${links.join("") || '<span class="caption">暂无外链</span>'}</div>
         </div>
       </article>`;

@@ -7,7 +7,7 @@ import { fetchJSON } from "../api/client";
 import { requireSetup } from "../account/index";
 import { startJob, updateJobUI } from "../jobs/index";
 import { showToast } from "../shell/toast";
-import { escapeHtml, sanitizeUserText } from "../utils/text";
+import { sanitizeUserText } from "../utils/text";
 
 const ACTION = "update_all_datasources";
 let starting = false;
@@ -16,9 +16,7 @@ let bound = false;
 
 function getElements() {
   return {
-    panel: document.getElementById("update-all-panel"),
     summary: document.getElementById("update-all-summary"),
-    lanes: document.getElementById("update-all-lanes"),
     startBtn: document.getElementById("update-all-sources-btn"),
     stopBtn: document.getElementById("update-all-stop-btn"),
   };
@@ -47,62 +45,36 @@ function refreshControls() {
 }
 
 function showPanel() {
-  const { panel, summary, lanes } = getElements();
-  if (panel) panel.hidden = false;
+  const { summary } = getElements();
   if (summary) summary.textContent = "正在启动全部数据源更新…";
-  if (lanes) lanes.innerHTML = '<p class="caption">等待任务开始…</p>';
 }
 
-function scanMeta(entry) {
-  const status = String(entry?.status || "waiting");
-  if (status !== "success" && status !== "risk") return [];
-  const discovered = Number(entry?.discovered_count) || 0;
-  if (entry?.updated === false && entry?.pipeline_skipped) {
-    return [`本轮源返回 ${discovered}`, "未进入候选处理"];
-  }
-  const duplicateOrInvalid = (Number(entry?.duplicate_link_count) || 0)
-    + (Number(entry?.invalid_link_count) || 0);
-  const safeSkipped = (Number(entry?.non_lottery_count) || 0)
-    + (Number(entry?.other_skipped_count) || 0);
-  const meta = [
-    `发现 ${discovered}`,
-    `已有 ${Number(entry?.existing_count) || 0}`,
-  ];
-  if (duplicateOrInvalid > 0) meta.push(`重复/无效 ${duplicateOrInvalid}`);
-  meta.push(
-    `新候选 ${Number(entry?.candidate_count ?? entry?.new_link_count) || 0}`,
-    `过期 ${Number(entry?.expired_skipped_count) || 0}`,
-    `非抽奖/其他 ${safeSkipped}`,
-    `失败 ${Number(entry?.processing_failed_count) || 0}`,
-  );
-  if (Number(entry?.persist_skipped_count) > 0) {
-    meta.push(`写入时已有 ${Number(entry.persist_skipped_count)}`);
-  }
-  meta.push(`新增 ${Number(entry?.persisted_count) || 0}`);
-  return meta;
-}
-
-function renderLanes(payload) {
-  const { lanes } = getElements();
-  if (!lanes) return;
+function sourceCounts(payload) {
   const sources = Array.isArray(payload?.sources) ? payload.sources : [];
-  if (!sources.length) return;
-  lanes.innerHTML = sources
-    .map((entry) => {
-      const status = String(entry?.status || "waiting");
-      const name = sanitizeUserText(entry?.name) || String(entry?.source_id || "");
-      const key = escapeHtml(String(entry?.source_id || ""));
-      const message = sanitizeUserText(entry?.message || "") || "";
-      const meta = scanMeta(entry);
-      const metaText = meta.length ? ` · ${meta.join(" · ")}` : "";
-      return `
-        <div class="update-all-lane" data-status="${escapeHtml(status)}">
-          <span class="update-all-lane-key"><span class="update-all-lane-dot" aria-hidden="true"></span>${key}</span>
-          <span class="update-all-lane-name">${escapeHtml(name)}</span>
-          <span class="update-all-lane-message">${escapeHtml(message || status)}${escapeHtml(metaText)}</span>
-        </div>`;
-    })
-    .join("");
+  return sources.reduce((counts, item) => {
+    const status = String(item?.status || "");
+    if (status === "success") counts.success += 1;
+    if (["failed", "error", "risk"].includes(status)) counts.failed += 1;
+    return counts;
+  }, { success: 0, failed: 0 });
+}
+
+function compactSummary(payload) {
+  const phase = String(payload?.phase || "running");
+  const counts = sourceCounts(payload);
+  const success = Number(payload?.success_count);
+  const failed = Number(payload?.failed_count);
+  const successCount = Number.isFinite(success) ? success : counts.success;
+  const failedCount = Number.isFinite(failed) ? failed : counts.failed;
+  const totals = payload?.totals || payload || {};
+  const discovered = Number(totals?.discovered_count) || 0;
+  const persisted = Number(totals?.persisted_count) || 0;
+  const status = phase === "done"
+    ? (failedCount > 0 ? "更新完成（有失败）" : "更新完成")
+    : phase === "stopped"
+      ? "已停止更新"
+      : "正在更新";
+  return `${status}（成功 ${successCount}，失败 ${failedCount}） · 本轮发现 ${discovered} · 实际新增 ${persisted}`;
 }
 
 function renderPanel(payload) {
@@ -111,8 +83,8 @@ function renderPanel(payload) {
   const total = Number(payload?.total) || 0;
   const phase = String(payload?.phase || "running");
   let text = "";
-  if (phase === "done") {
-    text = String(payload?.summary || "全部数据源更新完成");
+  if (phase === "done" || phase === "stopped") {
+    text = compactSummary(payload);
   } else if (total > 0) {
     const active = Array.isArray(payload?.sources)
       ? payload.sources.find((item) => String(item?.status) === "running")
@@ -130,7 +102,7 @@ function renderPanel(payload) {
     text = "正在启动全部数据源更新…";
   }
   if (summary) summary.textContent = text;
-  renderLanes(payload);
+  window.dispatchEvent(new CustomEvent("binggo:update-all-result", { detail: payload }));
 }
 
 function applyJobPayload(job) {

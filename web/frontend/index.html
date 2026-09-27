@@ -453,21 +453,15 @@
               <div class="panel-head panel-head-row">
                 <div>
                   <p class="eyebrow">合集数据源</p>
-                  <h2 class="section-title">UP 合集</h2>
+                  <h2 class="section-title" id="source-count">共 7 个数据源</h2>
                   <p class="section-desc">从不同合集采集抽奖内容。</p>
+                  <p class="caption update-all-summary" id="update-all-summary" aria-live="polite"></p>
                 </div>
                 <div class="action-row">
                   <button type="button" class="btn btn-primary btn-pill" id="update-all-sources-btn">一键更新全部数据源（串行）</button>
-                </div>
-              </div>
-              <div class="update-all-panel" id="update-all-panel" hidden>
-                <div class="update-all-panel-head">
-                  <p class="update-all-title" id="update-all-summary">准备更新全部数据源…</p>
                   <button type="button" class="btn btn-ghost btn-compact btn-pill" id="update-all-stop-btn" disabled>停止更新</button>
                 </div>
-                <div class="update-all-lanes" id="update-all-lanes" aria-live="polite"></div>
               </div>
-              <p class="caption source-count" id="source-count" aria-live="polite"></p>
               <div class="source-list" id="source-grid"></div>
             </div>
           </div>
