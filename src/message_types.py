@@ -123,6 +123,21 @@ def _pick_text(payload: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _pick_name(payload: dict[str, Any]) -> str:
+    """Read a nickname already present in a message payload; never fetches remotely."""
+    for key in ("nickname", "sender_name", "senderName", "uname", "name"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("user", "sender", "account_info"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            name = _pick_name(nested)
+            if name:
+                return name
+    return ""
+
+
 def normalize_feed_item(msg_type: MessageType, item: dict[str, Any]) -> MessageEntry:
     """将 msgfeed 条目归一化为 MessageEntry。"""
     user = item.get("user") or {}
@@ -160,7 +175,7 @@ def normalize_dm_message(msg: dict[str, Any], *, talker_id: int | None = None) -
         msg_type=msg_type,
         id=str(msg.get("msg_key") or msg.get("msg_seqno") or ""),
         talker_id=talker_id or sender_uid,
-        talker_name="",
+        talker_name=_pick_name(msg),
         timestamp=int(msg.get("timestamp") or 0),
         title=title,
         text=text,

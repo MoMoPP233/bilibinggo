@@ -23,42 +23,67 @@ from src.winner_scan import service as winmod
 UID = 101
 
 
-def _feed_entry(item_id: str, text: str, *, mid: int = 202, ts: int = 1000, uri: str = "") -> MessageEntry:
+def _feed_entry(
+    item_id: str,
+    text: str,
+    *,
+    mid: int = 202,
+    ts: int = 1000,
+    uri: str = "",
+    name: str | None = None,
+    raw_extra: dict | None = None,
+) -> MessageEntry:
+    raw = {"uri": uri} if uri else {}
+    raw.update(raw_extra or {})
     return MessageEntry(
         msg_type=MessageType.AT,
         id=str(item_id),
         talker_id=mid,
-        talker_name=f"用户{mid}",
+        talker_name=f"用户{mid}" if name is None else name,
         timestamp=ts,
         title="",
         text=text,
-        raw={"uri": uri} if uri else {},
+        raw=raw,
     )
 
 
-def _dm_entry(talker_id: int, seqno: int, text: str, *, ts: int = 2000) -> MessageEntry:
+def _dm_entry(
+    talker_id: int,
+    seqno: int,
+    text: str,
+    *,
+    ts: int = 2000,
+    talker_name: str = "私信用户",
+) -> MessageEntry:
     return MessageEntry(
         msg_type=MessageType.DM,
         id=str(seqno),
         talker_id=talker_id,
-        talker_name="私信用户",
+        talker_name=talker_name,
         timestamp=ts,
         text=text,
         raw={"msg_seqno": seqno},
     )
 
 
-def _session(talker_id: int, unread: int, seqno: int = 0) -> SimpleNamespace:
+def _session(
+    talker_id: int,
+    unread: int,
+    seqno: int = 0,
+    *,
+    name: str | None = None,
+    raw_extra: dict | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         talker_id=talker_id,
-        talker_name=f"会话{talker_id}",
+        talker_name=f"会话{talker_id}" if name is None else name,
         unread_count=unread,
         timestamp=2000,
         last_text="",
         is_follow=True,
         system_msg_type=0,
         msg_type=MessageType.DM,
-        raw={"last_msg_seqno": seqno},
+        raw={"last_msg_seqno": seqno, **(raw_extra or {})},
     )
 
 
@@ -181,6 +206,280 @@ def test_no_new_messages_three_sources_idle(profile: Path, monkeypatch) -> None:
     assert winmod.list_candidates() == []
     assert fake["notify"].calls == []
 
+
+def test_old_timestamp_first_discovery_still_notifies_once(profile: Path, monkeypatch) -> None:
+    """消息发布时间较早不等于已处理；首次被扫描到仍应产生一次事件。"""
+    fake = _install(monkeypatch, at=[_feed_entry("old-1", WIN_TEXT, ts=1_000)])
+    first = _run(monkeypatch)
+    assert first["sources"]["mention"]["found"] == 1
+    assert fake["notify"].calls == [("winning_candidate:mention:old-1", "winning_candidate")]
+    second = _run(monkeypatch)
+    assert second["sources"]["mention"]["found"] == 0
+    assert fake["notify"].calls == [("winning_candidate:mention:old-1", "winning_candidate")]
+
+
+def test_cross_midnight_messages_are_found_and_restart_deduplicates(profile: Path, monkeypatch) -> None:
+    """23:58/00:01 的新消息不依赖日历日；重启后稳定 key 仍只通知一次。"""
+    fake = _install(monkeypatch, at=[])
+    first = _run(monkeypatch)
+    assert first["sources"]["mention"]["found"] == 0
+
+    monkeypatch.setattr(
+        winmod,
+        "list_feed",
+        lambda client, msg_type: ([
+            _feed_entry("late-2358", WIN_TEXT, ts=1_758_999_480),
+            _feed_entry("early-0001", WIN_TEXT, ts=1_759_000_060),
+        ], {"id": "late-2358", "time": 1_759_000_060}) if msg_type == MessageType.AT else ([], {"id": "22", "time": 222}),
+    )
+    second = _run(monkeypatch)
+    assert second["sources"]["mention"]["found"] == 2
+    assert {event for event, _ in fake["notify"].calls} == {
+        "winning_candidate:mention:late-2358",
+        "winning_candidate:mention:early-0001",
+    }
+
+    restarted = winmod.WinnerScanService(notification=fake["notify"])
+    monkeypatch.setattr(winmod, "service", restarted)
+    third = _run(monkeypatch)
+    assert third["sources"]["mention"]["found"] == 0
+    assert len(fake["notify"].calls) == 2
+
+
+def test_historical_explicit_auto_reply_is_suppressed_without_deleting_candidate(profile: Path, monkeypatch) -> None:
+    winmod._save_candidates({
+        "dm:3001:1": {
+            "key": "dm:3001:1",
+            "source_type": "dm",
+            "auto_reply": True,
+            "notification_event_id": "winning_candidate:dm:3001:1",
+            "discovered_at": 10,
+        },
+        "dm:3001:2": {
+            "key": "dm:3001:2",
+            "source_type": "dm",
+            "metadata": {"system_msg_type": 5},
+            "notification_event_id": "winning_candidate:dm:3001:2",
+            "discovered_at": 11,
+        },
+        "mention:rog-1": {
+            "key": "mention:rog-1",
+            "source_type": "mention",
+            "sender": {"name": "ROG玩家国度官方UP"},
+            "summary": "恭喜共计10位小伙伴中奖",
+            "discovered_at": 9,
+        },
+        "mention:ambiguous": {
+            "key": "mention:ambiguous",
+            "source_type": "mention",
+            "summary": "正文提到自动回复，但没有结构化标记",
+            "discovered_at": 8,
+        },
+    })
+
+    first = winmod.list_candidates(20)
+    second = winmod.list_candidates(20)
+
+    keys = {item["key"] for item in first}
+    assert {"dm:3001:1", "dm:3001:2"}.isdisjoint(keys)
+    assert {"mention:rog-1", "mention:ambiguous"} <= keys
+    assert [item["key"] for item in first] == [item["key"] for item in second]
+    persisted = winmod._load_candidates()
+    assert "dm:3001:1" in persisted  # durable suppression，不物理删除 candidate/outbox 关联
+
+
+def test_historical_auto_reply_suppression_is_profile_local(tmp_path: Path, monkeypatch) -> None:
+    profile_a = tmp_path / "a"
+    profile_b = tmp_path / "b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    monkeypatch.setattr(winmod, "get_profile_dir", lambda: profile_a)
+    winmod._save_candidates({"dm:a": {"key": "dm:a", "source_type": "dm", "is_auto_reply": True}})
+    assert winmod.list_candidates() == []
+    monkeypatch.setattr(winmod, "get_profile_dir", lambda: profile_b)
+    winmod._save_candidates({"mention:b": {"key": "mention:b", "source_type": "mention"}})
+    assert [item["key"] for item in winmod.list_candidates()] == ["mention:b"]
+
+
+def test_manual_candidate_suppression_is_durable_and_identity_scoped(profile: Path, monkeypatch) -> None:
+    winmod._save_candidates(
+        {
+            "mention:old": {
+                "key": "mention:old",
+                "source_type": "mention",
+                "sender": {"id": 202, "name": "同一发送者"},
+                "summary": "同一发送者: 垃圾中奖提醒",
+                "discovered_at": 10,
+                "notification_event_id": "winning_candidate:mention:old",
+            },
+            "mention:new": {
+                "key": "mention:new",
+                "source_type": "mention",
+                "sender": {"id": 202, "name": "同一发送者"},
+                "summary": "同一发送者: 新中奖消息",
+                "discovered_at": 11,
+                "notification_event_id": "winning_candidate:mention:new",
+            },
+        }
+    )
+
+    result = winmod.suppress_candidate("mention:old")
+    assert result["reason"] == "manual_delete"
+    assert [item["key"] for item in winmod.list_candidates()] == ["mention:new"]
+    assert "mention:old" in winmod._load_candidates()  # 不物理删除 candidate
+    assert winmod.suppress_candidate("mention:old")["suppressed"] is True  # 幂等
+
+    state = winmod._load_state()
+    assert state["mention"]["cursor_id"] == 0
+    assert any(item["key"] == "mention:old" for item in state["suppressed_candidates"])
+
+    # 模拟同一 source event 再次扫描：suppression 阻止重新落 candidate/通知。
+    fake = _install(monkeypatch, at=[_feed_entry("old", WIN_TEXT), _feed_entry("newer", WIN_TEXT)])
+    result = _run(monkeypatch)
+    assert result["sources"]["mention"]["found"] == 1
+    assert {item["key"] for item in winmod.list_candidates()} == {"mention:new", "mention:newer"}
+    assert ("winning_candidate:mention:old", "winning_candidate") not in fake["notify"].calls
+
+
+def test_mention_candidate_preserves_nested_dynamic_link_and_nickname(profile: Path, monkeypatch) -> None:
+    dynamic_id = "1221021101641957383"
+    fake = _install(
+        monkeypatch,
+        at=[
+            _feed_entry(
+                "mention-real-1",
+                "恭喜共计10位小伙伴中奖 @H牵手的痛",
+                mid=8848,
+                name="",
+                raw_extra={
+                    "user": {"nickname": "ROG玩家国度官方UP", "mid": 8848},
+                    "item": {
+                        "dynamic_id": dynamic_id,
+                        "uri": f"https://t.bilibili.com/{dynamic_id}",
+                    },
+                },
+            )
+        ],
+    )
+
+    result = _run(monkeypatch)
+
+    assert result["sources"]["mention"]["found"] == 1
+    candidate = winmod.list_candidates()[0]
+    assert candidate["sender"] == {"id": 8848, "name": "ROG玩家国度官方UP"}
+    assert candidate["dynamic_id"] == dynamic_id
+    assert candidate["source_url"] == f"https://t.bilibili.com/{dynamic_id}"
+    assert fake["notify"].calls == [("winning_candidate:mention:mention-real-1", "winning_candidate")]
+
+
+def test_dm_candidate_uses_payload_nickname_and_explicit_session_url(profile: Path, monkeypatch) -> None:
+    session_url = "https://message.bilibili.com/#/whisper/3001"
+    _install(
+        monkeypatch,
+        sessions=[
+            _session(
+                3001,
+                unread=1,
+                name="中奖好友",
+                raw_extra={"conversation_url": session_url},
+            )
+        ],
+        dm_messages={3001: [_dm_entry(3001, 91, WIN_TEXT, talker_name="")]},
+    )
+
+    result = _run(monkeypatch)
+
+    assert result["sources"]["dm"]["found"] == 1
+    candidate = winmod.list_candidates()[0]
+    assert candidate["sender"] == {"id": 3001, "name": "中奖好友"}
+    assert candidate["source_url"] == session_url
+
+
+def test_dm_candidate_resolves_nickname_once_and_builds_precise_whisper_url(profile: Path, monkeypatch) -> None:
+    _install(
+        monkeypatch,
+        sessions=[_session(39945369, unread=2, name="")],
+        dm_messages={
+            39945369: [
+                _dm_entry(39945369, 1, WIN_TEXT, talker_name=""),
+                _dm_entry(39945369, 2, "恭喜中奖，请回复收货信息", talker_name=""),
+            ]
+        },
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_json(self, url, *, params=None, referer=None, retries=0):
+            assert url.endswith("/x/space/acc/info")
+            assert params == {"mid": 39945369}
+            self.calls += 1
+            return {"code": 0, "data": {"name": "中奖好友"}}
+
+    client = FakeClient()
+    result = winmod.service.run(client)
+
+    assert result["sources"]["dm"]["found"] == 2
+    assert client.calls == 1
+    candidates = sorted(winmod.list_candidates(), key=lambda item: item["key"])
+    assert all(item["sender"] == {"id": 39945369, "name": "中奖好友"} for item in candidates)
+    assert all(item["source_url"] == "https://message.bilibili.com/#/whisper/mid39945369" for item in candidates)
+
+
+def test_dm_nickname_lookup_failure_keeps_uid_candidate_and_does_not_retry(profile: Path, monkeypatch) -> None:
+    _install(
+        monkeypatch,
+        sessions=[_session(39945369, unread=2, name="")],
+        dm_messages={
+            39945369: [
+                _dm_entry(39945369, 1, WIN_TEXT, talker_name=""),
+                _dm_entry(39945369, 2, "恭喜中奖，请回复收货信息", talker_name=""),
+            ]
+        },
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_json(self, *args, **kwargs):
+            self.calls += 1
+            raise RuntimeError("temporary lookup failure")
+
+    client = FakeClient()
+    result = winmod.service.run(client)
+
+    assert result["sources"]["dm"]["found"] == 2
+    assert client.calls == 1
+    assert all(item["sender"] == {"id": 39945369, "name": ""} for item in winmod.list_candidates())
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "恭喜您在评论区获奖，请在9月29日前及时私信，发送您的收件人、联系电话还有收件地址。",
+        "收件人：张三，联系电话：123，收件地址：上海市。",
+        "恭喜中奖，请直接回复您的收货信息。",
+    ],
+)
+def test_delivery_winner_keyword_combinations(text: str) -> None:
+    assert winmod.judge_keywords(text) is True
+
+
+@pytest.mark.parametrize("text", ["请修改你的联系电话", "这个地址在哪里", "这是自动回复吗？联系电话是什么？"])
+def test_delivery_weak_keywords_do_not_match(text: str) -> None:
+    assert winmod.judge_keywords(text) is False
+
+
+def test_dm_whisper_url_is_fail_closed_for_invalid_or_system_sender() -> None:
+    invalid_entry = _dm_entry(0, 1, WIN_TEXT, talker_name="")
+    invalid_session = _session(0, unread=1, name="")
+    assert winmod._dm_source_url(invalid_entry, invalid_session) == ""
+
+    system_session = _session(39945369, unread=1, name="")
+    system_session.system_msg_type = 5
+    assert winmod._dm_source_url(_dm_entry(39945369, 1, WIN_TEXT, talker_name=""), system_session) == ""
 
 # ---------- E/F/Q：cursor 独立 + partial + 普通失败不伪装 ----------
 

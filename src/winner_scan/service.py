@@ -36,9 +36,13 @@ from src.message_api import fetch_dm_messages, list_dm_sessions, list_feed
 from src.message_types import MessageEntry, MessageType
 from src.notification.service import NotificationLocalError, NotificationService
 from src.platform_risk import risk_code_of
+from src.sources.common import is_valid_dynamic_id, opus_link
 
 _STATE_FILE = "winner_scan_state.json"
 _CANDIDATES_FILE = "winner_candidates.json"
+_NICKNAME_CACHE_FILE = "winner_nickname_cache.json"
+_NICKNAME_CACHE_LIMIT = 500
+_NICKNAME_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_REPLY_ENTRIES = 20
 MAX_DM_SESSIONS = 20
 MAX_DM_MESSAGES_PER_SESSION = 20
@@ -55,6 +59,7 @@ DEFAULT_KEYWORDS = [
 #   + 无强中奖/领奖信号 + 无链接
 # 任一条件不满足 → 保留为正常 Winner 扫描对象（宁可留可疑候选，不误杀真实中奖）。
 _FILTERED_AUTO_REPLIES_LIMIT = 200
+_SUPPRESSED_CANDIDATES_LIMIT = 500
 
 # 强中奖/领奖信号：命中任一即否决过滤（优先级高于欢迎模板）。
 # 注意：不含“恭喜/获得/幸运”这类泛化词——“恭喜成为我的粉丝”正是本次误判来源。
@@ -77,6 +82,44 @@ STRONG_WINNER_MARKERS = (
     "收货地址",
     "核对信息",
     "联系方式",
+    "领取奖品",
+    "领取奖励",
+    "恭喜中奖",
+    "恭喜获奖",
+    "收件人",
+    "联系电话",
+    "收件地址",
+    "收货信息",
+)
+
+_WINNER_INTENT_MARKERS = (
+    "中奖",
+    "获奖",
+    "恭喜中奖",
+    "恭喜获奖",
+    "领奖",
+    "领取奖品",
+    "领取奖励",
+    "兑奖",
+    "奖品",
+)
+_DELIVERY_INFO_MARKERS = (
+    "收件人",
+    "联系电话",
+    "联系方式",
+    "收件地址",
+    "收货地址",
+    "收货信息",
+    "收件信息",
+    "回复收货信息",
+    "发送收货信息",
+)
+_DELIVERY_AUXILIARY_MARKERS = (
+    "逾期未发送",
+    "自动放弃领奖",
+    "放弃领奖",
+    "请在",
+    "请于",
 )
 
 _LINK_RE = re.compile(
@@ -106,6 +149,15 @@ _LEADING_ADDRESS_RE = re.compile(
 def has_strong_winner_signal(text: str) -> bool:
     value = str(text or "")
     return any(marker in value for marker in STRONG_WINNER_MARKERS)
+
+
+def has_delivery_winner_signal(text: str) -> bool:
+    """识别领奖收货信息组合，避免“电话/地址”单独误报。"""
+    value = str(text or "")
+    intent = any(marker in value for marker in _WINNER_INTENT_MARKERS)
+    fields = sum(marker in value for marker in _DELIVERY_INFO_MARKERS)
+    auxiliary = any(marker in value for marker in _DELIVERY_AUXILIARY_MARKERS)
+    return fields >= 2 or (intent and (fields >= 1 or auxiliary))
 
 
 def contains_link(text: str) -> bool:
@@ -172,6 +224,19 @@ def is_high_confidence_follow_auto_reply(entry: MessageEntry, session: Any) -> b
     return is_welcome_template(text)
 
 
+def is_explicit_auto_reply(entry: MessageEntry) -> bool:
+    """识别平台 payload 明确标记的自动回复，不依赖正文文案。"""
+    raw = entry.raw or {}
+    for key in ("auto_reply", "is_auto_reply"):
+        if raw.get(key) is True or str(raw.get(key) or "").strip().lower() in {"true", "1", "yes"}:
+            return True
+    for key in ("message_type", "msg_type", "messageType"):
+        marker = str(raw.get(key) or "").strip().lower().replace("-", "_")
+        if marker in {"auto_reply", "autoreply", "automatic_reply"}:
+            return True
+    return False
+
+
 def judge_keywords(text: str, patterns: list[str] | None = None) -> bool:
     """关键词判定（复用 bil-1-main 语义）：`~` 开头为黑名单（命中置 False），
     其余为白名单（命中置 True）；后面的规则优先级更高。仅表示“疑似中奖”。"""
@@ -192,7 +257,8 @@ def judge_keywords(text: str, patterns: list[str] | None = None) -> bool:
             matched = pattern in text
         if matched:
             result = not is_black
-    return result
+    # 默认规则之外补充领奖收货信息组合；单独“地址/电话/回复/私信”仍不会命中。
+    return result or (patterns is None and has_delivery_winner_signal(text))
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +272,10 @@ def _state_path() -> Path:
 
 def _candidates_path() -> Path:
     return get_profile_dir() / _CANDIDATES_FILE
+
+
+def _nickname_cache_path() -> Path:
+    return get_profile_dir() / _NICKNAME_CACHE_FILE
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -264,6 +334,26 @@ def _load_state() -> dict[str, Any]:
         ][-_FILTERED_AUTO_REPLIES_LIMIT:]
     else:
         state["filtered_auto_replies"] = []
+    suppressed = stored.get("suppressed_candidates")
+    if isinstance(suppressed, list):
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in suppressed:
+            if isinstance(item, dict):
+                key = str(item.get("key") or "").strip()
+                reason = str(item.get("reason") or "manual_delete").strip() or "manual_delete"
+                at = item.get("suppressed_at")
+            else:
+                key = str(item or "").strip()
+                reason = "manual_delete"
+                at = None
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"key": key, "reason": reason, "suppressed_at": at})
+        state["suppressed_candidates"] = normalized[-_SUPPRESSED_CANDIDATES_LIMIT:]
+    else:
+        state["suppressed_candidates"] = []
     return state
 
 
@@ -272,6 +362,7 @@ def _save_state(state: dict[str, Any]) -> None:
         key: state[key] for key in ("mention", "reply", "dm") if key in state
     }
     filtered = state.get("filtered_auto_replies") or []
+    suppressed = state.get("suppressed_candidates") or []
     _write_json(
         _state_path(),
         {
@@ -280,6 +371,11 @@ def _save_state(state: dict[str, Any]) -> None:
             "filtered_auto_replies": [
                 str(item) for item in filtered if str(item or "").strip()
             ][-_FILTERED_AUTO_REPLIES_LIMIT:],
+            "suppressed_candidates": [
+                item
+                for item in suppressed
+                if isinstance(item, dict) and str(item.get("key") or "").strip()
+            ][-_SUPPRESSED_CANDIDATES_LIMIT:],
         },
     )
 
@@ -297,10 +393,113 @@ def _save_candidates(candidates: dict[str, dict[str, Any]]) -> None:
     _write_json(_candidates_path(), {"version": 1, "candidates": ordered[-500:]})
 
 
+def _load_nickname_cache() -> dict[str, dict[str, Any]]:
+    stored = _read_json(_nickname_cache_path())
+    entries = stored.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    now = int(time.time())
+    result: dict[str, dict[str, Any]] = {}
+    for uid, item in entries.items():
+        key = str(uid).strip()
+        if not key.isdigit() or int(key) <= 0 or not isinstance(item, dict):
+            continue
+        nickname = str(item.get("nickname") or "").strip()
+        cached_at = int(item.get("cached_at") or 0)
+        if nickname and cached_at > 0 and now - cached_at <= _NICKNAME_CACHE_TTL_SECONDS:
+            result[key] = {"nickname": nickname, "cached_at": cached_at}
+    return result
+
+
+def _save_nickname_cache(cache: dict[str, dict[str, Any]]) -> None:
+    ordered = sorted(cache.items(), key=lambda pair: int(pair[1].get("cached_at") or 0), reverse=True)
+    _write_json(
+        _nickname_cache_path(),
+        {"version": 1, "entries": dict(ordered[:_NICKNAME_CACHE_LIMIT])},
+    )
+
+
+def _candidate_is_explicit_auto_reply(record: dict[str, Any]) -> bool:
+    """只根据候选中持久化的结构化元数据判断历史自动回复。"""
+    payloads: list[dict[str, Any]] = [record]
+    for key in ("raw", "metadata", "source_payload", "message"):
+        nested = record.get(key)
+        if isinstance(nested, dict):
+            payloads.append(nested)
+    for payload in payloads:
+        for key in ("auto_reply", "is_auto_reply"):
+            if payload.get(key) is True or str(payload.get(key) or "").strip().lower() in {"true", "1", "yes"}:
+                return True
+        for key in ("message_type", "msg_type", "messageType"):
+            marker = str(payload.get(key) or "").strip().lower().replace("-", "_")
+            if marker in {"auto_reply", "autoreply", "automatic_reply"}:
+                return True
+    if str(record.get("source_type") or "") == "dm":
+        for payload in payloads:
+            try:
+                if int(payload.get("system_msg_type") or 0) in {1, 5, 7, 8, 9}:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _suppressed_candidate_keys(state: dict[str, Any] | None = None) -> set[str]:
+    current = state if state is not None else _load_state()
+    values = current.get("suppressed_candidates") or []
+    result: set[str] = set()
+    for item in values:
+        if isinstance(item, dict):
+            key = str(item.get("key") or "").strip()
+        else:
+            key = str(item or "").strip()
+        if key:
+            result.add(key)
+    return result
+
+
+def suppress_candidate(key: str, *, reason: str = "manual_delete") -> dict[str, Any]:
+    """Persist Profile-local suppression for one stable candidate identity.
+
+    Candidate and notification records remain untouched; the key is filtered from
+    future views/scans so the same source event cannot reappear or notify again.
+    """
+    stable_key = str(key or "").strip()
+    if not stable_key:
+        raise ValueError("候选 identity 不能为空")
+    candidates = _load_candidates()
+    if stable_key not in candidates:
+        raise KeyError(stable_key)
+    with get_atomic_path_lock(_state_path()):
+        state = _load_state()
+        entries = list(state.get("suppressed_candidates") or [])
+        if not any(isinstance(item, dict) and str(item.get("key") or "") == stable_key for item in entries):
+            entries.append(
+                {
+                    "key": stable_key,
+                    "reason": str(reason or "manual_delete"),
+                    "suppressed_at": int(time.time()),
+                }
+            )
+            state["suppressed_candidates"] = entries[-_SUPPRESSED_CANDIDATES_LIMIT:]
+            _save_state(state)
+    return {"key": stable_key, "reason": str(reason or "manual_delete"), "suppressed": True}
+
+
 def list_candidates(limit: int = 50) -> list[dict[str, Any]]:
     candidates = _load_candidates()
-    ordered = sorted(candidates.values(), key=lambda item: int(item.get("discovered_at") or 0), reverse=True)
-    return ordered[:limit]
+    suppressed = _suppressed_candidate_keys()
+    ordered = sorted(
+        (
+            item
+            for item in candidates.values()
+            if str(item.get("key") or "") not in suppressed
+            and not _candidate_is_explicit_auto_reply(item)
+        ),
+        key=lambda item: int(item.get("discovered_at") or 0),
+        reverse=True,
+    )
+    return [_candidate_view(item) for item in ordered[:limit]]
 
 
 def scan_status_view() -> dict[str, Any]:
@@ -334,10 +533,117 @@ def _source_entry_key(source_type: str, entry: MessageEntry) -> str | None:
     return f"{source_type}:{item_id}"
 
 
+def _payloads(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
+    root = raw if isinstance(raw, dict) else {}
+    payloads = [root]
+    for key in ("item", "detail", "source", "data", "message"):
+        nested = root.get(key)
+        if isinstance(nested, dict):
+            payloads.append(nested)
+    return payloads
+
+
+def _dynamic_id_from_raw(raw: dict[str, Any] | None) -> str:
+    for payload in _payloads(raw):
+        for field in ("dynamic_id", "dynamicId", "business_id"):
+            value = str(payload.get(field) or "").strip()
+            if is_valid_dynamic_id(value):
+                return value
+    return ""
+
+
+def _source_url_from_raw(raw: dict[str, Any] | None) -> str:
+    for payload in _payloads(raw):
+        for field in (
+            "source_url",
+            "dynamic_url",
+            "reply_url",
+            "jump_url",
+            "detail_url",
+            "native_url",
+            "conversation_url",
+            "session_url",
+            "uri",
+            "url",
+        ):
+            uri = str(payload.get(field) or "").strip()
+            if uri.startswith(("http://", "https://")):
+                return uri
+    dynamic_id = _dynamic_id_from_raw(raw)
+    return opus_link(dynamic_id) if dynamic_id else ""
+
+
 def _source_url(entry: MessageEntry) -> str:
-    raw = entry.raw or {}
-    uri = str(raw.get("uri") or "").strip()
-    return uri if uri.startswith("http") else ""
+    return _source_url_from_raw(entry.raw)
+
+
+def _dm_source_url(entry: MessageEntry, session: Any) -> str:
+    url = _source_url(entry)
+    if url:
+        return url
+    raw = getattr(session, "raw", None)
+    url = _source_url_from_raw(raw)
+    if url:
+        return url
+    # 普通用户会话可直接进入对应会话；系统消息不得套用 whisper pattern。
+    try:
+        system_msg_type = int(getattr(session, "system_msg_type", 0) or 0)
+        sender_uid = int(getattr(session, "talker_id", 0) or 0)
+        entry_system_msg_type = int((entry.raw or {}).get("system_msg_type") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if system_msg_type in {1, 5, 7, 8, 9} or entry_system_msg_type in {1, 5, 7, 8, 9} or sender_uid <= 0:
+        return ""
+    if not re.fullmatch(r"[1-9][0-9]*", str(sender_uid)):
+        return ""
+    return f"https://message.bilibili.com/#/whisper/mid{sender_uid}"
+
+
+def _sender_name_from_raw(raw: dict[str, Any] | None) -> str:
+    for payload in _payloads(raw):
+        for field in ("nickname", "sender_name", "senderName", "uname", "name"):
+            value = str(payload.get(field) or "").strip()
+            if value:
+                return value
+        for field in ("user", "sender", "account_info"):
+            nested = payload.get(field)
+            if isinstance(nested, dict):
+                value = _sender_name_from_raw(nested)
+                if value:
+                    return value
+    return ""
+
+
+def _candidate_sender(record: dict[str, Any]) -> dict[str, Any] | None:
+    sender = record.get("sender") if isinstance(record.get("sender"), dict) else {}
+    sender_id = sender.get("id") or record.get("sender_id") or record.get("talker_id")
+    sender_name = (
+        sender.get("name")
+        or sender.get("nickname")
+        or record.get("sender_name")
+        or record.get("nickname")
+        or _sender_name_from_raw(record.get("raw"))
+    )
+    if not sender_id and not sender_name:
+        return None
+    return {"id": sender_id, "name": str(sender_name or "")}
+
+
+def _candidate_view(record: dict[str, Any]) -> dict[str, Any]:
+    view = dict(record)
+    sender = _candidate_sender(record)
+    if sender is not None:
+        view["sender"] = sender
+    dynamic_id = str(view.get("dynamic_id") or "").strip() or _dynamic_id_from_raw(record.get("raw"))
+    if dynamic_id:
+        view["dynamic_id"] = dynamic_id
+    if not str(view.get("source_url") or ""):
+        source_url = _source_url_from_raw(record.get("raw"))
+        if not source_url and is_valid_dynamic_id(dynamic_id):
+            source_url = opus_link(dynamic_id)
+        if source_url:
+            view["source_url"] = source_url
+    return view
 
 
 def _summary_for(source_type: str, entry: MessageEntry) -> str:
@@ -358,6 +664,63 @@ class WinnerScanService:
     def __init__(self, notification: NotificationService | None = None) -> None:
         self.notification = notification or NotificationService()
 
+    def _lookup_nickname(
+        self,
+        client: Any,
+        sender_uid: int,
+        *,
+        cache: dict[str, dict[str, Any]],
+        attempted: set[int],
+        blocked: list[bool],
+    ) -> str:
+        """Resolve one newly discovered DM sender without fan-out.
+
+        Cache hits are local-only. A UID is attempted at most once per scan; a
+        platform-risk response disables all subsequent nickname lookups while
+        leaving the winner candidate on the UID fallback path.
+        """
+        if sender_uid <= 0 or blocked[0]:
+            return ""
+        key = str(sender_uid)
+        cached = cache.get(key)
+        now = int(time.time())
+        if cached and now - int(cached.get("cached_at") or 0) <= _NICKNAME_CACHE_TTL_SECONDS:
+            return str(cached.get("nickname") or "").strip()
+        if sender_uid in attempted:
+            return ""
+        attempted.add(sender_uid)
+        try:
+            url = "https://api.bilibili.com/x/space/acc/info"
+            if hasattr(client, "get_json"):
+                payload = client.get_json(
+                    url,
+                    params={"mid": sender_uid},
+                    referer="https://space.bilibili.com",
+                    retries=0,
+                )
+            else:
+                payload = client.request_json(
+                    url,
+                    params={"mid": sender_uid},
+                    referer="https://space.bilibili.com",
+                    retries=0,
+                )
+            code = payload.get("code") if isinstance(payload, dict) else None
+            if code not in (None, 0):
+                raise RuntimeError(f"API error {code}: {payload.get('message') or payload.get('msg') or ''}")
+            data = payload.get("data") if isinstance(payload, dict) else None
+            data = data if isinstance(data, dict) else {}
+            nickname = str(data.get("name") or data.get("uname") or data.get("nickname") or "").strip()
+            if not nickname:
+                return ""
+            cache[key] = {"nickname": nickname, "cached_at": now}
+            _save_nickname_cache(cache)
+            return nickname
+        except Exception as exc:  # noqa: BLE001 - enrichment must never drop a candidate
+            if risk_code_of(exc) is not None:
+                blocked[0] = True
+            return ""
+
     # -- 单来源实现（各自独立成功/失败与推进） --
 
     def _scan_feed_source(
@@ -368,9 +731,11 @@ class WinnerScanService:
         *,
         state: dict[str, Any],
         existing: dict[str, dict[str, Any]],
+        suppressed: set[str] | None = None,
     ) -> tuple[int, list[str]]:
         found_keys: list[str] = []
         newly_saved = 0
+        suppressed_keys = suppressed if suppressed is not None else _suppressed_candidate_keys()
         for entry in entries[:MAX_REPLY_ENTRIES]:
             text = str(entry.text or entry.title or "")
             if not judge_keywords(text):
@@ -380,14 +745,19 @@ class WinnerScanService:
                 self._record_malformed(state, source_type, entry)
                 continue
             existing_record = existing.get(key)
-            if existing_record is not None:
+            if existing_record is not None or key in suppressed_keys:
                 continue
             event_id = f"winning_candidate:{key}"
             existing[key] = {
                 "key": key,
                 "source_type": source_type,
                 "source_item_id": str(entry.id or ""),
-                "sender": {"id": entry.talker_id, "name": entry.talker_name} if entry.talker_id else None,
+                "sender": {
+                    "id": entry.talker_id,
+                    "name": entry.talker_name or _sender_name_from_raw(entry.raw),
+                }
+                if entry.talker_id
+                else None,
                 "summary": _summary_for(source_type, entry),
                 "source_time": _entry_timestamp(entry),
                 "discovered_at": int(time.time()),
@@ -395,6 +765,9 @@ class WinnerScanService:
                 "status": "candidate",
                 "notification_event_id": event_id,
             }
+            dynamic_id = _dynamic_id_from_raw(entry.raw)
+            if dynamic_id:
+                existing[key]["dynamic_id"] = dynamic_id
             newly_saved += 1
             found_keys.append(key)
         return newly_saved, found_keys
@@ -437,6 +810,10 @@ class WinnerScanService:
         auto_reply_skipped = 0
         newly_saved = 0
         found_keys: list[str] = []
+        suppressed = _suppressed_candidate_keys(state)
+        nickname_cache = _load_nickname_cache()
+        nickname_attempted: set[int] = set()
+        nickname_lookup_blocked = [False]
         for session in sessions:
             if session.unread_count <= 0:
                 continue
@@ -453,7 +830,7 @@ class WinnerScanService:
                 if key is not None and key in filtered:
                     # 已记录为关注自动回复：不生成 candidate、不通知、不重复计数。
                     continue
-                if is_high_confidence_follow_auto_reply(entry, session):
+                if is_explicit_auto_reply(entry) or is_high_confidence_follow_auto_reply(entry, session):
                     if key is not None:
                         filtered.add(key)
                         newly_filtered.append(key)
@@ -465,18 +842,31 @@ class WinnerScanService:
                 if key is None:
                     self._record_malformed(state["dm"], "dm", entry)
                     continue
-                if existing.get(key) is not None:
+                if existing.get(key) is not None or key in suppressed:
                     continue
                 event_id = f"winning_candidate:{key}"
+                sender_uid = int(session.talker_id)
+                sender_name = entry.talker_name or session.talker_name or _sender_name_from_raw(entry.raw)
+                if not sender_name:
+                    sender_name = self._lookup_nickname(
+                        client,
+                        sender_uid,
+                        cache=nickname_cache,
+                        attempted=nickname_attempted,
+                        blocked=nickname_lookup_blocked,
+                    )
                 existing[key] = {
                     "key": key,
                     "source_type": "dm",
                     "source_item_id": str(entry.id or ""),
-                    "sender": {"id": int(session.talker_id), "name": session.talker_name},
+                    "sender": {
+                        "id": sender_uid,
+                        "name": sender_name,
+                    },
                     "summary": _summary_for("dm", entry),
                     "source_time": _entry_timestamp(entry),
                     "discovered_at": int(time.time()),
-                    "source_url": _source_url(entry),
+                    "source_url": _dm_source_url(entry, session),
                     "status": "candidate",
                     "notification_event_id": event_id,
                 }
@@ -521,6 +911,7 @@ class WinnerScanService:
 
         state = _load_state()
         existing = _load_candidates()
+        suppressed = _suppressed_candidate_keys(state)
         partial = False
         outcomes: dict[str, Any] = {}
         try:
@@ -529,7 +920,9 @@ class WinnerScanService:
                 raise RuntimeError("任务已取消")
             try:
                 entries, cursor = list_feed(active_client, MessageType.AT)
-                saved, keys = self._scan_feed_source("mention", MessageType.AT, entries, state=state["mention"], existing=existing)
+                saved, keys = self._scan_feed_source(
+                    "mention", MessageType.AT, entries, state=state["mention"], existing=existing, suppressed=suppressed
+                )
                 # 1) candidate durable；2) 通知（claim→HTTP→terminal durable）；3) 最后推进 checkpoint
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
@@ -547,7 +940,9 @@ class WinnerScanService:
                 raise RuntimeError("任务已取消")
             try:
                 entries, cursor = list_feed(active_client, MessageType.REPLY)
-                saved, keys = self._scan_feed_source("reply", MessageType.REPLY, entries, state=state["reply"], existing=existing)
+                saved, keys = self._scan_feed_source(
+                    "reply", MessageType.REPLY, entries, state=state["reply"], existing=existing, suppressed=suppressed
+                )
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
                 self._advance_source_state(state, "reply", cursor=cursor)

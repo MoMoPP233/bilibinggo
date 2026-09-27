@@ -5,6 +5,7 @@
 import { fetchJSON } from "../api/client";
 import { startJob } from "../jobs/index";
 import { state as appState } from "../state";
+import { openAppConfirm } from "../shell/confirm";
 import { showToast } from "../shell/toast";
 import { formatAutoCountdown } from "../utils/format";
 import { escapeHtml } from "../utils/text";
@@ -36,7 +37,7 @@ const STATUS_LABELS = {
   dispatching: "发送中", // 当前进程真实在途发送（短暂）
 };
 const EVENT_LABELS = {
-  winning_candidate: "疑似中奖候选",
+  winning_candidate: "中奖提醒",
   winning_confirmed: "中奖确认",
   platform_risk: "平台风控",
   auto_task_error: "自动任务失败",
@@ -44,6 +45,15 @@ const EVENT_LABELS = {
   test: "测试",
 };
 const EVENT_PRODUCER_PENDING = new Set(["platform_risk", "auto_task_error", "auto_task_completed"]);
+const CHANNEL_LABELS = {
+  serverchan: "Server酱",
+  dingtalk: "钉钉",
+  wecom: "企业微信",
+  enterprise_wechat: "企业微信",
+  feishu: "飞书",
+};
+const SOURCE_LABELS_M3 = { mention: "@提及", reply: "回复", dm: "私信" };
+const MESSAGE_CENTER_URL = "https://message.bilibili.com";
 
 function timeText(value) {
   if (!value) return "—";
@@ -51,6 +61,90 @@ function timeText(value) {
   if (Number.isNaN(date.getTime())) return "—";
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function channelLabel(value) {
+  const key = String(value || "");
+  return CHANNEL_LABELS[key] || key || "未知渠道";
+}
+
+function recordDeleteUrl(record) {
+  const eventId = String(record?.event_id || "").trim();
+  const channel = String(record?.channel || "").trim();
+  if (!eventId || !channel) return "";
+  return `/api/notifications/records/${encodeURIComponent(eventId)}/${encodeURIComponent(channel)}`;
+}
+
+function recordSource(record) {
+  const eventType = String(record?.event_type || "");
+  if (eventType === "winning_candidate") {
+    const eventId = String(record?.event_id || "");
+    const source = eventId.startsWith("winning_candidate:") ? eventId.split(":")[1] : "";
+    return SOURCE_LABELS_M3[source] || "";
+  }
+  return "";
+}
+
+function eventLabel(record) {
+  const eventType = String(record?.event_type || "");
+  const source = recordSource(record);
+  if (eventType === "winning_candidate" || String(record?.event_id || "").startsWith("winning_candidate:")) {
+    return source ? `中奖提醒 · ${source}` : "中奖提醒";
+  }
+  return EVENT_LABELS[eventType] || (eventType ? eventType : "未知事件");
+}
+
+function recordSummary(record) {
+  const raw = String(record?.summary || "").trim();
+  if (!raw) return "—";
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const senderLine = lines.find((line) => line.startsWith("发送者："));
+  const summaryLine = lines.find((line) => line.startsWith("摘要："));
+  const sender = senderLine ? senderLine.slice("发送者：".length).trim() : "";
+  let message = summaryLine ? summaryLine.slice("摘要：".length).trim() : "";
+  if (sender && message) {
+    if (message.startsWith(`${sender}:`)) message = message.slice(sender.length + 1).trim();
+    if (message.startsWith(`${sender}：`)) message = message.slice(sender.length + 1).trim();
+    return `${sender}：${message}`;
+  }
+  if (message) return message;
+  return lines
+    .filter((line) => !/^(来源|时间|链接|事件)：/.test(line) && !/^\d{10,13}$/.test(line))
+    .join(" ")
+    .replace(/\b\d{10,13}\b/g, "")
+    .replace(/winning_candidate:[^\s]+/g, "")
+    .trim() || "—";
+}
+
+function safeBilibiliUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    const hostname = parsed.hostname.toLowerCase();
+    if (!(parsed.protocol === "http:" || parsed.protocol === "https:")) return "";
+    if (!(hostname === "bilibili.com" || hostname.endsWith(".bilibili.com"))) return "";
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}
+
+function candidateSenderText(item) {
+  const sender = item?.sender && typeof item.sender === "object" ? item.sender : {};
+  const name = String(sender.name || sender.nickname || item?.sender_name || item?.nickname || "").trim();
+  const id = String(sender.id || item?.sender_id || "").trim();
+  if (name && id) return `${name}（UID ${id}）`;
+  if (name) return name;
+  return id ? `UID ${id}` : "未知发送者";
+}
+
+function candidateUrl(item) {
+  const explicitUrl = safeBilibiliUrl(
+    item?.source_url || item?.conversation_url || item?.session_url || item?.dynamic_url || item?.reply_url,
+  );
+  if (String(item?.source_type || "") === "dm") return explicitUrl || MESSAGE_CENTER_URL;
+  return explicitUrl;
 }
 
 export function statusBadge(status) {
@@ -65,12 +159,16 @@ function channelCardHtml(channel) {
         <input class="form-control" data-ntf-field="${escapeHtml(field.key)}" type="${field.secret ? "password" : "text"}" autocomplete="off" placeholder="${escapeHtml(channel.configured ? "已配置，留空保持不变" : `请输入 ${field.label.replace(/（可选）$/, "")}`)}" />
       </label>`
   ).join("");
+  const enabledLabel = channel.enabled
+    ? channel.channel === "serverchan" ? "渠道：✅ 已启用" : "渠道：已启用"
+    : "渠道：未启用";
   return `
     <article class="panel ntf-card is-${channel.configured ? "configured" : "missing"}" data-channel="${escapeHtml(channel.channel)}">
       <div class="ntf-card-head">
         <h3 class="section-title">${escapeHtml(channel.label)}</h3>
-        <span class="caption ntf-config-state">${channel.configured ? (channel.enabled ? "已启用" : "已停用") : "未配置"}</span>
-        <label class="ntf-toggle"><input type="checkbox" data-ntf-enabled ${channel.enabled ? "checked" : ""} /> ${channel.enabled ? "已启用" : "已停用"}</label>
+        <span class="caption ntf-config-state">凭据：${channel.configured ? "已配置" : "未配置"}</span>
+        <span class="caption ntf-enabled-state">${enabledLabel}</span>
+        <label class="ntf-toggle"><input type="checkbox" data-ntf-enabled ${channel.enabled ? "checked" : ""} /> 启用通知</label>
       </div>
       <form class="ntf-config-form" data-ntf-config>
         ${fields}
@@ -118,7 +216,7 @@ function renderRoot(state) {
     <article class="panel">
       <h3 class="section-title">最近发送记录</h3>
       <table class="ntf-records">
-        <thead><tr><th>时间</th><th>渠道</th><th>事件</th><th>状态</th><th>摘要</th></tr></thead>
+        <thead><tr><th>时间</th><th>渠道</th><th>事件</th><th>状态</th><th>摘要</th><th>操作</th></tr></thead>
         <tbody>
           ${(state?.records || []).length
             ? (state?.records || [])
@@ -126,14 +224,19 @@ function renderRoot(state) {
               (record) => `
             <tr>
               <td>${timeText(record.sent_at)}</td>
-              <td>${escapeHtml(record.channel)}</td>
-              <td>${escapeHtml(String(record.event_id || "").slice(0, 40))}</td>
+              <td>${escapeHtml(channelLabel(record.channel))}</td>
+              <td>${escapeHtml(eventLabel(record))}</td>
               <td>${statusBadge(record.status)}</td>
-              <td>${escapeHtml(String(record.summary || ""))}</td>
+              <td>${escapeHtml(recordSummary(record))}</td>
+              <td>
+                ${recordDeleteUrl(record)
+                  ? `<button type="button" class="btn btn-ghost btn-compact btn-pill ntf-record-delete" data-ntf-record-delete="${escapeHtml(recordDeleteUrl(record))}">删除</button>`
+                  : ""}
+              </td>
             </tr>`
             )
             .join("")
-            : '<tr class="empty-row"><td colspan="5" class="caption">暂无发送记录</td></tr>'}
+            : '<tr class="empty-row"><td colspan="6" class="caption">暂无发送记录</td></tr>'}
         </tbody>
       </table>
     </article>`;
@@ -208,6 +311,21 @@ function bindEvents() {
       }).catch((error) => showToast(String(error?.message || error), "error"));
     });
   });
+  root.querySelectorAll("[data-ntf-record-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const url = String(button.dataset.ntfRecordDelete || "");
+      if (!url) return;
+      button.disabled = true;
+      try {
+        await fetchJSON(url, { method: "DELETE" });
+        button.closest("tr")?.remove();
+        showToast("发送记录已删除", "success");
+      } catch (error) {
+        button.disabled = false;
+        showToast(String(error?.message || error), "error");
+      }
+    });
+  });
 }
 
 async function refreshView() {
@@ -231,8 +349,6 @@ async function refreshView() {
     showToast(String(error?.message || error), "error", "通知状态读取失败");
   }
 }
-
-const SOURCE_LABELS_M3 = { mention: "@我的", reply: "回复", dm: "私信" };
 
 function winnerClueCount(task, sources) {
   const found = Object.values(sources || {}).reduce((total, source) => {
@@ -314,17 +430,22 @@ function renderWinner(state) {
       .join("")}
     </div>
     <table class="ntf-records">
-      <thead><tr><th>时间</th><th>来源</th><th>发送者</th><th>摘要</th><th>状态</th></tr></thead>
+      <thead><tr><th>时间</th><th>来源</th><th>发送者</th><th>摘要</th><th>操作</th></tr></thead>
       <tbody>
         ${candidates
           .map(
             (item) => `
           <tr>
             <td>${timeText(item.discovered_at)}</td>
-            <td>${escapeHtml(String(item.source_type || ""))}</td>
-            <td>${escapeHtml(String(item.sender?.name || item.sender?.id || ""))}</td>
+            <td>${escapeHtml(SOURCE_LABELS_M3[String(item.source_type || "")] || String(item.source_type || "未知来源"))}</td>
+            <td>${escapeHtml(candidateSenderText(item))}</td>
             <td>${escapeHtml(truncateSummary(item.summary))}</td>
-            <td>${escapeHtml(candidateStatusLabel(item.status))}</td>
+            <td class="winner-row-actions">
+              ${candidateUrl(item)
+                ? `<a class="btn btn-ghost btn-compact btn-pill winner-jump-action" href="${escapeHtml(candidateUrl(item))}" target="_blank" rel="noopener noreferrer">跳转链接</a>`
+                : '<button type="button" class="btn btn-ghost btn-compact btn-pill winner-jump-action" disabled>无链接</button>'}
+              <button type="button" class="btn btn-danger btn-compact btn-pill winner-delete-action" data-winner-delete="${escapeHtml(String(item.key || ""))}">删除</button>
+            </td>
           </tr>`
           )
           .join("") || '<tr><td colspan="5" class="caption">暂无疑似中奖线索</td></tr>'}
@@ -333,6 +454,30 @@ function renderWinner(state) {
   const previous = document.getElementById("winner-scan-panel");
   if (previous) previous.remove();
   root.appendChild(panel);
+  panel.querySelectorAll("[data-winner-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const key = String(button.dataset.winnerDelete || "");
+      if (!key) return;
+      const confirmed = await openAppConfirm({
+        eyebrow: "中奖深检",
+        title: "删除这条中奖记录？",
+        desc: "仅在当前账号的本地记录中隐藏，不会删除 B 站原消息或通知历史。",
+        confirmLabel: "删除",
+        cancelLabel: "取消",
+        danger: true,
+      });
+      if (!confirmed) return;
+      button.disabled = true;
+      try {
+        await fetchJSON(`/api/winner-scan/candidates/${encodeURIComponent(key)}/suppress`, { method: "POST" });
+        button.closest("tr")?.remove();
+        showToast("已删除", "success");
+      } catch (error) {
+        button.disabled = false;
+        showToast(String(error?.message || error), "error");
+      }
+    });
+  });
   document.getElementById("winner-scan-run")?.addEventListener("click", () => {
     startJob("winner_deep_scan", {}).catch((error) => {
       showToast(String(error?.message || error), "error");

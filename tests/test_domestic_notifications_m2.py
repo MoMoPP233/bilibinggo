@@ -127,6 +127,21 @@ def test_profile_isolation_config_and_records(tmp_path: Path, monkeypatch) -> No
     assert nsvc.get_public_config()["channels"][0]["configured"] is False
 
 
+def test_delete_recent_record_hides_row_but_preserves_dedup(profile_dir: Path) -> None:
+    nsvc._append_record(
+        "winning_candidate:dm:39945369:1",
+        nsvc.CHANNEL_SERVERCHAN,
+        "sent",
+        "中奖提醒",
+        event_type="winning_candidate",
+    )
+
+    nsvc.delete_record("winning_candidate:dm:39945369:1", nsvc.CHANNEL_SERVERCHAN)
+
+    assert nsvc.recent_records() == []
+    assert nsvc._existing_status("winning_candidate:dm:39945369:1", nsvc.CHANNEL_SERVERCHAN) == "sent"
+
+
 # ---------- C/P：secret 不暴露 ----------
 
 

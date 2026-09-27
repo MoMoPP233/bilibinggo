@@ -3712,6 +3712,23 @@ html.sidebar-init-collapsed .system-btn {
   align-items: center;
 }
 
+.winner-row-actions {
+  display: grid;
+  grid-template-columns: 112px 64px;
+  gap: 8px;
+  align-items: center;
+  min-width: 192px;
+  white-space: nowrap;
+}
+
+.winner-row-actions .winner-jump-action,
+.winner-row-actions .winner-delete-action {
+  width: 100%;
+  box-sizing: border-box;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
 .btn {
   appearance: none;
   border: none;

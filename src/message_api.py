@@ -10,6 +10,7 @@ from src.message_types import (
     normalize_dm_message,
     normalize_feed_item,
     parse_dm_content,
+    _pick_name,
 )
 
 MESSAGE_REFERER = "https://message.bilibili.com"
@@ -110,7 +111,7 @@ def list_dm_sessions(
         title, text = parse_dm_content(last_msg.get("content"))
         talker_id = int(item.get("talker_id") or 0)
         account_info = item.get("account_info") or {}
-        talker_name = str(account_info.get("name") or "").strip()
+        talker_name = _pick_name(item) or _pick_name(account_info)
         sessions.append(
             DmSession(
                 talker_id=talker_id,

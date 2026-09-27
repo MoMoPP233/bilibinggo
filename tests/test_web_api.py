@@ -17,6 +17,16 @@ def test_reject_unknown_job_action() -> None:
     assert data["detail"] == data["error"]["message"]
 
 
+def test_delete_notification_record_route_is_single_record_scope() -> None:
+    with patch("web.app.delete_record") as delete_mock:
+        resp = client.delete(
+            "/api/notifications/records/winning_candidate%3Adm%3A39945369%3A1/serverchan"
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    delete_mock.assert_called_once_with("winning_candidate:dm:39945369:1", "serverchan")
+
+
 def test_watch_users_api_seeds_and_lists() -> None:
     with patch("web.app.seed_from_candidates_if_empty", return_value=True):
         with patch(

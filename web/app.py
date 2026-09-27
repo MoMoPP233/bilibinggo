@@ -40,6 +40,8 @@ from src.restart_control import (
 from src.sources.ds9_topics import add_topic, list_topics, remove_topic, set_topic_enabled
 from src.notification.service import (
     NotificationConfigError,
+    NotificationLocalError,
+    delete_record,
     get_public_config,
     recent_records,
     save_channel_config,
@@ -544,6 +546,20 @@ def api_notifications_status() -> dict[str, Any]:
     return config
 
 
+@app.delete("/api/notifications/records/{event_id}/{channel}", tags=["stable"])
+def api_notifications_delete_record(event_id: str, channel: str) -> dict[str, Any]:
+    """Hide one recent notification row without changing outbox dedup state."""
+    try:
+        delete_record(event_id, channel)
+    except KeyError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, "通知记录不存在") from exc
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    except NotificationLocalError as exc:
+        raise AppError(ErrorCode.INTERNAL, str(exc)) from exc
+    return {"ok": True}
+
+
 @app.post("/api/notifications/channels/{channel}/config", tags=["stable"])
 def api_notifications_save_channel(channel: str, payload: NotifyChannelConfigRequest) -> dict[str, Any]:
     values = {key: value for key, value in payload.model_dump().items() if value is not None}
@@ -723,6 +739,30 @@ def api_winner_scan_status() -> dict[str, Any]:
     from src.winner_scan.service import scan_status_view
 
     return scan_status_view()
+
+
+def _suppress_winner_candidate(candidate_key: str) -> dict[str, Any]:
+    """Hide one stable winner source event without deleting candidate/outbox data."""
+    from src.winner_scan.service import suppress_candidate
+
+    try:
+        result = suppress_candidate(candidate_key, reason="manual_delete")
+    except KeyError as exc:
+        raise AppError(ErrorCode.NOT_FOUND, "中奖候选不存在") from exc
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "candidate": result}
+
+
+@app.post("/api/winner-scan/candidates/{candidate_key}/suppress", tags=["stable"])
+def api_suppress_winner_candidate(candidate_key: str) -> dict[str, Any]:
+    return _suppress_winner_candidate(candidate_key)
+
+
+@app.delete("/api/winner-scan/candidates/{candidate_key}", tags=["stable"])
+def api_delete_winner_candidate(candidate_key: str) -> dict[str, Any]:
+    """Compatibility alias: DELETE means durable local suppression, not remote deletion."""
+    return _suppress_winner_candidate(candidate_key)
 
 
 

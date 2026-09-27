@@ -466,8 +466,40 @@ def _append_record(
 
 
 def recent_records(limit: int = 30) -> list[dict[str, Any]]:
-    records = _load_outbox()
+    records = [record for record in _load_outbox() if not record.get("deleted")]
     return records[-limit:][::-1]
+
+
+def delete_record(event_id: str, channel: str) -> None:
+    """Hide one recent-record row while preserving outbox deduplication state."""
+    target_event = str(event_id or "").strip()
+    target_channel = str(channel or "").strip()
+    if not target_event or target_channel not in ALL_CHANNELS:
+        raise ValueError("通知记录标识无效")
+    matched = False
+
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        nonlocal matched
+        # 正常 outbox 对 (event_id, channel) 唯一；从后往前只标记一条，
+        # 即使旧数据存在重复，也不会扩大删除范围。
+        for record in reversed(records):
+            if (
+                not record.get("deleted")
+                and record.get("event_id") == target_event
+                and record.get("channel") == target_channel
+            ):
+                record["deleted"] = True
+                record["deleted_at"] = int(time.time())
+                matched = True
+                break
+        return records
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:  # noqa: BLE001 - local durable failure
+        raise NotificationLocalError("无法删除通知记录") from exc
+    if not matched:
+        raise KeyError((target_event, target_channel))
 
 
 def recover_stale_dispatches_on_startup() -> int:

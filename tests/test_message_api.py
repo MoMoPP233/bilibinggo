@@ -81,6 +81,37 @@ def test_normalize_dm_message() -> None:
     assert entry.talker_id == 999
 
 
+def test_normalize_dm_message_preserves_payload_nickname() -> None:
+    entry = normalize_dm_message(
+        {
+            "sender_uid": 999,
+            "sender_name": "中奖发送者",
+            "content": '{"content":"恭喜中奖"}',
+            "timestamp": 1654154093,
+            "msg_seqno": 7,
+        },
+        talker_id=999,
+    )
+    assert entry.talker_name == "中奖发送者"
+
+
+def test_normalize_feed_item_keeps_nested_dynamic_source_metadata() -> None:
+    item = {
+        "id": 123,
+        "reply_time": 1749474709,
+        "user": {"mid": 42, "nickname": "ROG玩家国度官方UP"},
+        "item": {
+            "title": "动态标题",
+            "source_content": "恭喜共计10位小伙伴中奖",
+            "dynamic_id": "1221021101641957383",
+            "uri": "https://t.bilibili.com/1221021101641957383",
+        },
+    }
+    entry = normalize_feed_item(MessageType.AT, item)
+    assert entry.talker_name == "ROG玩家国度官方UP"
+    assert entry.raw["item"]["dynamic_id"] == "1221021101641957383"
+
+
 def test_dm_session_type_detection() -> None:
     dm_session = DmSession(
         talker_id=1,
@@ -189,6 +220,31 @@ def test_list_dm_sessions_filters_system_sessions() -> None:
     assert len(sessions) == 1
     assert sessions[0].talker_id == 123
     assert sessions[0].last_text == "你好"
+
+
+def test_list_dm_sessions_preserves_nested_talker_nickname() -> None:
+    client = _FakeClient(
+        {
+            "get_sessions": {
+                "code": 0,
+                "data": {
+                    "session_list": [
+                        {
+                            "talker_id": 39945369,
+                            "unread_count": 1,
+                            "is_follow": 1,
+                            "system_msg_type": 0,
+                            "user": {"nickname": "中奖好友"},
+                            "last_msg": {"timestamp": 1, "content": '{"content":"中奖"}'},
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    sessions = list_dm_sessions(client)
+    assert sessions[0].talker_name == "中奖好友"
 
 
 def test_list_feed_reply() -> None:

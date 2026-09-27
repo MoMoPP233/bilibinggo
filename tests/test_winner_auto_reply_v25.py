@@ -37,12 +37,14 @@ def _dm_entry(
     sender_uid: int | None = None,
     system_msg_type: int = 0,
     msg_type: MessageType | None = None,
+    raw_extra: dict | None = None,
 ) -> MessageEntry:
     raw = {
         "msg_seqno": seqno,
         "sender_uid": talker_id if sender_uid is None else sender_uid,
         "system_msg_type": system_msg_type,
     }
+    raw.update(raw_extra or {})
     return MessageEntry(
         msg_type=MessageType.DM if msg_type is None else msg_type,
         id=str(seqno),
@@ -186,6 +188,36 @@ def test_case4_5_6_7_strong_signals_keep_candidate(text, profile, monkeypatch) -
     assert result["sources"]["dm"]["found"] == 1
     assert len(winmod.list_candidates()) == 1
     assert fake["notify"].calls == [("winning_candidate:dm:3001:1", "winning_candidate")]
+
+
+def test_explicit_auto_reply_flag_filters_even_with_winner_words(profile, monkeypatch) -> None:
+    fake = _install(
+        monkeypatch,
+        sessions=[_session(3001)],
+        dm_messages={3001: [_dm_entry(3001, 2, WIN_TEXT, raw_extra={"auto_reply": True})]},
+    )
+
+    result = _run(monkeypatch)
+
+    assert result["auto_reply_skipped_count"] == 1
+    assert result["sources"]["dm"]["found"] == 0
+    assert winmod.list_candidates() == []
+    assert fake["notify"].calls == []
+
+
+def test_auto_reply_words_in_normal_message_do_not_filter(profile, monkeypatch) -> None:
+    text = "这不是自动回复，恭喜你中奖了，请填写收货地址"
+    fake = _install(
+        monkeypatch,
+        sessions=[_session(3001)],
+        dm_messages={3001: [_dm_entry(3001, 3, text)]},
+    )
+
+    result = _run(monkeypatch)
+
+    assert result["auto_reply_skipped_count"] == 0
+    assert result["sources"]["dm"]["found"] == 1
+    assert fake["notify"].calls == [("winning_candidate:dm:3001:3", "winning_candidate")]
 
 
 # ---------- CASE 8-11: 结构条件缺失时 fail-safe 保留 ----------
