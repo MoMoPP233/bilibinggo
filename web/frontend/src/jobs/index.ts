@@ -1208,9 +1208,43 @@ export function setProgressAria(percent, labelText) {
   }
 }
 
+export function renderLogDockProgress(job) {
+  const container = document.getElementById("log-dock-progress");
+  if (!container) return;
+  const running = String(job?.state || "") === "running";
+  container.hidden = !running;
+  if (!running) return;
+  const title = document.getElementById("log-dock-progress-title");
+  const value = document.getElementById("log-dock-progress-value");
+  const detail = document.getElementById("log-dock-progress-detail");
+  const track = document.getElementById("log-dock-progress-track");
+  const fill = document.getElementById("log-dock-progress-fill");
+  const total = Number(job?.progress_total) || 0;
+  const step = Math.max(0, Number(job?.progress_step) || 0);
+  const message = formatProgressDetail(job);
+  if (title) title.textContent = formatProgressTitle(job);
+  if (total > 0) {
+    const percent = Math.max(0, Math.min(100, Math.round((step / total) * 100)));
+    if (value) value.textContent = `${step} / ${total} · ${percent}%`;
+    if (fill) fill.style.width = `${percent}%`;
+    track?.setAttribute("aria-valuenow", String(percent));
+  } else {
+    if (value) value.textContent = "运行中";
+    if (fill) fill.style.width = "0%";
+    track?.setAttribute("aria-valuenow", "0");
+  }
+  if (detail) detail.textContent = message || sanitizeUserText(job?.message) || "";
+}
+
 export function updateProgressUI(job) {
   const running = job.state === "running";
+  renderLogDockProgress(job);
   document.body.classList.toggle("job-running", running);
+  if (!progressBanner) {
+    renderParticipateSteps(job);
+    window.dispatchEvent(new CustomEvent("binggo:job-progress", { detail: job }));
+    return;
+  }
   progressBanner.hidden = !running;
   if (!running) {
     progressFill.style.width = "0%";
@@ -1284,18 +1318,8 @@ export function updateJobUI(job) {
   jobLog.textContent = sanitizeUserText(job.log) || "";
   syncLogDockTone(job);
   const jobState = String(job?.state || "idle");
-  const wasRunning = lastLogDockJobState === "running";
   lastLogDockJobState = jobState;
-  if (jobState === "running") {
-    toggleLogDock(true);
-    scrollJobLogToBottom({ showHint: true });
-  } else if (
-    wasRunning
-    && ["success", "error", "cancelled", "interrupted"].includes(jobState)
-  ) {
-    // 只在运行态首次进入终态时自动收起；日志内容保留，之后可再次手动展开。
-    toggleLogDock(false);
-  } else if (state.logDockOpen) {
+  if (state.logDockOpen) {
     scrollJobLogToBottom({ showHint: false });
   }
   setButtonsDisabled(job.state === "running");
@@ -1333,7 +1357,6 @@ export async function startJob(action, params = {}) {
     state.smoothJobPercent = 0;
     state.activeJobKey = "";
   }
-  toggleLogDock(true);
   // 错误提示由调用方 notifyJobStartError 统一处理，避免重复 toast
   const startResponse = await fetchJSON("/api/jobs", {
     method: "POST",

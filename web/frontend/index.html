@@ -18,48 +18,6 @@
   </script>
 </head>
 <body>
-  <div class="progress-banner" id="progress-banner" hidden>
-    <div class="progress-banner-shell">
-      <div class="progress-banner-glow" aria-hidden="true"></div>
-      <div class="progress-banner-inner">
-        <div class="progress-banner-head">
-          <div class="progress-banner-meta">
-            <div class="progress-ring" aria-hidden="true">
-              <svg class="progress-ring-svg" viewBox="0 0 36 36">
-                <circle class="progress-ring-track" cx="18" cy="18" r="15.5" />
-                <circle class="progress-ring-fill" id="progress-ring" cx="18" cy="18" r="15.5" />
-              </svg>
-            </div>
-            <div class="progress-banner-copy">
-              <span class="progress-chip" id="progress-chip">运行中</span>
-              <h2 class="progress-title" id="progress-label">任务运行中…</h2>
-            </div>
-          </div>
-          <div class="progress-percent-wrap">
-            <span class="progress-percent" id="progress-percent">0</span>
-            <span class="progress-percent-suffix">%</span>
-          </div>
-        </div>
-        <div class="progress-track-wrap">
-          <div
-            class="progress-track"
-            id="progress-track"
-            role="progressbar"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            aria-valuenow="0"
-            aria-labelledby="progress-label"
-          >
-            <div class="progress-fill" id="progress-fill"></div>
-            <div class="progress-fill-glow" id="progress-fill-glow" aria-hidden="true"></div>
-            <div class="progress-fill-shine" id="progress-fill-shine" aria-hidden="true"></div>
-          </div>
-        </div>
-        <p class="progress-detail" id="progress-detail"></p>
-        <div class="progress-pipeline" id="progress-steps" hidden></div>
-      </div>
-    </div>
-  </div>
   <div class="job-result-banner" id="job-result-banner" hidden>
     <div class="job-result-shell">
       <div class="job-result-head">
@@ -179,6 +137,17 @@
         </button>
         <span class="log-dock-status is-idle" id="log-dock-status">空闲</span>
         <p class="log-dock-message" id="job-message">暂无任务</p>
+      </div>
+      <div class="log-dock-progress" id="log-dock-progress" hidden>
+        <div class="log-dock-progress-head">
+          <strong id="log-dock-progress-title">当前任务</strong>
+          <span id="log-dock-progress-value"></span>
+        </div>
+        <div class="log-dock-progress-track" role="progressbar" id="log-dock-progress-track" aria-valuemin="0" aria-valuemax="100">
+          <div class="log-dock-progress-fill" id="log-dock-progress-fill"></div>
+        </div>
+        <p class="caption" id="log-dock-progress-detail"></p>
+        <div class="progress-pipeline" id="progress-steps" hidden></div>
       </div>
       <div class="log-dock-body" id="log-dock-body">
         <p class="caption log-dock-section-label">自动调度日志（最近 100 条）</p>

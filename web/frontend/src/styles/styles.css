@@ -5980,24 +5980,49 @@ body.modal-open {
   position: relative;
 }
 
-.log-dock-body::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 18px;
-  border-radius: 12px 12px 0 0;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--log-bg) 92%, transparent), transparent);
-  pointer-events: none;
-  z-index: 1;
-  opacity: 0.9;
-}
-
 .log-dock-body .log-box {
   max-height: 240px;
   margin: 0;
   border: 1px solid color-mix(in srgb, var(--border-soft) 80%, transparent);
+}
+
+.log-dock-progress {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.log-dock-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.log-dock-progress-track {
+  height: 6px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--border-soft);
+}
+
+.log-dock-progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--motion-fast) var(--motion-ease-out);
+}
+
+.log-dock-progress-detail {
+  margin: 7px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .log-dock-section-label {

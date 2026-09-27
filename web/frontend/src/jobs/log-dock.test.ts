@@ -20,10 +20,17 @@ function setupDom(): void {
           <button type="button" class="log-dock-chevron-button" id="log-dock-panel-toggle" aria-expanded="false" aria-label="展开任务日志">
             <span class="log-dock-chevron" aria-hidden="true"></span>
           </button>
-          <span class="log-dock-status is-idle" id="log-dock-status">空闲</span>
-          <p id="job-message">暂无任务</p>
-        </div>
-        <div id="log-dock-body"><pre id="job-log"></pre><span id="log-dock-pin-hint" hidden></span></div>
+        <span class="log-dock-status is-idle" id="log-dock-status">空闲</span>
+        <p id="job-message">暂无任务</p>
+      </div>
+      <div id="log-dock-progress" hidden>
+        <strong id="log-dock-progress-title"></strong>
+        <span id="log-dock-progress-value"></span>
+        <div id="log-dock-progress-track"><div id="log-dock-progress-fill"></div></div>
+        <p id="log-dock-progress-detail"></p>
+        <div id="progress-steps" hidden></div>
+      </div>
+      <div id="log-dock-body"><pre id="job-log"></pre><span id="log-dock-pin-hint" hidden></span></div>
       </div>
     </div>
     <div id="progress-banner" hidden data-percent="0"></div>
@@ -36,7 +43,7 @@ function setupDom(): void {
     <svg><circle id="progress-ring"></circle></svg>
     <div id="progress-track"></div>
     <div id="progress-chip"></div>
-    <div id="progress-steps"></div>`;
+    `;
 }
 
 function firstBlock(css: string, selector: string): string {
@@ -82,6 +89,8 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     expect(html).toContain('class="log-dock-label"');
     expect(html).toContain('class="log-dock-badge"');
     expect(html).toContain('id="log-dock-panel-toggle"');
+    expect(html).toContain('id="log-dock-progress"');
+    expect(html).not.toContain('id="progress-banner" hidden>');
     // 收起态不再是 “任务日志 + ▲ + 状态” 的横向 compact bar。
     expect(html).not.toContain("log-dock-compact-status");
     expect(html).not.toContain('<span class="log-dock-label">任务日志</span><span class="log-dock-chevron"');
@@ -95,6 +104,8 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     // 深浅主题原始样式仍在；三角无专属暗色背景。
     expect(css).toContain('[data-theme="dark"] .log-dock-panel');
     expect(css).not.toContain('[data-theme="dark"] .log-dock-chevron-button');
+    expect(css).not.toContain(".log-dock-body::before");
+    expect(css).toContain(".log-dock-body .log-box");
     expect(css).toContain("@media (max-width: 520px)");
   });
 
@@ -156,8 +167,10 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     expect(panel.classList.contains("is-open")).toBe(true);
   });
 
-  it("auto-collapses to the circular launcher on terminal states and preserves logs", async () => {
+  it("keeps the user-selected open state on terminal states and preserves logs", async () => {
     const jobs = await import("./index");
+    const navigation = await import("../shell/nav");
+    navigation.bindNavigation();
     const running = {
       state: "running",
       action: "refresh_source",
@@ -169,6 +182,8 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     jobs.updateJobUI(running);
     const panel = document.getElementById("log-dock-panel") as HTMLElement;
     const toggle = document.getElementById("log-dock-toggle") as HTMLElement;
+    expect(panel.classList.contains("is-open")).toBe(false);
+    toggle.click();
     expect(panel.classList.contains("is-open")).toBe(true);
 
     const completed = {
@@ -179,8 +194,8 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
       progress_step: 2,
     };
     jobs.updateJobUI(completed);
-    expect(panel.classList.contains("is-open")).toBe(false);
-    expect(toggle.hidden).toBe(false);
+    expect(panel.classList.contains("is-open")).toBe(true);
+    expect(toggle.hidden).toBe(true);
     // 日志未被清空。
     expect(document.getElementById("job-log")?.textContent).toContain("第二行\n完成");
     // 展开卡片的右侧状态徽标仍为已完成；收起时圆形入口不展示整段状态文字。
@@ -209,7 +224,7 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     jobs.updateJobUI(completed);
     expect(panel.classList.contains("is-open")).toBe(false);
 
-    // 用户手动重新展开后，重复收到相同终态轮询不再次自动收起。
+    // 用户手动重新展开后，重复收到相同终态轮询不会改变 open state。
     toggle.click();
     expect(panel.classList.contains("is-open")).toBe(true);
     expect(triangle.textContent).toContain("▼");
@@ -217,5 +232,44 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     jobs.updateJobUI(completed);
     expect(panel.classList.contains("is-open")).toBe(true);
     expect(document.getElementById("job-log")?.textContent).toContain("错误");
+  });
+
+  it("does not open on start, log, progress, phase, error, or finish updates", async () => {
+    const jobs = await import("./index");
+    const navigation = await import("../shell/nav");
+    navigation.bindNavigation();
+    const panel = document.getElementById("log-dock-panel") as HTMLElement;
+    const events = [
+      { state: "running", action: "refresh_source", message: "开始", log: "一", progress_step: 1, progress_total: 4 },
+      { state: "running", action: "refresh_source", message: "阶段二", log: "一\n二", progress_step: 2, progress_total: 4 },
+      { state: "error", action: "refresh_source", message: "失败", log: "错误", progress_step: 2, progress_total: 4 },
+      { state: "success", action: "refresh_source", message: "完成", log: "完成", progress_step: 4, progress_total: 4 },
+    ];
+    for (const event of events) jobs.updateJobUI(event);
+    expect(panel.classList.contains("is-open")).toBe(false);
+    document.getElementById("log-dock-toggle")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(panel.classList.contains("is-open")).toBe(true);
+    expect(document.getElementById("job-log")?.textContent).toContain("完成");
+  });
+
+  it("keeps latest real progress while closed and shows it when reopened", async () => {
+    const jobs = await import("./index");
+    const navigation = await import("../shell/nav");
+    navigation.bindNavigation();
+    jobs.updateJobUI({ state: "running", action: "refresh_source", message: "正在更新 DS-4", log: "DS-4", progress_step: 3, progress_total: 8 });
+    const panel = document.getElementById("log-dock-panel") as HTMLElement;
+    expect(panel.classList.contains("is-open")).toBe(false);
+    expect(document.getElementById("log-dock-progress")?.hidden).toBe(false);
+    expect(document.getElementById("log-dock-progress-value")?.textContent).toContain("3 / 8");
+    expect(document.getElementById("log-dock-progress-detail")?.textContent).toContain("正在更新 DS-4");
+    document.getElementById("log-dock-toggle")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(panel.classList.contains("is-open")).toBe(true);
+    expect(document.getElementById("log-dock-progress-value")?.textContent).toContain("3 / 8");
+  });
+
+  it("does not invent a percentage when progress total is unavailable", async () => {
+    const jobs = await import("./index");
+    jobs.updateJobUI({ state: "running", action: "login", message: "等待扫码", log: "" });
+    expect(document.getElementById("log-dock-progress-value")?.textContent).toBe("运行中");
   });
 });
