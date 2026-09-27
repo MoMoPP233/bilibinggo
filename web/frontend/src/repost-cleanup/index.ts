@@ -9,14 +9,14 @@ import {
   repostManualTotal,
   repostDeferredTotal,
   repostBlockedTotal,
-  repostPendingTotal,
   repostCheckpointStatus,
   repostClearSelectionBtn,
   repostDeleteSelectedBtn,
-  repostHistoryBody,
-  repostHistoryPagination,
-  repostHistorySummary,
   repostHistoryTotal,
+  repostExistingTotal,
+  repostPendingTotal,
+  repostFailedTotal,
+  repostUnknownTotal,
   repostDeletedTotal,
   repostWorkflowStatus,
   repostEvalStatus,
@@ -27,6 +27,9 @@ import {
   repostSelectedCount,
   repostSelectPageBtn,
   repostHealthPill,
+  repostHealthStatus,
+  repostRiskPause,
+  repostMaintenance,
   repostHealthAll,
   repostHealthExisting,
   repostHealthDeleted,
@@ -448,15 +451,12 @@ export function renderCandidates(): void {
   );
   selectedRepostIds = new Set([...selectedRepostIds].filter((id) => validIds.has(id)));
 
-  const safeCount = candidates.filter((c) => String(c.level) === "safe").length;
-  const manualCount = candidates.filter((c) => String(c.level) === "manual_review").length;
-  const deferredCount = candidates.filter((c) => String(c.level) === "deferred").length;
-  const blockedCount = candidates.filter((c) => String(c.level) === "blocked").length;
   if (repostDeletedTotal) repostDeletedTotal.textContent = String(deletedTotal);
-  if (repostSafeTotal) repostSafeTotal.textContent = String(safeCount);
-  if (repostManualTotal) repostManualTotal.textContent = String(manualCount);
-  if (repostDeferredTotal) repostDeferredTotal.textContent = String(deferredCount);
-  if (repostBlockedTotal) repostBlockedTotal.textContent = String(blockedCount);
+  if (repostSafeTotal) repostSafeTotal.textContent = String(candidates.filter((c) => String(c.level) === "safe").length);
+  if (repostManualTotal) repostManualTotal.textContent = String(candidates.filter((c) => String(c.level) === "manual_review").length);
+  if (repostDeferredTotal) repostDeferredTotal.textContent = String(candidates.filter((c) => String(c.level) === "deferred").length);
+  if (repostBlockedTotal) repostBlockedTotal.textContent = String(candidates.filter((c) => String(c.level) === "blocked").length);
+  if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
   if (repostCandidateSummary) {
     if (filter === "deleted") {
       repostCandidateSummary.textContent = `已删除 tombstone ${deletedCandidates.length} 条；仅供查看，不提供再次删除。`;
@@ -569,17 +569,11 @@ export function setCandidates(items: unknown): CleanupCandidate[] {
 }
 
 function renderHistory(data: RepostHistoryResponse): void {
-  const items = Array.isArray(data.items) ? data.items : [];
   const total = Math.max(0, Number(data.total) || 0);
   historyPage = Math.max(1, Number(data.page) || historyPage);
   const pageSize = Math.max(1, Number(data.page_size) || HISTORY_PAGE_SIZE);
   historyPages = Math.max(1, Math.ceil(total / pageSize));
   if (repostHistoryTotal) repostHistoryTotal.textContent = String(total);
-  if (repostHistorySummary) {
-    repostHistorySummary.textContent = total
-      ? `当前运行账号已索引 ${total} 条本人转发。不可删除的记录也会保留在这里。`
-      : "尚未索引到本人转发；请手动同步转发历史。";
-  }
 
   const checkpoint = data.checkpoint;
   const complete = Boolean(checkpoint?.full_scan_completed ?? data.full_scan_completed);
@@ -593,31 +587,6 @@ function renderHistory(data: RepostHistoryResponse): void {
     }
   }
 
-  if (repostHistoryBody) {
-    if (!items.length) {
-      repostHistoryBody.innerHTML = '<tr class="empty-row"><td colspan="5">暂无转发历史</td></tr>';
-    } else {
-      repostHistoryBody.innerHTML = items.map((item) => {
-        const repostId = validDynamicId(item.repost_dynamic_id);
-        const originalId = validDynamicId(item.original_dynamic_id);
-        const status = historyStatus(item.delete_status);
-        const author = sanitizeUserText(item.original_author_name || "") || "—";
-        const error = sanitizeUserText(item.last_error || "");
-        return `
-          <tr>
-            <td>${repostId ? `<a class="activity-link" href="${opusUrl(repostId)}" target="_blank" rel="noopener">${escapeHtml(repostId)}</a>` : "—"}</td>
-            <td>${originalId ? `<a class="activity-link" href="${opusUrl(originalId)}" target="_blank" rel="noopener">${escapeHtml(originalId)}</a>` : "—"}</td>
-            <td>${escapeHtml(author)}</td>
-            <td class="time-cell">${escapeHtml(formatTimestamp(item.reposted_at))}</td>
-            <td>
-              <span class="repost-status repost-status--${status.tone}">${status.label}</span>
-              ${error ? `<p class="caption repost-error" title="${escapeHtml(error)}">${escapeHtml(error)}</p>` : ""}
-            </td>
-          </tr>`;
-      }).join("");
-    }
-  }
-  renderPager(repostHistoryPagination, historyPage, historyPages, total, "history");
 }
 
 export async function loadRepostHistory(page = historyPage): Promise<RepostHistoryResponse> {
@@ -629,10 +598,6 @@ export async function loadRepostHistory(page = historyPage): Promise<RepostHisto
     renderHistory(data || {});
     return data || {};
   } catch (error) {
-    if (repostHistoryBody) {
-      const message = sanitizeUserText(error instanceof Error ? error.message : String(error));
-      repostHistoryBody.innerHTML = `<tr class="empty-row"><td colspan="5">读取失败：${escapeHtml(message || "未知错误")}</td></tr>`;
-    }
     throw error;
   }
 }
@@ -648,7 +613,6 @@ export async function loadPersistedCandidates(): Promise<void> {
       level: "deleted",
       delete_status: "deleted",
     }));
-    if (repostPendingTotal) repostPendingTotal.textContent = String(pendingEvaluation);
     if (repostHistoryTotal && Number(data?.all_total) >= 0) {
       repostHistoryTotal.textContent = String(Number(data?.all_total) || 0);
     }
@@ -776,12 +740,27 @@ export function renderHealth(data: RepostHealthResponse): void {
     repostHealthPill.dataset.tone = healthStatusTone(status);
   }
   const counts = data?.counts || {};
+  const checkpoint = data?.checkpoint;
+  if (repostCheckpointStatus) {
+    repostCheckpointStatus.textContent = !checkpoint
+      ? "尚未完成首次同步"
+      : checkpoint.full_scan_completed
+        ? `正常 · 进度已保存（${formatTimestamp(checkpoint.last_synced_at)}）`
+        : `未完成 · ${formatTimestamp(checkpoint.last_synced_at)}`;
+  }
+  setHealthNumber(repostExistingTotal, counts?.history_total);
+  setHealthNumber(repostDeletedTotal, counts?.deleted);
+  setHealthNumber(repostPendingTotal, counts?.delete_pending);
+  setHealthNumber(repostFailedTotal, counts?.delete_failed);
+  setHealthNumber(repostUnknownTotal, counts?.unknown);
   setHealthNumber(repostHealthAll, counts?.all_total);
   setHealthNumber(repostHealthExisting, counts?.history_total);
   setHealthNumber(repostHealthDeleted, counts?.deleted);
   setHealthNumber(repostHealthPending, counts?.delete_pending);
   setHealthNumber(repostHealthFailed, counts?.delete_failed);
   setHealthNumber(repostHealthUnknown, counts?.unknown);
+  if (repostHealthStatus) repostHealthStatus.textContent = sanitizeUserText(data?.status_text || "正常");
+  if (repostRiskPause) repostRiskPause.textContent = data?.maintenance?.risk_paused ? "是" : "否";
   if (repostHealthLines) {
     const maintenance = data?.maintenance || {};
     const enabled = Boolean(maintenance.enabled);
@@ -789,6 +768,7 @@ export function renderHealth(data: RepostHealthResponse): void {
     const toggleLine = enabled
       ? `自动维护：开启（每 ${intervalHours} 小时一次；只同步与评估，从不自动删除）`
       : "自动维护：关闭（不会自动联网）";
+    if (repostMaintenance) repostMaintenance.textContent = enabled ? `正常 · 每 ${intervalHours} 小时` : "已关闭";
     const checks = Array.isArray(data?.checks) ? data.checks : [];
     const lines = [
       { tone: "info", text: toggleLine },
@@ -1329,7 +1309,6 @@ export function bindRepostCleanup(): void {
     requestCleanupStart("sync_assess_repost_history").catch(() => {});
   });
   repostCandidatePagination?.addEventListener("click", handlePaginationClick);
-  repostHistoryPagination?.addEventListener("click", handlePaginationClick);
   document.querySelectorAll<HTMLButtonElement>("[data-repost-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       const value = button.dataset.repostFilter;

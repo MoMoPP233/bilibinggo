@@ -93,6 +93,11 @@ export const pagination = document.getElementById("pagination");
 
 export const repostHistoryTotal = document.getElementById("repost-history-total");
 
+export const repostExistingTotal = document.getElementById("repost-existing-total");
+export const repostPendingTotal = document.getElementById("repost-pending-total");
+export const repostFailedTotal = document.getElementById("repost-failed-total");
+export const repostUnknownTotal = document.getElementById("repost-unknown-total");
+
 export const repostSafeTotal = document.getElementById("repost-safe-total");
 
 export const repostManualTotal = document.getElementById("repost-manual-total");
@@ -100,8 +105,6 @@ export const repostManualTotal = document.getElementById("repost-manual-total");
 export const repostDeferredTotal = document.getElementById("repost-deferred-total");
 
 export const repostBlockedTotal = document.getElementById("repost-blocked-total");
-
-export const repostPendingTotal = document.getElementById("repost-pending-total");
 
 export const repostDeletedTotal = document.getElementById("repost-deleted-total");
 
@@ -140,6 +143,9 @@ export const repostHistoryBody = document.getElementById("repost-history-body");
 export const repostHistoryPagination = document.getElementById("repost-history-pagination");
 
 export const repostHealthPill = document.getElementById("repost-health-pill");
+export const repostHealthStatus = document.getElementById("repost-health-status");
+export const repostRiskPause = document.getElementById("repost-risk-pause");
+export const repostMaintenance = document.getElementById("repost-maintenance");
 export const repostHealthAll = document.getElementById("repost-health-all");
 export const repostHealthExisting = document.getElementById("repost-health-existing");
 export const repostHealthDeleted = document.getElementById("repost-health-deleted");

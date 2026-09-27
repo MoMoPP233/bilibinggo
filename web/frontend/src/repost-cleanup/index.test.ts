@@ -129,6 +129,13 @@ describe("repost cleanup UI", () => {
     expect(autoDelete - combined).toBeLessThan(1800);
     expect(html).not.toContain('id="repost-sync-btn"');
     expect(html).not.toContain('id="repost-scan-btn"');
+    expect(html).not.toContain("我的转发历史");
+    expect(html).toContain('id="repost-history-total"');
+    expect(html).toContain('id="repost-existing-total"');
+    expect(html).toContain('id="repost-health-status"');
+    expect(html).toContain('id="repost-checkpoint-status"');
+    expect(html).toContain('id="repost-risk-pause"');
+    expect(html).toContain('id="repost-maintenance"');
   });
 
   beforeEach(() => {

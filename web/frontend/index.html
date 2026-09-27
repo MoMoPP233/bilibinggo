@@ -546,7 +546,7 @@
                 <div>
                   <p class="eyebrow">Cleanup Center</p>
                   <h2 class="section-title">抽奖转发清理中心</h2>
-                  <p class="section-desc">一次同步并连续评估全部当前 backlog。safe 可勾选删除；manual_review 需人工核对后强确认删除；deferred 暂缓；blocked 不可删除。页面打开/刷新/切换均为 0 远程请求。</p>
+                  <p class="section-desc">同步、评估并安全处理当前转发记录。</p>
                 </div>
                 <div class="action-row repost-cleanup-actions">
                   <button type="button" class="btn btn-primary btn-pill" id="repost-sync-assess-btn" data-action="sync_assess_repost_history">同步/评估转发历史</button>
@@ -568,31 +568,31 @@
               <p class="repost-eval-status" id="repost-eval-status" aria-live="polite">尚未开始智能评估</p>
               <div class="repost-cleanup-metrics" aria-live="polite">
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">全部历史（含已删除）</span>
+                  <span class="repost-cleanup-metric-label">历史记录</span>
                   <strong class="repost-cleanup-metric-value" id="repost-history-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">🟢 安全可删</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-safe-total">0</strong>
+                  <span class="repost-cleanup-metric-label">现存转发</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-existing-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">🟡 人工确认</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-manual-total">0</strong>
+                  <span class="repost-cleanup-metric-label">已清理</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-deleted-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">🕒 暂缓处理</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-deferred-total">0</strong>
+                  <span class="repost-cleanup-metric-label">待处理</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-pending-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">🔴 不可判断</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-blocked-total">0</strong>
+                  <span class="repost-cleanup-metric-label">删除失败</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-failed-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric">
-                  <span class="repost-cleanup-metric-label">⏳ 待评估</span>
-                  <strong class="repost-cleanup-metric-value" id="repost-pending-total">0</strong>
+                  <span class="repost-cleanup-metric-label">结果未知</span>
+                  <strong class="repost-cleanup-metric-value" id="repost-unknown-total">—</strong>
                 </div>
                 <div class="repost-cleanup-metric repost-cleanup-metric-wide">
-                  <span class="repost-cleanup-metric-label">同步 / 评估状态</span>
+                  <span class="repost-cleanup-metric-label">处理进度</span>
                   <strong class="repost-cleanup-metric-text" id="repost-workflow-status">尚未读取</strong>
                 </div>
               </div>
@@ -607,34 +607,13 @@
                 </div>
                 <span class="repost-health-pill" id="repost-health-pill" data-tone="idle">—</span>
               </div>
-              <div class="repost-health-stats" aria-live="polite">
-                <div class="repost-health-stat">
-                  <span class="repost-health-stat-label">全部历史</span>
-                  <strong class="repost-health-stat-value" id="repost-health-all">—</strong>
-                </div>
-                <div class="repost-health-stat">
-                  <span class="repost-health-stat-label">现存转发（未删除）</span>
-                  <strong class="repost-health-stat-value" id="repost-health-existing">—</strong>
-                </div>
-                <div class="repost-health-stat">
-                  <span class="repost-health-stat-label">已删除</span>
-                  <strong class="repost-health-stat-value" id="repost-health-deleted">—</strong>
-                </div>
-                <div class="repost-health-stat">
-                  <span class="repost-health-stat-label">未完成删除</span>
-                  <strong class="repost-health-stat-value" id="repost-health-pending">—</strong>
-                </div>
-                <div class="repost-health-stat">
-                  <span class="repost-health-stat-label">删除失败</span>
-                  <strong class="repost-health-stat-value" id="repost-health-failed">—</strong>
-                </div>
-                <div class="repost-health-stat">
-                  <span class="repost-health-stat-label">删除结果未知</span>
-                  <strong class="repost-health-stat-value" id="repost-health-unknown">—</strong>
-                </div>
+              <div class="repost-health-summary" aria-live="polite">
+                <p><span>清理状态</span><strong id="repost-health-status">读取中…</strong></p>
+                <p><span>清理进度</span><strong id="repost-checkpoint-status">读取中…</strong></p>
+                <p><span>风险暂停</span><strong id="repost-risk-pause">读取中…</strong></p>
+                <p><span>自动维护</span><strong id="repost-maintenance">读取中…</strong></p>
               </div>
-              <p class="repost-health-legend">统计口径：全部历史＝现存转发＋未完成删除＋已删除；现存转发（未删除）＝仍存在＋删除失败＋删除结果未知，是上方候选分级与“待评估”的统计范围。</p>
-              <div class="repost-health-lines" id="repost-health-lines" aria-live="polite">正在读取维护状态…</div>
+              <div class="repost-health-lines" id="repost-health-lines" aria-live="polite"></div>
               <div class="repost-health-issues" id="repost-health-issues" hidden></div>
             </article>
 
@@ -692,32 +671,6 @@
               <div class="pagination" id="repost-candidate-pagination"></div>
             </article>
 
-            <article class="panel repost-history-panel">
-              <div class="panel-head-row repost-list-head">
-                <div>
-                  <p class="eyebrow">Repost History</p>
-                  <h2 class="section-title">我的转发历史</h2>
-                  <p class="section-desc" id="repost-history-summary">读取当前运行 Profile 的本地索引中…</p>
-                </div>
-              </div>
-              <div class="table-wrap">
-                <table class="data-table repost-cleanup-table">
-                  <thead>
-                    <tr>
-                      <th>本人转发</th>
-                      <th>原动态</th>
-                      <th>原作者</th>
-                      <th>转发时间</th>
-                      <th>状态</th>
-                    </tr>
-                  </thead>
-                  <tbody id="repost-history-body">
-                    <tr class="empty-row"><td colspan="5">加载中…</td></tr>
-                  </tbody>
-                </table>
-              </div>
-              <div class="pagination" id="repost-history-pagination"></div>
-            </article>
           </div>
         </section>
 

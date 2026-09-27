@@ -7933,6 +7933,45 @@ body.job-running .main-shell .topbar {
   margin-top: 16px;
 }
 
+.repost-health-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.repost-health-summary p {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.repost-health-summary span {
+  color: var(--foreground-muted);
+  font-size: 12px;
+}
+
+.repost-health-summary strong {
+  color: var(--foreground);
+  font-size: 14px;
+}
+
+@media (max-width: 900px) {
+  .repost-health-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .repost-health-summary {
+    grid-template-columns: 1fr;
+  }
+}
+
 .repost-health-pill {
   display: inline-flex;
   align-items: center;
