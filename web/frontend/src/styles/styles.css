@@ -3433,6 +3433,72 @@ html.sidebar-init-collapsed .system-btn {
   padding: 24px 12px;
 }
 
+.ds9-topic-rows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ds9-topic-card {
+  display: flex;
+  flex: 1 1 280px;
+  min-width: min(280px, 100%);
+  max-width: 390px;
+  flex-direction: column;
+  gap: 7px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--surface-highlight);
+}
+
+.ds9-topic-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ds9-topic-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ds9-topic-card-id {
+  color: var(--foreground-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ds9-topic-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+}
+
+.ds9-topic-card-meta .caption {
+  font-size: 12px;
+}
+
+.ds9-topic-actions {
+  display: flex;
+  justify-content: flex-end;
+  min-height: 0;
+}
+
+[data-theme="dark"] .ds9-topic-card {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.07);
+}
+
 .source-row--watch {
   grid-template-columns: 72px 1fr;
   background: var(--surface);

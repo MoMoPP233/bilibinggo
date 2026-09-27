@@ -18,6 +18,14 @@ function timeText(value) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function topicScanText(value) {
+  if (!value) return "—";
+  const date = new Date(Number(value) * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function statusText(topics) {
   const enabled = topics.filter((item) => item?.enabled);
   if (enabled.some((item) => item?.last_error)) return "partial";
@@ -37,25 +45,24 @@ function renderStatusPill(status) {
   return `<span class="ds9-status-pill is-${escapeHtml(status)}">${STATUS_LABELS[status] || status}</span>`;
 }
 
-function topicRowHtml(topic) {
+function topicCardHtml(topic) {
   const kind = topic?.kind === "built-in" ? "内置" : "自定义";
   const enabled = Boolean(topic?.enabled);
+  const processed = topic?.fp ? "已推送数据库" : "未处理";
   return `
-    <li class="ds9-topic-row" data-topic-id="${escapeHtml(String(topic?.topic_id || ""))}">
-      <div class="ds9-topic-main">
-        <strong>${escapeHtml(String(topic?.name || topic?.topic_id || ""))}</strong>
-        <span class="ds9-topic-id">${escapeHtml(String(topic?.topic_id || ""))}</span>
-        <span class="ds9-topic-kind is-${escapeHtml(kind)}">${kind}</span>
+    <li class="ds9-topic-card" data-topic-id="${escapeHtml(String(topic?.topic_id || ""))}">
+      <div class="ds9-topic-card-head">
+        <strong class="ds9-topic-name">话题：${escapeHtml(String(topic?.name || topic?.topic_id || ""))}</strong>
+        <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-toggle data-ds9-enabled="${enabled ? "true" : "false"}">${enabled ? "暂停" : "恢复"}</button>
       </div>
-      <div class="ds9-topic-meta">
-        <span class="caption">最近成功：${timeText(topic?.last_success_at)}</span>
-        <span class="caption">最近发现：${Number(topic?.last_found) || 0} 条</span>
-        ${Number(topic?.incomplete_count) > 0 ? `<span class="caption" title="等待下轮重新解析的条目数（不影响 checkpoint）">待解析：${Number(topic?.incomplete_count)} 条</span>` : ""}
+      <div class="ds9-topic-card-id">${escapeHtml(String(topic?.topic_id || ""))} · ${kind}</div>
+      <div class="ds9-topic-card-meta">
+        <span class="caption">最近扫描：${topicScanText(topic?.last_scan_at)}</span>
+        <span class="caption">发现 ${Number(topic?.last_found) || 0} · ${processed}</span>
+        ${Number(topic?.incomplete_count) > 0 ? `<span class="caption" title="等待下轮重新解析的条目数">待解析：${Number(topic?.incomplete_count)} 条</span>` : ""}
         ${topic?.last_error ? `<span class="caption is-error" title="${escapeHtml(String(topic.last_error))}">最近错误</span>` : ""}
-        <span class="caption">checkpoint：${topic?.fp ? "已推进" : "未运行"}</span>
       </div>
       <div class="ds9-topic-actions">
-        <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-toggle>${enabled ? "暂停" : "启用"}</button>
         ${topic?.kind === "custom" ? `<button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-delete>删除</button>` : ""}
       </div>
     </li>`;
@@ -75,7 +82,7 @@ function render(state) {
   panel.querySelector("[data-ds9-builtin]").textContent = String(builtin);
   panel.querySelector("[data-ds9-custom]").textContent = String(custom);
   panel.querySelector("[data-ds9-last-scan]").textContent = timeText(latest || null);
-  panel.querySelector("[data-ds9-rows]").innerHTML = topics.map(topicRowHtml).join("");
+  panel.querySelector("[data-ds9-rows]").innerHTML = topics.map(topicCardHtml).join("");
 }
 
 async function refreshView() {
@@ -100,7 +107,7 @@ function handleTopicAction(event) {
       .catch((error) => showToast(String(error?.message || error), "error"));
     return;
   }
-  const enabling = button.textContent === "启用";
+  const enabling = button.dataset.ds9Enabled !== "true";
   fetchJSON(`/api/ds9/topics/${encodeURIComponent(topicId)}/enabled`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
