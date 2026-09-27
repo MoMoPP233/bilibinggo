@@ -51,9 +51,9 @@ describe("winner scheduler state", () => {
 
     await vi.waitFor(() => expect(document.getElementById("winner-scheduler-state")).not.toBeNull());
     const stateText = document.getElementById("winner-scheduler-state")?.textContent || "";
-    expect(stateText).toContain("自动调度：完成");
-    expect(stateText).toContain("2026-09-08 17:04:00");
-    expect(stateText).toContain("本轮发现 0 条疑似中奖");
+    expect(stateText).toContain("扫描状态：完成");
+    expect(stateText).toContain("上次扫描：2026-09-08 17:04:00");
+    expect(stateText).toContain("新增线索：0");
 
     document.getElementById("winner-scan-run")?.click();
     expect(startJobMock).toHaveBeenCalledWith("winner_deep_scan", {});
@@ -84,8 +84,7 @@ describe("winner scheduler state", () => {
       },
     }));
 
-    expect(document.getElementById("winner-scheduler-state")?.textContent).toContain("风控暂停");
-    expect(document.getElementById("winner-scheduler-state")?.textContent).toContain("平台风控冷却中");
+    expect(document.getElementById("winner-scheduler-state")?.textContent).toContain("扫描状态：风控暂停");
     expect(fetchJSONMock).toHaveBeenCalledTimes(before);
   });
 });

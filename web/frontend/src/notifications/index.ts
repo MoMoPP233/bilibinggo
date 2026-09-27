@@ -7,7 +7,7 @@ import { startJob } from "../jobs/index";
 import { state as appState } from "../state";
 import { showToast } from "../shell/toast";
 import { formatAutoCountdown } from "../utils/format";
-import { escapeHtml, sanitizeUserText } from "../utils/text";
+import { escapeHtml } from "../utils/text";
 
 const ROOT_ID = "notifications-root";
 let bound = false;
@@ -36,11 +36,11 @@ const STATUS_LABELS = {
   dispatching: "发送中", // 当前进程真实在途发送（短暂）
 };
 const EVENT_LABELS = {
-  winning_candidate: "疑似中奖候选（M3）",
-  winning_confirmed: "中奖确认（M3）",
-  platform_risk: "平台风控（暂未接入）",
-  auto_task_error: "自动任务失败（暂未接入）",
-  auto_task_completed: "自动任务完成（暂未接入）",
+  winning_candidate: "疑似中奖候选",
+  winning_confirmed: "中奖确认",
+  platform_risk: "平台风控",
+  auto_task_error: "自动任务失败",
+  auto_task_completed: "自动任务完成",
   test: "测试",
 };
 const EVENT_PRODUCER_PENDING = new Set(["platform_risk", "auto_task_error", "auto_task_completed"]);
@@ -62,14 +62,14 @@ function channelCardHtml(channel) {
     (field) => `
       <label class="ntf-field">
         <span class="caption">${escapeHtml(field.label)}</span>
-        <input class="form-control" data-ntf-field="${escapeHtml(field.key)}" type="${field.secret ? "password" : "text"}" autocomplete="off" placeholder="已配置则留空以保持不变" />
+        <input class="form-control" data-ntf-field="${escapeHtml(field.key)}" type="${field.secret ? "password" : "text"}" autocomplete="off" placeholder="${escapeHtml(channel.configured ? "已配置，留空保持不变" : `请输入 ${field.label.replace(/（可选）$/, "")}`)}" />
       </label>`
   ).join("");
   return `
     <article class="panel ntf-card is-${channel.configured ? "configured" : "missing"}" data-channel="${escapeHtml(channel.channel)}">
       <div class="ntf-card-head">
         <h3 class="section-title">${escapeHtml(channel.label)}</h3>
-        <span class="caption ntf-config-state">${channel.configured ? "已配置" : "未配置"} · ${channel.masked ? `凭据 ${escapeHtml(channel.masked)}` : "无凭据"}</span>
+        <span class="caption ntf-config-state">${channel.configured ? (channel.enabled ? "已启用" : "已停用") : "未配置"}</span>
         <label class="ntf-toggle"><input type="checkbox" data-ntf-enabled ${channel.enabled ? "checked" : ""} /> ${channel.enabled ? "已启用" : "已停用"}</label>
       </div>
       <form class="ntf-config-form" data-ntf-config>
@@ -109,7 +109,7 @@ function renderRoot(state) {
             ([event, enabled]) => `
           <label class="ntf-toggle-row">
             <input type="checkbox" data-ntf-event="${escapeHtml(event)}" ${enabled ? "checked" : ""} ${EVENT_PRODUCER_PENDING.has(event) ? "disabled" : ""} />
-            <span>${escapeHtml(EVENT_LABELS[event] || event)}</span>
+            <span>${escapeHtml(EVENT_LABELS[event] || event)}${EVENT_PRODUCER_PENDING.has(event) ? ' <span class="ntf-pending-badge">未接入</span>' : ""}</span>
           </label>`
           )
           .join("")}
@@ -120,7 +120,8 @@ function renderRoot(state) {
       <table class="ntf-records">
         <thead><tr><th>时间</th><th>渠道</th><th>事件</th><th>状态</th><th>摘要</th></tr></thead>
         <tbody>
-          ${(state?.records || [])
+          ${(state?.records || []).length
+            ? (state?.records || [])
             .map(
               (record) => `
             <tr>
@@ -131,7 +132,8 @@ function renderRoot(state) {
               <td>${escapeHtml(String(record.summary || ""))}</td>
             </tr>`
             )
-            .join("")}
+            .join("")
+            : '<tr class="empty-row"><td colspan="5" class="caption">暂无发送记录</td></tr>'}
         </tbody>
       </table>
     </article>`;
@@ -230,9 +232,19 @@ async function refreshView() {
   }
 }
 
-const SOURCE_LABELS_M3 = { mention: "@我的", reply: "回复我的", dm: "未读私信" };
+const SOURCE_LABELS_M3 = { mention: "@我的", reply: "回复", dm: "私信" };
 
-function winnerSchedulerHtml(task, scheduler) {
+function winnerClueCount(task, sources) {
+  const found = Object.values(sources || {}).reduce((total, source) => {
+    const count = Number(source?.found);
+    return Number.isFinite(count) && count >= 0 ? total + count : total;
+  }, 0);
+  if (found > 0 || Object.keys(sources || {}).length) return found;
+  const match = String(task?.last_result || "").match(/发现\s*(\d+)\s*条/);
+  return match ? Number(match[1]) : 0;
+}
+
+function winnerSchedulerHtml(task, scheduler, clueCount) {
   const statusLabels = {
     waiting: "等待",
     running: "运行中",
@@ -252,11 +264,11 @@ function winnerSchedulerHtml(task, scheduler) {
       ? "正在确认状态…"
       : formatAutoCountdown(next || null);
   return `<div class="winner-scheduler-state" id="winner-scheduler-state" data-status="${escapeHtml(status)}">
-    <strong>自动调度：${escapeHtml(statusLabels[status] || status)}</strong>
-    <span>上次 ${escapeHtml(String(task?.last_started_at || "—"))}</span>
-    <span>下次 ${next ? escapeHtml(new Date(next * 1000).toLocaleString("zh-CN", { hour12: false })) : "—"}</span>
-    <span>倒计时 ${escapeHtml(countdown)}</span>
-    <small>${escapeHtml(sanitizeUserText(task?.last_result || ""))}</small>
+    <strong>扫描状态：${escapeHtml(statusLabels[status] || status)}</strong>
+    <span>上次扫描：${escapeHtml(String(task?.last_started_at || "—"))}</span>
+    <span>下次扫描：${next ? escapeHtml(new Date(next * 1000).toLocaleString("zh-CN", { hour12: false })) : "—"}</span>
+    <span>新增线索：${escapeHtml(String(Number.isFinite(Number(clueCount)) ? clueCount : winnerClueCount(task)))}</span>
+    <span>倒计时：${escapeHtml(countdown)}</span>
   </div>`;
 }
 
@@ -264,7 +276,7 @@ function renderWinnerSchedulerTask(task, scheduler) {
   const current = document.getElementById("winner-scheduler-state");
   if (!current) return;
   const holder = document.createElement("div");
-  holder.innerHTML = winnerSchedulerHtml(task, scheduler);
+  holder.innerHTML = winnerSchedulerHtml(task, scheduler, winnerClueCount(task));
   current.replaceWith(holder.firstElementChild!);
 }
 
@@ -283,22 +295,21 @@ function renderWinner(state) {
       <div class="watch-panel-intro">
         <p class="eyebrow">中奖深检（M3）</p>
         <h2 class="section-title">疑似中奖记录</h2>
-        <p class="section-desc">只扫描 @我的 / 回复我的 / 未读私信；命中关键词仅标记「疑似中奖」，请人工确认。</p>
+        <p class="section-desc">自动扫描私信、@提及和未读消息，发现疑似中奖线索。</p>
       </div>
       <button type="button" class="btn btn-primary btn-pill" id="winner-scan-run">立即执行深检</button>
     </div>
-    ${winnerSchedulerHtml(schedulerTask, scheduler)}
+    ${winnerSchedulerHtml(schedulerTask, scheduler, winnerClueCount(schedulerTask, sources))}
     <div class="ntf-event-list">
     ${Object.entries(SOURCE_LABELS_M3)
       .map(([key, label]) => {
         const source = sources[key] || {};
-        const cursor = key === "dm" ? "—" : `${source.cursor_id || 0}`;
         const skipped = Array.isArray(source.malformed_skipped) ? source.malformed_skipped.length : 0;
         const lastReason = Array.isArray(source.malformed_skipped) && source.malformed_skipped.length
           ? String(source.malformed_skipped[source.malformed_skipped.length - 1]?.reason || "")
           : "";
         return `<span class="caption"${skipped && lastReason ? ` title="${escapeHtml(lastReason.slice(0, 80))}"` : ""}>
-          <b>${label}</b> · ${source.last_error ? "最近错误" : source.last_success_at ? "正常" : "未运行"} · cursor ${cursor}${skipped ? ` · 跳过 ${skipped} 条无法稳定识别消息` : ""}</span>`;
+          <b>${label}</b> · ${source.last_error ? "最近错误" : source.last_success_at ? "正常" : "未运行"}${skipped ? ` · 跳过 ${skipped} 条无法稳定识别消息` : ""}</span>`;
       })
       .join("")}
     </div>
@@ -312,8 +323,8 @@ function renderWinner(state) {
             <td>${timeText(item.discovered_at)}</td>
             <td>${escapeHtml(String(item.source_type || ""))}</td>
             <td>${escapeHtml(String(item.sender?.name || item.sender?.id || ""))}</td>
-            <td>${escapeHtml(String(item.summary || ""))}</td>
-            <td>${escapeHtml(String(item.status || ""))}</td>
+            <td>${escapeHtml(truncateSummary(item.summary))}</td>
+            <td>${escapeHtml(candidateStatusLabel(item.status))}</td>
           </tr>`
           )
           .join("") || '<tr><td colspan="5" class="caption">暂无疑似中奖线索</td></tr>'}
@@ -367,4 +378,14 @@ export function bindNotificationsPage() {
     });
   }
   refreshView().catch(() => {});
+}
+
+export function truncateSummary(value, max = 50) {
+  const text = String(value ?? "");
+  return Array.from(text).length > max ? `${Array.from(text).slice(0, max).join("")}……` : text;
+}
+
+export function candidateStatusLabel(status) {
+  const labels = { candidate: "疑似中奖", confirmed: "已确认中奖", dismissed: "已排除", ignored: "已忽略" };
+  return labels[String(status)] || String(status ?? "");
 }
