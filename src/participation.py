@@ -12,6 +12,7 @@ import httpx
 from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient
 from src.bilibili_request_budget import RequestBudgetExhausted
+from src.comment_breaker import CommentLimitActive, is_comment_breaker_active
 from src.lottery_actions import (
     ACTION_INTERVAL_SEC,
     DEFAULT_PARTICIPATE_TEXT,
@@ -120,6 +121,32 @@ def _network_requeue_result(
         action_text="",
         actions=[],
         context_snapshot={"result_class": "failed_local", "requeue": True},
+    )
+    _persist_result(result=result, persist=persist, dry_run=dry_run)
+    return result
+
+
+def _deferred_comment_result(
+    *,
+    dynamic_id: str,
+    lottery_type: str,
+    actions: list[ActionResult] | None = None,
+    action_text: str = "",
+    context_snapshot: dict[str, Any] | None = None,
+    persist: bool,
+    dry_run: bool,
+) -> ParticipateResult:
+    result = ParticipateResult(
+        dynamic_id=dynamic_id,
+        lottery_type=lottery_type,
+        status="deferred",
+        message="评论发送已暂停：已达到当前评论发送上限",
+        action_text=action_text,
+        actions=list(actions or []),
+        context_snapshot={
+            **(context_snapshot or {}),
+            "result_class": "deferred_comment_limit",
+        },
     )
     _persist_result(result=result, persist=persist, dry_run=dry_run)
     return result
@@ -345,6 +372,14 @@ def participate_five_action_lottery(
     persist: bool = True,
     on_step: Callable[[int, int, str, str], None] | None = None,
 ) -> ParticipateResult:
+    if not dry_run and is_comment_breaker_active():
+        return _deferred_comment_result(
+            dynamic_id=dynamic_id,
+            lottery_type=lottery_type,
+            action_text=(action_text or DEFAULT_PARTICIPATE_TEXT).strip() or DEFAULT_PARTICIPATE_TEXT,
+            persist=persist,
+            dry_run=dry_run,
+        )
     reader = client if isinstance(client, ParticipationReadClient) else ParticipationReadClient(client)
     text = action_text or DEFAULT_PARTICIPATE_TEXT
     text_meta: dict[str, Any] = {}
@@ -468,6 +503,7 @@ def participate_five_action_lottery(
             comment_type=context.comment_type,
             action_text=text,
             referer=context.referer,
+            dynamic_id=dynamic_id,
         )
         reader.raise_if_failed()
     except Exception as exc:
@@ -499,6 +535,19 @@ def participate_five_action_lottery(
             on_mutation_start=on_mutation_start,
         )
     except Exception as exc:
+        if isinstance(exc, CommentLimitActive):
+            return _deferred_comment_result(
+                dynamic_id=dynamic_id,
+                lottery_type=lottery_type,
+                actions=completed_actions,
+                action_text=text,
+                context_snapshot=_context_snapshot(
+                    context,
+                    extra={**text_meta, "notice": _notice_snapshot(notice)},
+                ),
+                persist=persist,
+                dry_run=dry_run,
+            )
         # 明确平台风控：保留已完成动作的记录，触发共享 breaker，并把风险上抛给
         # JobRunner（唯一 6h cooldown 出口），不能被普通失败语义吞掉/覆盖。
         risk = _risk_error_from_exc(exc)
@@ -1101,6 +1150,19 @@ def participate_activity(
                     )
                 checked_step(0, RESERVE_PARTICIPATE_STEPS if lottery_type == "预约抽奖" else 5,
                              "本地防重检查通过，正在检查当前目标…", "check")
+                if (
+                    not dry_run
+                    and lottery_type in {"互动抽奖", "转发抽奖"}
+                    and is_comment_breaker_active()
+                ):
+                    return _deferred_comment_result(
+                        dynamic_id=dynamic_id,
+                        lottery_type=lottery_type,
+                        action_text=(action_text or DEFAULT_PARTICIPATE_TEXT).strip()
+                        or DEFAULT_PARTICIPATE_TEXT,
+                        persist=persist,
+                        dry_run=dry_run,
+                    )
                 # 本地明确成功/待确认时不会构造客户端，亦不会发生暖机请求。
                 manager = nullcontext(client) if client is not None else BilibiliClient(warmup=False)
                 with manager as active_client:

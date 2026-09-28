@@ -11,9 +11,22 @@ import httpx
 
 from src.bilibili_auth import get_login_uid, require_login
 from src.bilibili_client import BilibiliClient, api_code
+from src.comment_breaker import (
+    COMMENT_LIMIT_CODE,
+    CommentLimitActive,
+    _trigger_comment_limit_unlocked,
+    comment_mutation_gate,
+    is_comment_breaker_active,
+)
+from src.comment_confirmation import (
+    _is_comment_confirmed_unlocked,
+    confirm_comment,
+    is_comment_confirmed,
+)
 from src.invalid_activities import is_self_follow_failure
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
 from src.platform_risk import API_RISK_CODES, risk_code_of as _risk_code_of
+from src.participation_errors import ParticipationReadError
 from src.sources.common import opus_link
 from src.participation_guard import (
     ParticipationGuardBlocked,
@@ -52,9 +65,26 @@ ACTION_LABELS: dict[ActionName, str] = {
 PARTICIPATION_STEPS: tuple[ActionName, ...] = ("like", "follow", "favorite", "repost", "comment")
 _UNSET = object()
 
+try:
+    from src.app_logging import get_logger
+except ImportError:  # pragma: no cover
+    import logging
 
-class ParticipationReadError(RuntimeError):
-    """无法可靠确认当前目标的交互状态；本次参与不得继续写操作。"""
+    def get_logger(name: str) -> logging.Logger:
+        return logging.getLogger(name)
+
+
+logger = get_logger("participation")
+
+
+def _dynamic_id_from_params(params: dict | None) -> str | None:
+    if not isinstance(params, dict):
+        return None
+    for key in ("id", "dynamic_id", "business_id", "oid"):
+        value = params.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
 
 
 class ParticipationReadClient:
@@ -80,11 +110,33 @@ class ParticipationReadClient:
             else:
                 payload = self.raw_client.request_json(url, params, referer=referer, retries=0)
                 if not isinstance(payload, dict) or type(payload.get("code")) is not int:
-                    raise ParticipationReadError("交互状态响应缺少有效 code，已停止本次参与")
-                if payload["code"] != 0:
-                    raise ParticipationReadError(
-                        f"交互状态读取失败 code={payload['code']}，已停止本次参与且不重试"
+                    error = ParticipationReadError(
+                        "交互状态响应缺少有效 code，已停止本次参与",
+                        endpoint=url,
+                        dynamic_id=_dynamic_id_from_params(params),
                     )
+                    logger.warning(
+                        "参与状态读取失败 code=%s message=%s endpoint=%s dynamic_id=%s",
+                        error.code,
+                        error.message,
+                        error.endpoint,
+                        error.dynamic_id,
+                    )
+                    raise error
+                if payload["code"] != 0:
+                    error = ParticipationReadError.from_payload(
+                        payload,
+                        endpoint=url,
+                        dynamic_id=_dynamic_id_from_params(params),
+                    )
+                    logger.warning(
+                        "参与状态读取失败 code=%s message=%s endpoint=%s dynamic_id=%s",
+                        error.code,
+                        error.message,
+                        error.endpoint,
+                        error.dynamic_id,
+                    )
+                    raise error
         except (httpx.HTTPError, RuntimeError, json.JSONDecodeError) as exc:
             if isinstance(exc, RuntimeError) and not isinstance(exc, ParticipationReadError):
                 if not isinstance(exc.__cause__, (httpx.HTTPError, json.JSONDecodeError)):
@@ -92,7 +144,11 @@ class ParticipationReadClient:
                     raise
             self._failure = (
                 exc if isinstance(exc, ParticipationReadError)
-                else ParticipationReadError(f"交互状态读取失败，已停止本次参与：{exc}")
+                else ParticipationReadError(
+                    f"交互状态读取失败，已停止本次参与：{exc}",
+                    endpoint=url,
+                    dynamic_id=_dynamic_id_from_params(params),
+                )
             )
             if self._failure is exc:
                 raise
@@ -432,6 +488,7 @@ def build_dynamic_context(
             comment_type=comment_type,
             action_text=action_text,
             referer=referer,
+            dynamic_id=dynamic_id,
         )
         client.raise_if_failed()
 
@@ -505,7 +562,10 @@ def has_comment(
     comment_type: int,
     action_text: str,
     referer: str,
+    dynamic_id: str | None = None,
 ) -> bool:
+    if dynamic_id and is_comment_confirmed(dynamic_id):
+        return True
     uid = get_login_uid()
     if not uid:
         return False
@@ -686,13 +746,24 @@ def comment_dynamic(
     message: str,
     csrf: str,
     referer: str,
+    dynamic_id: str | None = None,
 ) -> ActionResult:
-    payload = client.post_form(
-        COMMENT_URL,
-        {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
-        referer=referer,
-        raise_on_code=False,
-    )
+    with comment_mutation_gate():
+        if dynamic_id and _is_comment_confirmed_unlocked(dynamic_id):
+            return ActionResult("comment", True, "已评论，跳过")
+        if is_comment_breaker_active():
+            raise CommentLimitActive()
+        payload = client.post_form(
+            COMMENT_URL,
+            {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
+            referer=referer,
+            raise_on_code=False,
+            retries=0,
+        )
+        code = _api_code(payload)
+        if code == COMMENT_LIMIT_CODE:
+            detail = _api_message(payload)
+            _trigger_comment_limit_unlocked(code=code, message=detail)
     code = _api_code(payload)
     if code == 0:
         return ActionResult("comment", True, message[:80])
@@ -767,6 +838,8 @@ def execute_full_participation(
 
     def append_action(action: ActionResult) -> None:
         actions.append(action)
+        if action.action == "comment" and action.ok:
+            confirm_comment(dynamic_id)
         if on_action is not None:
             on_action(action)
 
@@ -852,6 +925,7 @@ def execute_full_participation(
                 message=text,
                 csrf=csrf,
                 referer=context.referer,
+                dynamic_id=dynamic_id,
             )
         )
 

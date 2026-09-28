@@ -15,6 +15,7 @@ from src.participation_log import (
     load_action_entries_for_uid,
 )
 from src.participation_store import ParticipationRecord, load_participations
+from src.comment_breaker import comment_breaker_snapshot, is_comment_breaker_active
 from src.invalid_activities import invalid_activity_ids
 from src.participation_guard import load_blocked_guard_ids
 from src.sources.common import is_valid_dynamic_id
@@ -399,6 +400,7 @@ def _pick_triple_from_rows(
 ) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    comment_breaker_active = is_comment_breaker_active()
     for row in rows:
         if str(row.get("activity_status") or "") != "未参加":
             continue
@@ -429,6 +431,8 @@ def _pick_triple_from_rows(
         row_lottery_type = str(row.get("lottery_type") or "")
         if row_lottery_type not in PARTICIPATABLE_TYPES:
             continue
+        if comment_breaker_active and row_lottery_type in {"互动抽奖", "转发抽奖"}:
+            continue
         seen_ids.add(dynamic_id)
         targets.append(row)
         if len(targets) >= limit:
@@ -453,6 +457,7 @@ def build_triple_target_preview(targets: list[dict[str, Any]]) -> dict[str, Any]
         "count": len(targets),
         "limit": PARTICIPATE_TRIPLE_LIMIT,
         "items": _format_triple_target_items(targets),
+        "comment_breaker": comment_breaker_snapshot(),
     }
 
 

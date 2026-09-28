@@ -107,6 +107,8 @@ def _payload_joined_success(payload: dict[str, Any]) -> bool:
 
 def _require_participate_success(payload: dict[str, Any]) -> None:
     status = str(payload.get("status") or "")
+    if status == "deferred" or payload.get("result_class") == "deferred_comment_limit":
+        return
     if status == "skipped":
         raise RuntimeError(str(payload.get("message") or "该活动不可参与"))
     if status != "joined" or not _payload_joined_success(payload):
@@ -125,7 +127,10 @@ def _normalize_participate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if _is_participation_dedup_skip(payload):
         return {**payload, "skipped": True}
     _require_participate_success(payload)
-    return dict(payload)
+    normalized = dict(payload)
+    if str(normalized.get("status") or "") == "deferred" and not normalized.get("result_class"):
+        normalized["result_class"] = "deferred_comment_limit"
+    return normalized
 
 
 def _triple_transport_unknown(exc: BaseException) -> bool:
@@ -2041,6 +2046,8 @@ def _run_action_impl(
             with progress_lock:
                 if skipped:
                     state_message = str(payload.get("message") or "已跳过")
+                elif result_class == "deferred_comment_limit" or payload.get("status") == "deferred":
+                    state_message = str(payload.get("message") or "评论发送已暂停")
                 elif result_class == "unknown":
                     state_message = str(payload.get("message") or "结果未知，已锁定")
                 elif result_class == "failed_local" or payload.get("status") == "failed":
@@ -2144,6 +2151,7 @@ def _run_action_impl(
         log_blocks = [format_participation_log(item["payload"]) for item in results]
         skipped_count = sum(_is_participation_dedup_skip(item["payload"]) for item in results)
         unknown_count = sum(item.get("result_class") == "unknown" for item in results)
+        deferred_count = sum(item.get("result_class") == "deferred_comment_limit" for item in results)
         deleted_count = sum(item.get("result_class") == "invalid_activity" for item in results)
         requeued_count = sum(
             bool(
@@ -2166,7 +2174,7 @@ def _run_action_impl(
         message = (
             f"三连参与完成：成功 {joined_count} 个，删除 {deleted_count} 个，"
             f"重新排队 {requeued_count} 个，失败 {failed_count} 个，"
-            f"跳过 {skipped_count} 个，结果未知 {unknown_count} 个"
+            f"暂缓 {deferred_count} 个，跳过 {skipped_count} 个，结果未知 {unknown_count} 个"
         )
         detail_message = f"{message} | {_progress_snapshot()}"
         progress(step=total_steps, total=total_steps, message=detail_message, log_append=message)

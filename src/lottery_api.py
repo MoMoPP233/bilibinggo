@@ -11,6 +11,7 @@ import httpx
 from src.bilibili_client import BilibiliClient
 from src.bilibili_request_budget import RequestBudgetExhausted
 from src.lottery_classifier import UPOWER_BUSINESS_TYPE
+from src.participation_errors import ParticipationReadError
 from src.platform_risk import risk_code_of
 from src.sources.common import opus_link
 
@@ -190,6 +191,10 @@ def _fetch_opus_detail_item(
         )
     except RequestBudgetExhausted:
         # V22 本地预算保护是独立控制流：绝不能被“不可读/跳过当前动态”吞掉。
+        raise
+    except ParticipationReadError:
+        # ParticipationReadClient owns sticky read failures and their
+        # structured diagnostics; do not wrap them as platform risk.
         raise
     except Exception as exc:
         # 明确平台风控绝不能被“不可读/跳过当前动态”吞掉；普通失败允许跳过该条。

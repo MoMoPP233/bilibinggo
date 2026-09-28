@@ -814,6 +814,24 @@ def api_triple_participate_targets(
     )
 
 
+@app.get("/api/participation/comment-breaker", tags=["stable"])
+def api_comment_breaker() -> dict[str, Any]:
+    """Read the current Profile-local comment mutation pause."""
+    from src.comment_breaker import comment_breaker_snapshot
+
+    return {"ok": True, **comment_breaker_snapshot()}
+
+
+@app.post("/api/participation/comment-breaker/recover", tags=["stable"])
+def api_comment_breaker_recover() -> dict[str, Any]:
+    """Clear only the local comment pause; never contacts Bilibili."""
+    from src.comment_breaker import clear_comment_breaker, comment_breaker_snapshot
+
+    uid = _require_local_account("请先扫码登录后再恢复评论参与")
+    clear_comment_breaker()
+    return {"ok": True, "uid": uid, **comment_breaker_snapshot()}
+
+
 def _require_runtime_bilibili_uid(message: str | None = None) -> str:
     from src.bilibili_auth import require_login as require_bilibili_login
 
