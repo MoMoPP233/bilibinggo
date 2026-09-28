@@ -974,6 +974,19 @@ class AutoScheduler:
         self._set_task_status("participate", "running", "三连参与开始")
         self._log("info", f"三连参与刻度 {key}")
         try:
+            from src.comment_probe import run_comment_recovery_probe
+
+            probe = run_comment_recovery_probe()
+            if probe.get("claimed"):
+                self._done_triple.add(key)
+                if self._is_stale():
+                    return
+                with self._lock:
+                    self._status.triple_slot_key = key
+                self._mark_remote_stage_finished()
+                self._set_task_status("participate", "completed", "评论恢复探测完成")
+                self._set_phase("等待下一刻度", "评论恢复探测完成，等待下一轮参与")
+                return
             outcome = self._click_and_wait("participate_triple")
             self._done_triple.add(key)
             if self._is_stale():

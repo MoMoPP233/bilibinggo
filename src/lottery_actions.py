@@ -774,6 +774,39 @@ def comment_dynamic(
     return ActionResult("comment", False, f"code={code} {_api_message(payload)}".strip())
 
 
+def comment_dynamic_probe(
+    client: BilibiliClient,
+    *,
+    rid: str,
+    comment_type: int,
+    message: str,
+    csrf: str,
+    referer: str,
+    dynamic_id: str | None = None,
+) -> ActionResult:
+    """Send one recovery-only comment while the breaker remains claimed active."""
+    with comment_mutation_gate():
+        if dynamic_id and _is_comment_confirmed_unlocked(dynamic_id):
+            return ActionResult("comment", True, "已评论，跳过")
+        if not is_comment_breaker_active():
+            return ActionResult("comment", False, "恢复探测已取消")
+        payload = client.post_form(
+            COMMENT_URL,
+            {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
+            referer=referer,
+            raise_on_code=False,
+            retries=0,
+        )
+    code = _api_code(payload)
+    if code == 0:
+        return ActionResult("comment", True, message[:80])
+    if code == 12051:
+        return ActionResult("comment", True, "已有相同评论")
+    _raise_payload_auth(payload, "评论")
+    _raise_payload_risk(payload, "评论")
+    return ActionResult("comment", False, f"code={code} {_api_message(payload)}".strip())
+
+
 def execute_full_participation(
     client: BilibiliClient,
     *,

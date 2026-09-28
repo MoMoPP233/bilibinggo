@@ -17,6 +17,22 @@ def test_reject_unknown_job_action() -> None:
     assert data["detail"] == data["error"]["message"]
 
 
+def test_comment_breaker_keeps_read_only_status_and_removes_manual_recover_route() -> None:
+    paths = {
+        (method, route.path)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+    assert ("GET", "/api/participation/comment-breaker") in paths
+    assert ("POST", "/api/participation/comment-breaker/recover") not in paths
+    with patch("src.comment_breaker.comment_breaker_snapshot", return_value={"active": False}):
+        assert client.get("/api/participation/comment-breaker").json() == {
+            "ok": True,
+            "active": False,
+        }
+    assert client.post("/api/participation/comment-breaker/recover").status_code in (404, 405)
+
+
 def test_delete_notification_record_route_is_single_record_scope() -> None:
     with patch("web.app.delete_record") as delete_mock:
         resp = client.delete(

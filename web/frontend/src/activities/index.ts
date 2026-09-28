@@ -261,7 +261,6 @@ export function renderTripleParticipateBar(data) {
   const bar = document.getElementById("triple-participate-bar");
   const descEl = document.getElementById("triple-participate-desc");
   const targetsEl = document.getElementById("triple-participate-targets");
-  const recoverBtn = document.getElementById("comment-breaker-recover-btn");
   const btn = document.getElementById("triple-participate-btn");
   const labelEl = document.getElementById("triple-participate-btn-label");
   if (!btn || !targetsEl || !labelEl) return;
@@ -286,7 +285,6 @@ export function renderTripleParticipateBar(data) {
   }
 
   if (!setupOk) {
-    if (recoverBtn) recoverBtn.hidden = true;
     if (descEl) descEl.textContent = "完成登录与 LLM 配置后，可一键并行参与最多 3 个活动";
     targetsEl.innerHTML = `<span class="triple-participate-empty">需先完成登录与 LLM 配置</span>`;
     btn.disabled = true;
@@ -299,23 +297,8 @@ export function renderTripleParticipateBar(data) {
     targetsEl.innerHTML = `<span class="triple-participate-empty">本地暂停评论发送，不会影响已记录结果</span>`;
     btn.disabled = true;
     labelEl.textContent = "评论已暂停";
-    if (recoverBtn) {
-      recoverBtn.hidden = false;
-      recoverBtn.disabled = false;
-      recoverBtn.onclick = async () => {
-        recoverBtn.disabled = true;
-        try {
-          await fetchJSON("/api/participation/comment-breaker/recover", { method: "POST" });
-          await loadActivities();
-        } catch (error) {
-          showToast(error?.message || "恢复评论参与失败", "error");
-          recoverBtn.disabled = false;
-        }
-      };
-    }
     return;
   }
-  if (recoverBtn) recoverBtn.hidden = true;
 
   if (count <= 0) {
     if (descEl) descEl.textContent = "当前筛选列表下没有可参与的未参加活动";

@@ -103,6 +103,32 @@ except Exception:
 runner.recover_on_startup()
 
 
+def _startup_comment_breaker_status() -> None:
+    """Recover stale comment probes, then log the current Profile's pause state."""
+    try:
+        from src.comment_breaker import load_comment_breaker, recover_stale_comment_probe
+
+        recover_stale_comment_probe()
+        state = load_comment_breaker()
+        if not state.get("active"):
+            return
+        next_probe_at = state.get("next_probe_at")
+        try:
+            remaining = max(0, int(next_probe_at) - int(time.time()))
+        except (TypeError, ValueError):
+            remaining = 0
+        if remaining:
+            minutes = (remaining + 59) // 60
+            logger.info("评论暂停中：约 %s 分钟后自动探测", minutes)
+        else:
+            logger.info("评论暂停中：等待自动恢复")
+    except Exception:
+        logger.warning("评论暂停状态读取失败（已忽略，不影响启动）")
+
+
+_startup_comment_breaker_status()
+
+
 def _startup_onboarding_sweep() -> None:
     """启动时执行一次 onboarding expired staging 清理；失败只记录，不阻塞服务启动。"""
     try:
@@ -820,16 +846,6 @@ def api_comment_breaker() -> dict[str, Any]:
     from src.comment_breaker import comment_breaker_snapshot
 
     return {"ok": True, **comment_breaker_snapshot()}
-
-
-@app.post("/api/participation/comment-breaker/recover", tags=["stable"])
-def api_comment_breaker_recover() -> dict[str, Any]:
-    """Clear only the local comment pause; never contacts Bilibili."""
-    from src.comment_breaker import clear_comment_breaker, comment_breaker_snapshot
-
-    uid = _require_local_account("请先扫码登录后再恢复评论参与")
-    clear_comment_breaker()
-    return {"ok": True, "uid": uid, **comment_breaker_snapshot()}
 
 
 def _require_runtime_bilibili_uid(message: str | None = None) -> str:

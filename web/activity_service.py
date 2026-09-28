@@ -16,9 +16,10 @@ from src.participation_log import (
 )
 from src.participation_store import ParticipationRecord, load_participations
 from src.comment_breaker import comment_breaker_snapshot, is_comment_breaker_active
+from src.comment_confirmation import is_comment_confirmed
 from src.invalid_activities import invalid_activity_ids
 from src.participation_guard import load_blocked_guard_ids
-from src.sources.common import is_valid_dynamic_id
+from src.sources.common import is_valid_dynamic_id, normalize_activity_id
 from src.state_store import DATA_DIR, get_last_pipeline_persisted
 
 from src.watch_sync import OUTPUT_PATH as WATCH_OUTPUT_PATH
@@ -483,6 +484,47 @@ def pick_triple_participate_targets(
         order=order,
     )
     return _pick_triple_from_rows(rows, limit=limit)
+
+
+def pick_comment_probe_candidate() -> dict[str, Any] | None:
+    """Pick one existing, still-participatable comment activity for recovery."""
+    rows = _filtered_activity_rows()
+    excluded_ids = {
+        str(value or "").strip()
+        for value in (comment_breaker_snapshot().get("probe_excluded_dynamic_ids") or [])
+        if str(value or "").strip()
+    }
+    for row in rows:
+        if str(row.get("activity_status") or "") != "未参加" or not row.get("can_participate"):
+            continue
+        if str(row.get("lottery_type") or "") not in {"互动抽奖", "转发抽奖"}:
+            continue
+        dynamic_id = str(row.get("dynamic_id") or "").strip()
+        canonical_id = normalize_activity_id(dynamic_id) or dynamic_id
+        if (
+            not is_valid_dynamic_id(dynamic_id)
+            or canonical_id in excluded_ids
+            or is_comment_confirmed(dynamic_id)
+        ):
+            continue
+        last = row.get("last_participation")
+        snapshot = last.get("context_snapshot") if isinstance(last, dict) else None
+        result_class = snapshot.get("result_class") if isinstance(snapshot, dict) else None
+        if result_class in {"unknown", "global_risk", "pending", "suspected"}:
+            continue
+        if result_class == "failed_local":
+            try:
+                recorded_at = int(last.get("recorded_at") or 0) if isinstance(last, dict) else 0
+                backoff_until = int(
+                    snapshot.get("backoff_until")
+                    or (recorded_at + TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS if recorded_at else 0)
+                )
+            except (TypeError, ValueError):
+                backoff_until = 0
+            if backoff_until > int(time.time()):
+                continue
+        return row
+    return None
 
 
 def summarize_triple_participate_targets(
