@@ -1066,28 +1066,41 @@ class WinnerScanService:
             if record is None:
                 continue
             event_id = str(record.get("notification_event_id") or f"winning_candidate:{key}")
-            lines = [
-                f"来源：{record.get('source_type')}",
-                f"发送者：{_sender_text(record.get('sender'))}",
-                f"时间：{record.get('source_time')}",
-                f"摘要：{record.get('summary')}",
-            ]
-            url = str(record.get("source_url") or "")
-            if url:
-                lines.append(f"链接：{url}")
+            title, body = _format_winner_notification(record)
             # 通知本地硬失败（claim/terminal 无法落盘）属于本地 durable 失败：
             # 当前 Source 不得推进 checkpoint（由调用方 catch 处理）。
             try:
                 self.notification.dispatch(
                     event_id,
-                    title="Binggo：疑似中奖线索",
-                    body="\n".join(lines),
+                    title=title,
+                    body=body,
                     event_type="winning_candidate",
                 )
             except NotificationLocalError:
                 raise
             except Exception:  # noqa: BLE001 - 其余通知异常不影响扫描推进
                 pass
+
+
+def _format_winner_notification(record: dict[str, Any]) -> tuple[str, str]:
+    """格式化实际中奖候选通知；测试通知不经过此处。"""
+    sender = _sender_text(record.get("sender"))
+    title = f"Binggo中奖提醒｜{sender}" if sender else "Binggo中奖提醒"
+    summary = str(record.get("summary") or "").strip()
+    if summary:
+        return title, summary
+
+    # 保留空摘要候选的既有安全 fallback，避免 None/空值导致通知失败。
+    lines = [
+        f"来源：{record.get('source_type') or ''}",
+        f"发送者：{sender}",
+        f"时间：{record.get('source_time') or ''}",
+        "摘要：",
+    ]
+    url = str(record.get("source_url") or "")
+    if url:
+        lines.append(f"链接：{url}")
+    return title, "\n".join(lines)
 
 
 def _sender_text(sender: Any) -> str:
