@@ -139,6 +139,17 @@ _WELCOME_PHRASES = (
     re.compile(r"(?:与|和|以及)(?:关注|支持|喜欢|陪伴)"),
 )
 
+# 关注后的长自动回复通常会包含导流内容，不能要求整段正文都匹配短欢迎模板。
+# 仅在明确的问候 + 导流结构同时出现时启用，避免把普通真人私信中的单个词误判为自动回复。
+_AUTO_REPLY_GREETING_RE = re.compile(
+    r"(?:感谢|谢谢|多谢|感恩)(?:(?:您|你)(?:的)?)?(?:关注|支持|喜欢|陪伴)"
+)
+_AUTO_REPLY_ROUTING_RES = (
+    re.compile(r"回复\s*[\"“‘「『][^\"”’」』\r\n]{1,24}[\"”’」』]"),
+    re.compile(r"回复\s*(?:关键词|口令)"),
+    re.compile(r"(?:共重号|公众号|粉丝群|粉丝群号|QQ群|群号|群聊)"),
+)
+
 # 允许出现在欢迎语最前面的称呼/问候（消费后必须被欢迎短语完全覆盖）。
 _LEADING_ADDRESS_RE = re.compile(
     r"^(?:亲爱的|亲|宝子|小可爱|朋友们|朋友|小伙伴们|小伙伴|大家|"
@@ -196,6 +207,14 @@ def is_welcome_template(text: str) -> bool:
     return matched and not compact
 
 
+def is_follow_auto_reply_template(text: str) -> bool:
+    """识别长关注自动回复中的保守问候+导流组合。"""
+    value = str(text or "")
+    if not value or not _AUTO_REPLY_GREETING_RE.search(value):
+        return False
+    return any(pattern.search(value) for pattern in _AUTO_REPLY_ROUTING_RES)
+
+
 def is_high_confidence_follow_auto_reply(entry: MessageEntry, session: Any) -> bool:
     """高置信度“关注后自动回复”判定（仅用于 DM，纯本地、无副作用）。"""
     raw = entry.raw or {}
@@ -217,11 +236,17 @@ def is_high_confidence_follow_auto_reply(entry: MessageEntry, session: Any) -> b
     if getattr(session, "is_follow", None) is not True:
         return False
     text = str(entry.text or entry.title or "")
-    # E/F. 强中奖信号或链接一律否决过滤。
-    if has_strong_winner_signal(text) or contains_link(text):
+    # 链接仍保持 fail-safe：仅凭文本无法确认链接是否指向真实活动。
+    if contains_link(text):
         return False
-    # D. 纯欢迎模板。
-    return is_welcome_template(text)
+    # D. 纯欢迎模板，或长自动回复中的问候+导流组合。
+    # 身份判定优先于正文语义：组合模板命中后，即使正文含中奖词也直接过滤。
+    if is_welcome_template(text) or is_follow_auto_reply_template(text):
+        return True
+    # E. 未命中自动回复模板时，强中奖信号保留。
+    if has_strong_winner_signal(text):
+        return False
+    return False
 
 
 def is_explicit_auto_reply(entry: MessageEntry) -> bool:
