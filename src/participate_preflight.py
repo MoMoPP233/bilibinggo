@@ -4,16 +4,20 @@ import json
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from src.bilibili_client import BilibiliClient
 from src.fetch_activity_info import ENRICHED_OUTPUT_PATH
 from src.lottery_api import (
+    DYNAMIC_DETAIL_URL,
+    OPUS_DETAIL_URL,
     fetch_dynamic_detail,
     fetch_notice_for_interact,
     fetch_notice_for_reserve,
     fetch_reserve_button_status,
     is_upower_dynamic,
 )
+from src.participation_errors import ParticipationReadError
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
 from src.lottery_time import lottery_time_unix
 from src.participation_store import ParticipationRecord, get_participation, load_participations
@@ -33,6 +37,25 @@ class InvalidActivityError(RuntimeError):
     def __init__(self, message: str, *, reason: str = "invalid_link") -> None:
         super().__init__(message)
         self.reason = reason
+
+
+_INVISIBLE_DETAIL_ENDPOINTS = frozenset(
+    {
+        urlsplit(DYNAMIC_DETAIL_URL).path,
+        urlsplit(OPUS_DETAIL_URL).path,
+    }
+)
+
+
+def _is_confirmed_invisible_detail_error(exc: BaseException) -> bool:
+    """Match only the confirmed permanent-invisibility detail response."""
+    if not isinstance(exc, ParticipationReadError):
+        return False
+    if exc.code != 4101152 or exc.message.strip() != "动态不可见":
+        return False
+    endpoint = str(exc.endpoint or "").strip()
+    path = urlsplit(endpoint).path or endpoint
+    return path in _INVISIBLE_DETAIL_ENDPOINTS
 
 
 def _raise_client_failure(client: BilibiliClient) -> None:
@@ -77,7 +100,15 @@ def _sync_live_fields(
     dynamic_id = str(item.get("dynamic_id") or "")
     # Cached account state must not become positive evidence for this request.
     item["platform_participated"] = None
-    detail = fetch_dynamic_detail(client, dynamic_id)
+    try:
+        detail = fetch_dynamic_detail(client, dynamic_id)
+    except ParticipationReadError as exc:
+        if _is_confirmed_invisible_detail_error(exc):
+            raise InvalidActivityError(
+                "动态不可见（code=4101152）",
+                reason="dynamic_invisible_4101152",
+            ) from exc
+        raise
     _raise_client_failure(client)
     if not detail:
         raise InvalidActivityError("无法打开活动链接，请稍后重试", reason="invalid_link")
