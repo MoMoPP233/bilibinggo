@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import time
+from datetime import datetime
 from typing import Any
 
 from sqlmodel import delete, select
@@ -12,6 +15,17 @@ from src.db.models import Ds9RejectionAuditRow
 from src.db.session import session_scope
 
 MAX_AUDIT_SAMPLES = 100
+AUDIT_CSV_FIELDS = (
+    "dynamic_id",
+    "topic_id",
+    "topic_name",
+    "canonical_url",
+    "classifier_text",
+    "classification_result",
+    "classification_reason",
+    "first_seen_at",
+    "last_seen_at",
+)
 
 
 def _row_payload(row: Ds9RejectionAuditRow) -> dict[str, Any]:
@@ -107,3 +121,38 @@ def clear_rejections() -> int:
         count = len(rows)
         session.exec(delete(Ds9RejectionAuditRow))
         return count
+
+
+def export_rejections_csv(
+    *,
+    source_topic_id: str | None = None,
+    now: datetime | None = None,
+) -> tuple[str, bytes]:
+    """Export the current Profile's bounded audit rows as an Excel-safe CSV."""
+    rows = list_rejections(source_topic_id=source_topic_id)
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        output,
+        fieldnames=list(AUDIT_CSV_FIELDS),
+        extrasaction="ignore",
+        lineterminator="\r\n",
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                "dynamic_id": row.get("dynamic_id", ""),
+                "topic_id": row.get("source_topic_id", ""),
+                "topic_name": row.get("source_topic_name", ""),
+                "canonical_url": row.get("canonical_url", ""),
+                "classifier_text": row.get("classifier_text", ""),
+                "classification_result": row.get("classification_result", ""),
+                "classification_reason": row.get("classification_reason", ""),
+                "first_seen_at": row.get("first_seen_at", ""),
+                "last_seen_at": row.get("last_seen_at", ""),
+            }
+        )
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M")
+    filename = f"binggo-ds9-rejection-audit-{stamp}.csv"
+    # UTF-8 BOM keeps Chinese headers and classifier text readable in Windows Excel.
+    return filename, ("\ufeff" + output.getvalue()).encode("utf-8")

@@ -183,6 +183,18 @@ function handleAuditAction(event) {
     renderAudit(samples, String(select.value || ""));
     return;
   }
+  const exportButton = event.target.closest("[data-ds9-audit-export]");
+  if (exportButton) {
+    const panel = document.getElementById(PANEL_ID);
+    const select = panel?.querySelector("[data-ds9-audit-filter]");
+    const topicId = String(select?.value || "");
+    const query = topicId ? `?topic_id=${encodeURIComponent(topicId)}` : "";
+    const link = document.createElement("a");
+    link.href = `/api/ds9/rejection-audit.csv${query}`;
+    link.download = "";
+    link.click();
+    return;
+  }
   const button = event.target.closest("[data-ds9-audit-clear]");
   if (!button) return;
   if (!window.confirm("仅清空本地 DS9 非抽奖审计记录，不会删除活动，也不会操作 B 站内容。")) return;
@@ -234,6 +246,7 @@ function ensurePanel() {
             <option value="47801">抽奖号的日常 · 47801</option>
           </select>
           <span class="caption">共 <b data-ds9-audit-count>0</b> 条</span>
+          <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-export>导出 CSV（当前筛选）</button>
           <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-clear>清空审计样本</button>
         </div>
       </div>

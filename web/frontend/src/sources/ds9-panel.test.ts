@@ -106,4 +106,26 @@ describe("DS9 topic cards", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("仅清空本地"));
     confirm.mockRestore();
   });
+
+  it("exports the current local topic filter as CSV", async () => {
+    fetchJSONMock
+      .mockResolvedValueOnce({
+        topics: [{ topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true }],
+        summary: { builtin_count: 1, custom_count: 0 },
+      })
+      .mockResolvedValueOnce({ samples: [] });
+    const clicked: string[] = [];
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      clicked.push(this.href);
+    });
+    const module = await import("./ds9-panel");
+    module.bindDs9Panel();
+    await vi.waitFor(() => expect(document.querySelector("[data-ds9-audit-export]")).not.toBeNull());
+    const panel = document.getElementById("ds9-topic-panel")!;
+    const select = panel.querySelector("[data-ds9-audit-filter]") as HTMLSelectElement;
+    select.value = "47801";
+    (panel.querySelector("[data-ds9-audit-export]") as HTMLButtonElement).click();
+    expect(clicked).toEqual([expect.stringContaining("/api/ds9/rejection-audit.csv?topic_id=47801")]);
+    click.mockRestore();
+  });
 });

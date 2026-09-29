@@ -58,6 +58,17 @@ def test_ds9_rejection_audit_api_is_local_read_and_clear_only() -> None:
     clear_mock.assert_called_once_with()
 
 
+def test_ds9_rejection_audit_csv_export_is_local_and_downloadable() -> None:
+    csv_bytes = "\ufeffdynamic_id,topic_id\r\n100000000000000001,47801\r\n".encode("utf-8")
+    with patch("web.app.export_rejections_csv", return_value=("binggo-ds9-rejection-audit-20260929-1200.csv", csv_bytes)) as export_mock:
+        resp = client.get("/api/ds9/rejection-audit.csv", params={"topic_id": "47801"})
+    assert resp.status_code == 200
+    assert resp.content == csv_bytes
+    assert resp.headers["content-type"].startswith("text/csv")
+    assert "binggo-ds9-rejection-audit-20260929-1200.csv" in resp.headers["content-disposition"]
+    export_mock.assert_called_once_with(source_topic_id="47801")
+
+
 def test_watch_users_api_seeds_and_lists() -> None:
     with patch("web.app.seed_from_candidates_if_empty", return_value=True):
         with patch(
