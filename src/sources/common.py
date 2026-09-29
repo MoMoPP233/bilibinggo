@@ -41,6 +41,9 @@ class CheckResult:
     checked_at: int
     link_hints: dict[str, LotteryHint] = field(default_factory=dict)
     cv_id: str | None = None
+    # Optional source metadata used by diagnostic side channels.  Business
+    # deduplication and activity persistence continue to use activity_links.
+    activity_source_context: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

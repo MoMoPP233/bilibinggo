@@ -344,7 +344,30 @@ def test_same_dynamic_from_two_topics_deduplicated(state_path: Path, monkeypatch
     result = ds9.check_update()
     assert result.activity_links == [f"https://www.bilibili.com/opus/{DID1}"]
     assert len(result.activity_links) == 1
+    assert result.activity_source_context[DID1] == {
+        "topic_id": TOPIC_A,
+        "topic_name": "抽奖！！！",
+    }
     # 最终活动库去重由公共 run_new_links_pipeline 的 known_activity_ids 兜底。
+
+
+def test_all_three_builtin_topics_carry_source_context(state_path: Path, monkeypatch) -> None:
+    ids = (DID1, DID2, "1000000000000000003")
+    client = _FakeTopicClient(
+        data_by_topic={
+            TOPIC_A: _original_payload(ids[0]),
+            TOPIC_B: _original_payload(ids[1]),
+            TOPIC_C: _original_payload(ids[2]),
+        }
+    )
+    _install_client(monkeypatch, client)
+    result = ds9.check_update()
+    assert {item["topic_id"] for item in result.activity_source_context.values()} == {
+        TOPIC_A,
+        TOPIC_B,
+        TOPIC_C,
+    }
+    assert result.activity_source_context[ids[2]]["topic_name"] == "抽奖号的日常"
 
 
 # ---------- H：partial failure ----------

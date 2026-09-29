@@ -73,4 +73,37 @@ describe("DS9 topic cards", () => {
     (document.querySelector("[data-ds9-refresh]") as HTMLButtonElement).click();
     expect(startJobMock).toHaveBeenCalledWith("refresh_source", { source_id: "DS-9" });
   });
+
+  it("renders local rejection samples and clears only the audit endpoint", async () => {
+    fetchJSONMock
+      .mockResolvedValueOnce({
+        topics: [{ topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true }],
+        summary: { builtin_count: 1, custom_count: 0 },
+      })
+      .mockResolvedValueOnce({
+        samples: [{
+          dynamic_id: "100000000000000001",
+          canonical_url: "https://www.bilibili.com/opus/100000000000000001",
+          source_topic_id: "47801",
+          source_topic_name: "抽奖号的日常",
+          classifier_text: "分类器实际看到的最终文本",
+          last_seen_at: 1_758_600_000,
+        }],
+      });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const module = await import("./ds9-panel");
+    module.bindDs9Panel();
+    await vi.waitFor(() => expect(document.querySelector(".ds9-audit-item")).not.toBeNull());
+    const panel = document.getElementById("ds9-topic-panel")!;
+    expect(panel.textContent).toContain("47801");
+    expect(panel.textContent).toContain("分类器实际看到的最终文本");
+    expect(panel.querySelector(".ds9-audit-link")?.getAttribute("href")).toContain("100000000000000001");
+    (panel.querySelector("[data-ds9-audit-clear]") as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(fetchJSONMock).toHaveBeenCalledWith(
+      "/api/ds9/rejection-audit",
+      expect.objectContaining({ method: "DELETE" }),
+    ));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("仅清空本地"));
+    confirm.mockRestore();
+  });
 });

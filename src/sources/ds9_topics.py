@@ -491,6 +491,7 @@ def check_update(*, force: bool = False) -> CheckResult:
     records = _topic_records(_read_state())
     now = int(time.time())
     links: list[str] = []
+    activity_source_context: dict[str, dict[str, str]] = {}
     seen_links: set[str] = set()
     pending: list[dict[str, Any]] = []
     failed_topic_ids: list[str] = []
@@ -553,6 +554,10 @@ def check_update(*, force: bool = False) -> CheckResult:
                 if canonical not in seen_links:
                     seen_links.add(canonical)
                     links.append(opus_link(canonical))
+                    activity_source_context[canonical] = {
+                        "topic_id": topic_id,
+                        "topic_name": str(record.get("name") or topic_id),
+                    }
             pending.append(
                 {
                     "topic_id": topic_id,
@@ -594,6 +599,7 @@ def check_update(*, force: bool = False) -> CheckResult:
         previous_container_url="topic://discovery",
         activity_links=links,
         checked_at=now,
+        activity_source_context=activity_source_context,
     )
     # 提交钩子：公共流水线成功（common.commit_source_checkpoint）后执行。
     result.ds9_summary = summary  # type: ignore[attr-defined]

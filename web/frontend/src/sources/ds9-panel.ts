@@ -68,6 +68,33 @@ function topicCardHtml(topic) {
     </li>`;
 }
 
+function auditSampleHtml(sample) {
+  const topic = `${String(sample?.source_topic_name || sample?.source_topic_id || "未知话题")} · ${String(sample?.source_topic_id || "")}`;
+  const url = String(sample?.canonical_url || "");
+  return `
+    <li class="ds9-audit-item">
+      <div class="ds9-audit-head">
+        <strong>${escapeHtml(topic)}</strong>
+        <span class="caption">${escapeHtml(timeText(sample?.last_seen_at))}</span>
+      </div>
+      <div class="ds9-audit-meta">动态 ID：${escapeHtml(String(sample?.dynamic_id || ""))}</div>
+      ${url ? `<a class="ds9-audit-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">打开原动态</a>` : ""}
+      <div class="ds9-audit-label">分类文本</div>
+      <pre class="ds9-audit-text">${escapeHtml(String(sample?.classifier_text || "(无正文)"))}</pre>
+    </li>`;
+}
+
+function renderAudit(samples, topicId = "") {
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel) return;
+  const rows = Array.isArray(samples) ? samples : [];
+  const visible = topicId ? rows.filter((item) => String(item?.source_topic_id || "") === topicId) : rows;
+  panel.querySelector("[data-ds9-audit-count]").textContent = String(visible.length);
+  panel.querySelector("[data-ds9-audit-rows]").innerHTML = visible.length
+    ? visible.map(auditSampleHtml).join("")
+    : '<li class="ds9-audit-empty">暂无非抽奖审计样本</li>';
+}
+
 function render(state) {
   const topics = Array.isArray(state?.topics) ? state.topics : [];
   const summary = state?.summary || {};
@@ -87,8 +114,14 @@ function render(state) {
 
 async function refreshView() {
   try {
-    const state = await fetchJSON("/api/ds9");
+    const [state, audit] = await Promise.all([
+      fetchJSON("/api/ds9"),
+      fetchJSON("/api/ds9/rejection-audit"),
+    ]);
     render(state);
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) panel._ds9AuditSamples = Array.isArray(audit?.samples) ? audit.samples : [];
+    renderAudit(audit?.samples);
   } catch (error) {
     showToast(String(error?.message || error), "error", "DS9 状态读取失败");
   }
@@ -142,6 +175,22 @@ function handleAddTopic(event) {
     .catch((error) => showToast(String(error?.message || error), "error"));
 }
 
+function handleAuditAction(event) {
+  const select = event.target.closest("[data-ds9-audit-filter]");
+  if (select) {
+    const panel = document.getElementById(PANEL_ID);
+    const samples = panel?._ds9AuditSamples || [];
+    renderAudit(samples, String(select.value || ""));
+    return;
+  }
+  const button = event.target.closest("[data-ds9-audit-clear]");
+  if (!button) return;
+  if (!window.confirm("仅清空本地 DS9 非抽奖审计记录，不会删除活动，也不会操作 B 站内容。")) return;
+  fetchJSON("/api/ds9/rejection-audit", { method: "DELETE" })
+    .then(() => refreshView())
+    .catch((error) => showToast(String(error?.message || error), "error"));
+}
+
 function ensurePanel() {
   const anchor = document.getElementById("watch-panel");
   if (!anchor || document.getElementById(PANEL_ID)) return;
@@ -171,6 +220,25 @@ function ensurePanel() {
       <button type="submit" class="btn btn-secondary btn-compact btn-pill">添加话题</button>
     </form>
     <ul class="ds9-topic-rows" data-ds9-rows></ul>
+    <section class="ds9-audit-section" data-ds9-audit>
+      <div class="ds9-audit-section-head">
+        <div>
+          <h3>非抽奖审计样本</h3>
+          <p class="section-desc">仅保存本地最近 100 条分类为非抽奖活动的样本。</p>
+        </div>
+        <div class="action-row">
+          <select class="form-control" data-ds9-audit-filter aria-label="按话题筛选">
+            <option value="">全部话题</option>
+            <option value="1261901">抽奖！！！ · 1261901</option>
+            <option value="1055656">转发动态抽奖！ · 1055656</option>
+            <option value="47801">抽奖号的日常 · 47801</option>
+          </select>
+          <span class="caption">共 <b data-ds9-audit-count>0</b> 条</span>
+          <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-clear>清空审计样本</button>
+        </div>
+      </div>
+      <ul class="ds9-audit-rows" data-ds9-audit-rows></ul>
+    </section>
   `;
   anchor.insertAdjacentElement("afterend", panel);
 }
@@ -187,5 +255,7 @@ export function bindDs9Panel() {
   });
   panel.querySelector("[data-ds9-add]")?.addEventListener("submit", handleAddTopic);
   panel.querySelector("[data-ds9-rows]")?.addEventListener("click", handleTopicAction);
+  panel.querySelector("[data-ds9-audit]")?.addEventListener("click", handleAuditAction);
+  panel.querySelector("[data-ds9-audit]")?.addEventListener("change", handleAuditAction);
   refreshView().catch(() => {});
 }

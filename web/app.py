@@ -71,6 +71,7 @@ from web.activity_service import (
     summarize_triple_participate_targets,
 )
 from src.activity_failures import delete_activity_failure, list_activity_failures
+from src.ds9_rejection_audit import clear_rejections, list_rejections
 from web.api_contract import API_CONTRACT_VERSION, ApiContractMiddleware, patch_openapi_schema
 from web.api_errors import AppError, ErrorCode, register_exception_handlers, require_llm_ready, require_login
 from web.auto_scheduler import auto_scheduler
@@ -507,6 +508,19 @@ def api_ds9_status() -> dict[str, Any]:
             "enabled_count": sum(1 for item in topics if item.get("enabled")),
         },
     }
+
+
+@app.get("/api/ds9/rejection-audit", tags=["stable"])
+def api_ds9_rejection_audit(topic_id: str | None = Query(default=None)) -> dict[str, Any]:
+    """Read Profile-local DS9 non-lottery audit evidence; no remote calls."""
+    rows = list_rejections(source_topic_id=topic_id)
+    return {"samples": rows, "count": len(rows), "max_count": 100}
+
+
+@app.delete("/api/ds9/rejection-audit", tags=["stable"])
+def api_ds9_clear_rejection_audit() -> dict[str, Any]:
+    """Delete only local DS9 rejection audit rows."""
+    return {"ok": True, "deleted_count": clear_rejections()}
 
 
 class Ds9TopicCreateRequest(BaseModel):

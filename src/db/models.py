@@ -288,6 +288,28 @@ class DsCheckSnapshotRow(SQLModel, table=True):
     raw_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
 
 
+class Ds9RejectionAuditRow(SQLModel, table=True):
+    """Profile-local, bounded evidence for DS9 candidates rejected as non-lottery."""
+
+    __tablename__ = "ds9_rejection_audit"
+    __table_args__ = (
+        Index("ux_ds9_rejection_audit_dynamic_id", "dynamic_id", unique=True),
+        Index("ix_ds9_rejection_audit_last_seen_at", "last_seen_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    dynamic_id: str = Field(max_length=32)
+    canonical_url: str = Field(default="", sa_column=Column(Text, nullable=False))
+    source_topic_id: str = Field(default="", max_length=32)
+    source_topic_name: str = Field(default="", sa_column=Column(Text, nullable=False))
+    classifier_text: str = Field(default="", sa_column=Column(Text, nullable=False))
+    classification_result: str = Field(default="非抽奖活动", max_length=32)
+    classification_reason: Optional[str] = Field(default=None, sa_column=Column(Text))
+    text_hash: str = Field(default="", max_length=64)
+    first_seen_at: int = 0
+    last_seen_at: int = 0
+
+
 class WatchSyncSnapshotRow(SQLModel, table=True):
     __tablename__ = "watch_sync_snapshots"
 

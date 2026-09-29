@@ -11,7 +11,7 @@ from src.db.models import SchemaMeta
 # 确保全部表注册到 metadata
 from src.db import models as _models  # noqa: F401
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _JOB_V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("label", "TEXT NOT NULL DEFAULT ''"),
@@ -564,6 +564,40 @@ def migrate_v4_to_v5(session: Session) -> None:
     _validate_repost_assessment_table(session)
 
 
+def migrate_v10_to_v11(session: Session) -> None:
+    """增加独立的 DS9 非抽奖审计表，不改写任何业务数据。"""
+    conn = session.connection()
+    conn.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS ds9_rejection_audit ("
+            "id INTEGER PRIMARY KEY, "
+            "dynamic_id VARCHAR(32) NOT NULL, "
+            "canonical_url TEXT NOT NULL DEFAULT '', "
+            "source_topic_id VARCHAR(32) NOT NULL DEFAULT '', "
+            "source_topic_name TEXT NOT NULL DEFAULT '', "
+            "classifier_text TEXT NOT NULL DEFAULT '', "
+            "classification_result VARCHAR(32) NOT NULL DEFAULT '非抽奖活动', "
+            "classification_reason TEXT, "
+            "text_hash VARCHAR(64) NOT NULL DEFAULT '', "
+            "first_seen_at INTEGER NOT NULL DEFAULT 0, "
+            "last_seen_at INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_ds9_rejection_audit_dynamic_id "
+            "ON ds9_rejection_audit(dynamic_id)"
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_ds9_rejection_audit_last_seen_at "
+            "ON ds9_rejection_audit(last_seen_at)"
+        )
+    )
+
+
 _MIGRATIONS: dict[int, Callable[[Session], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -574,6 +608,7 @@ _MIGRATIONS: dict[int, Callable[[Session], None]] = {
     7: migrate_v7_to_v8,
     8: migrate_v8_to_v9,
     9: migrate_v9_to_v10,
+    10: migrate_v10_to_v11,
 }
 
 

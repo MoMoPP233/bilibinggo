@@ -43,6 +43,21 @@ def test_delete_notification_record_route_is_single_record_scope() -> None:
     delete_mock.assert_called_once_with("winning_candidate:dm:39945369:1", "serverchan")
 
 
+def test_ds9_rejection_audit_api_is_local_read_and_clear_only() -> None:
+    sample = {"dynamic_id": "100000000000000001", "source_topic_id": "47801"}
+    with patch("web.app.list_rejections", return_value=[sample]) as list_mock:
+        resp = client.get("/api/ds9/rejection-audit", params={"topic_id": "47801"})
+    assert resp.status_code == 200
+    assert resp.json() == {"samples": [sample], "count": 1, "max_count": 100}
+    list_mock.assert_called_once_with(source_topic_id="47801")
+
+    with patch("web.app.clear_rejections", return_value=2) as clear_mock:
+        resp = client.delete("/api/ds9/rejection-audit")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "deleted_count": 2}
+    clear_mock.assert_called_once_with()
+
+
 def test_watch_users_api_seeds_and_lists() -> None:
     with patch("web.app.seed_from_candidates_if_empty", return_value=True):
         with patch(

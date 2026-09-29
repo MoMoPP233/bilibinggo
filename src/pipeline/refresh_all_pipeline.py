@@ -213,6 +213,59 @@ def _collect_updated_links(ds_results: list[CheckResult]) -> list[str]:
     return links
 
 
+def _collect_source_context(
+    ds_results: list[CheckResult],
+) -> dict[str, dict[str, str]]:
+    context: dict[str, dict[str, str]] = {}
+    for result in ds_results:
+        if not result.updated:
+            continue
+        for dynamic_id, metadata in (result.activity_source_context or {}).items():
+            if not isinstance(metadata, Mapping):
+                continue
+            topic_id = str(metadata.get("topic_id") or "").strip()
+            if not topic_id:
+                continue
+            # Preserve the first source context, matching DS9's existing
+            # first-seen cross-topic dedup behavior.
+            context.setdefault(
+                str(dynamic_id),
+                {
+                    "topic_id": topic_id,
+                    "topic_name": str(metadata.get("topic_name") or topic_id),
+                },
+            )
+    return context
+
+
+def _record_non_lottery_audit(
+    *,
+    dynamic_id: str,
+    classify_content: str,
+    source_context: Mapping[str, str] | None,
+) -> None:
+    if not source_context or not str(source_context.get("topic_id") or "").strip():
+        return
+    try:
+        from src.ds9_rejection_audit import record_rejection
+
+        record_rejection(
+            dynamic_id=dynamic_id,
+            canonical_url=f"https://www.bilibili.com/opus/{dynamic_id}",
+            source_topic_id=str(source_context.get("topic_id") or ""),
+            source_topic_name=str(source_context.get("topic_name") or ""),
+            # classify_forward_lottery uses this exact fallback in its user prompt.
+            classifier_text=classify_content or "(无正文)",
+            classification_reason="非抽奖活动",
+        )
+    except Exception as exc:  # noqa: BLE001 - audit is a side channel
+        logger.warning(
+            "保存 DS9 非抽奖审计样本失败 dynamic_id=%s error=%s",
+            dynamic_id,
+            str(exc)[:200],
+        )
+
+
 def run_new_links_pipeline(
     raw_urls: list[str],
     *,
@@ -220,6 +273,7 @@ def run_new_links_pipeline(
     on_progress: ProgressCallback | None = None,
     scan_started_at: int | None = None,
     identity_by_raw: Mapping[str, CanonicalIdentity] | None = None,
+    source_context_by_dynamic_id: Mapping[str, Mapping[str, str]] | None = None,
 ) -> PipelineResult:
     """Step 2～5：仅处理新链接（内存流转，末步落库）。
 
@@ -381,6 +435,18 @@ def run_new_links_pipeline(
                 if outcome.skipped:
                     reason = outcome.skip_reason or "skipped"
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    if (
+                        reason == "非抽奖活动"
+                        and outcome.lottery_type == "非抽奖活动"
+                        and (outcome.classify_content or outcome.llm_called)
+                    ):
+                        _record_non_lottery_audit(
+                            dynamic_id=outcome.dynamic_id,
+                            classify_content=outcome.classify_content,
+                            source_context=(source_context_by_dynamic_id or {}).get(
+                                outcome.dynamic_id
+                            ),
+                        )
                     _record_terminal_failure(outcome.dynamic_id, reason, failure_source_urls)
 
                 elif outcome.lottery_type in ("互动抽奖", "预约抽奖", "转发抽奖"):
@@ -726,9 +792,11 @@ def run_refresh_all_pipeline(
         )
 
     raw_links = _collect_updated_links(ds_results)
+    source_context = _collect_source_context(ds_results)
     return run_new_links_pipeline(
         raw_links,
         workers=workers,
         on_progress=on_progress,
         scan_started_at=scan_started_at,
+        source_context_by_dynamic_id=source_context,
     )
