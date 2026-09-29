@@ -263,7 +263,7 @@ def test_new_profile_isolated_and_defaults_present(root: Path, monkeypatch) -> N
     monkeypatch.setattr(dp, "get_profile_dir", lambda profile_id=None: account2)
     from src.sources.ds9_topics import list_topics
     topics = list_topics()
-    assert [t["topic_id"] for t in topics][:2] == ["1261901", "1055656"]
+    assert [t["topic_id"] for t in topics][:3] == ["1261901", "1055656", "47801"]
 
 
 def test_staging_cookie_never_in_api_result(root: Path) -> None:

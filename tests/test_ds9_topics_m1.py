@@ -19,6 +19,7 @@ N AutoScheduler refresh_all 走统一入口（无第二套调度）
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,7 @@ from src.sources.common import CheckResult, commit_source_checkpoint
 
 TOPIC_A = "1261901"
 TOPIC_B = "1055656"
+TOPIC_C = "47801"
 DID1 = "2000000000000000001"
 DID2 = "2000000000000000002"
 DID3 = "2000000000000000003"
@@ -143,10 +145,10 @@ def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeTopicClient) -
 # ---------- A：默认话题 + 独立状态 ----------
 
 
-def test_default_two_builtin_topics_with_independent_state(state_path: Path) -> None:
+def test_default_three_builtin_topics_with_independent_state(state_path: Path) -> None:
     topics = ds9.list_topics()
-    assert [t["topic_id"] for t in topics] == [TOPIC_A, TOPIC_B]
-    assert [t["name"] for t in topics] == ["抽奖！！！", "转发动态抽奖！"]
+    assert [t["topic_id"] for t in topics] == [TOPIC_A, TOPIC_B, TOPIC_C]
+    assert [t["name"] for t in topics] == ["抽奖！！！", "转发动态抽奖！", "抽奖号的日常"]
     assert all(t["kind"] == "built-in" for t in topics)
 
     updated = ds9.set_topic_enabled(TOPIC_A, False)
@@ -156,6 +158,62 @@ def test_default_two_builtin_topics_with_independent_state(state_path: Path) -> 
     # built-in 不可删除，只可暂停
     with pytest.raises(ValueError, match="内置话题不可删除"):
         ds9.remove_topic(TOPIC_A)
+
+
+def test_legacy_profile_gains_third_builtin_without_overwriting_state(state_path: Path) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "topics": [
+                    {
+                        "topic_id": TOPIC_A,
+                        "name": "抽奖！！！",
+                        "kind": "built-in",
+                        "enabled": False,
+                        "fp": "old-a",
+                        "incomplete": ["outer-a"],
+                        "last_success_at": 11,
+                        "last_scan_at": 12,
+                        "last_found": 3,
+                        "last_error": "old error",
+                    },
+                    {
+                        "topic_id": TOPIC_B,
+                        "name": "转发动态抽奖！",
+                        "kind": "built-in",
+                        "enabled": True,
+                        "fp": "old-b",
+                        "incomplete": [],
+                        "last_success_at": 21,
+                        "last_scan_at": 22,
+                        "last_found": 4,
+                        "last_error": "",
+                    },
+                    {
+                        "topic_id": "123456",
+                        "name": "已有自定义",
+                        "kind": "custom",
+                        "enabled": False,
+                        "fp": "custom-fp",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    topics = ds9.list_topics()
+    assert [item["topic_id"] for item in topics] == [TOPIC_A, TOPIC_B, TOPIC_C, "123456"]
+    by_id = {item["topic_id"]: item for item in topics}
+    assert by_id[TOPIC_A]["enabled"] is False
+    assert by_id[TOPIC_A]["fp"] == "old-a"
+    assert by_id[TOPIC_A]["last_scan_at"] == 12
+    assert by_id[TOPIC_C]["name"] == "抽奖号的日常"
+    assert by_id[TOPIC_C]["kind"] == "built-in"
+    assert by_id["123456"]["name"] == "已有自定义"
 
 
 # ---------- B：Profile 隔离 ----------
@@ -168,9 +226,11 @@ def test_profile_isolation_for_config_and_checkpoint(tmp_path: Path, monkeypatch
     monkeypatch.setattr(ds9, "_state_path", lambda: a)
     ds9.add_topic("A 自定", "123456")
     assert any(t["topic_id"] == "123456" for t in ds9.list_topics())
+    ds9.set_topic_enabled(TOPIC_C, False)
 
     monkeypatch.setattr(ds9, "_state_path", lambda: b)
     assert not any(t["topic_id"] == "123456" for t in ds9.list_topics())
+    assert {t["topic_id"]: t for t in ds9.list_topics()}[TOPIC_C]["enabled"] is True
 
     # A 成功扫描（checkpoint 只进 A）
     client_a = _FakeTopicClient(data_by_topic={TOPIC_A: _original_payload(DID1)})
@@ -192,6 +252,7 @@ def test_profile_isolation_for_config_and_checkpoint(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(ds9, "_state_path", lambda: a)
     assert {t["topic_id"]: t for t in ds9.list_topics()}[TOPIC_A]["fp"] == record_a[TOPIC_A]["fp"]
+    assert {t["topic_id"]: t for t in ds9.list_topics()}[TOPIC_C]["enabled"] is False
 
 
 # ---------- C：URL 添加 / 去重 / 校验 ----------
@@ -205,6 +266,8 @@ def test_add_topic_from_url_dedup_and_validation(state_path: Path) -> None:
 
     with pytest.raises(ValueError, match="已存在"):
         ds9.add_topic("重复", "123456")
+    with pytest.raises(ValueError, match="已存在"):
+        ds9.add_topic("重复内置", TOPIC_C)
 
     with pytest.raises(ValueError, match="格式无效"):
         ds9.add_topic("x", "not-a-topic")
@@ -310,6 +373,32 @@ def test_partial_failure_keeps_failed_topic_checkpoint(state_path: Path, monkeyp
     _install_client(monkeypatch, client2)
     result2 = ds9.check_update()
     assert result2.activity_links == [f"https://www.bilibili.com/opus/{DID2}"]
+
+
+def test_third_builtin_partial_failure_does_not_affect_first_two(
+    state_path: Path, monkeypatch
+) -> None:
+    client = _FakeTopicClient(
+        data_by_topic={
+            TOPIC_A: _original_payload(DID1),
+            TOPIC_B: _original_payload(DID2),
+        },
+        errors_by_topic={TOPIC_C: RuntimeError("网络请求失败: connect timeout")},
+    )
+    _install_client(monkeypatch, client)
+    result = ds9.check_update()
+    assert result.activity_links == [
+        f"https://www.bilibili.com/opus/{DID1}",
+        f"https://www.bilibili.com/opus/{DID2}",
+    ]
+    assert result.ds9_summary["partial"] is True
+    assert result.ds9_summary["failed_topics"] == [TOPIC_C]
+
+    commit_source_checkpoint(result)
+    record = {t["topic_id"]: t for t in ds9.list_topics()}
+    assert record[TOPIC_A]["fp"] is not None
+    assert record[TOPIC_B]["fp"] is not None
+    assert record[TOPIC_C]["fp"] is None
 
 
 # ---------- I：fingerprint 相同 → 不重复产出 ----------

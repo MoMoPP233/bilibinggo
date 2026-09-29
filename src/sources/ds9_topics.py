@@ -1,8 +1,8 @@
 """DS9 话题自动发现源（M1）。
 
 把 Bilibili 话题当作一个“数据源”，只负责发现候选动态：
-- 默认内嵌两个话题（topic_id 作为稳定身份，名称仅展示）：
-  抽奖！！！ topic_id=1261901；转发动态抽奖！ topic_id=1055656。
+- 默认内嵌三个话题（topic_id 作为稳定身份，名称仅展示）：
+  抽奖！！！ topic_id=1261901；转发动态抽奖！ topic_id=1055656；抽奖号的日常 topic_id=47801。
 - 同一 Profile 内：每个 topic_id 独立配置、启用状态、checkpoint/fingerprint、
   incomplete（转发关系不完整）列表、最近成功/错误——状态文件按 Profile 存放，
   绝不跨 Profile 共享。
@@ -55,6 +55,7 @@ class BuiltinTopic:
 BUILTIN_TOPICS: tuple[BuiltinTopic, ...] = (
     BuiltinTopic(name="抽奖！！！", topic_id="1261901"),
     BuiltinTopic(name="转发动态抽奖！", topic_id="1055656"),
+    BuiltinTopic(name="抽奖号的日常", topic_id="47801"),
 )
 
 

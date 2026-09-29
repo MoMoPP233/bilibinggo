@@ -24,19 +24,23 @@ describe("DS9 topic cards", () => {
       topics: [
         { topic_id: "1261901", name: "抽奖！！！", kind: "built-in", enabled: true, fp: "fp-a", last_scan_at: 1_758_600_000, last_found: 59 },
         { topic_id: "1055656", name: "转发动态抽奖！", kind: "built-in", enabled: false, fp: "fp-b", last_scan_at: 1_758_600_000, last_found: 57 },
+        { topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true, fp: null, last_scan_at: null, last_found: 0 },
       ],
-      summary: { builtin_count: 2, custom_count: 0 },
+      summary: { builtin_count: 3, custom_count: 0 },
     });
   });
 
   it("renders compact horizontal-ready cards without checkpoint terminology", async () => {
     const module = await import("./ds9-panel");
     module.bindDs9Panel();
-    await vi.waitFor(() => expect(document.querySelectorAll(".ds9-topic-card")).toHaveLength(2));
+    await vi.waitFor(() => expect(document.querySelectorAll(".ds9-topic-card")).toHaveLength(3));
     const panel = document.getElementById("ds9-topic-panel")!;
     const text = panel.textContent || "";
     expect(text).toContain("话题：抽奖！！！");
     expect(text).toContain("1261901 · 内置");
+    expect(text).toContain("话题：抽奖号的日常");
+    expect(text).toContain("47801 · 内置");
+    expect(panel.querySelector("[data-ds9-builtin]")?.textContent).toBe("3");
     expect(text).toContain("最近扫描：");
     expect(text).toContain("发现 59 · 已推送数据库");
     expect(text).toContain("暂停");

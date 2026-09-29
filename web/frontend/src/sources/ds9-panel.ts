@@ -161,7 +161,7 @@ function ensurePanel() {
       </div>
     </div>
     <div class="ds9-summary-row">
-      <span class="caption">默认话题：<b data-ds9-builtin>2</b></span>
+      <span class="caption">默认话题：<b data-ds9-builtin>3</b></span>
       <span class="caption">自定义话题：<b data-ds9-custom>0</b></span>
       <span class="caption">最近扫描：<span data-ds9-last-scan>—</span></span>
     </div>
