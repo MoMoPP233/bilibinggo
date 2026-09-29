@@ -2655,6 +2655,37 @@ def _repost_delete_barrier_blocked(uid: str) -> bool:
     return (int(counts.get("delete_pending") or 0) + int(counts.get("unknown") or 0)) > 0
 
 
+def cleanup_has_pending_local_work() -> bool:
+    """只读判断清理是否仍有本地待办；绝不创建 client 或发起网络请求。"""
+    _, uid_int = require_login()
+    uid = str(uid_int)
+    checkpoint = get_checkpoint(uid)
+    if bool(getattr(checkpoint, "sync_needed", False)) or reconciliation_needs_sync(uid):
+        return True
+
+    records = list_evaluable_reposts(uid)
+    assessments = list_repost_assessments(uid)
+    for record in records:
+        original_id = str(getattr(record, "original_dynamic_id", "") or "")
+        stored = assessments.get(original_id)
+        if stored is None or getattr(stored, "assessment_status", "final") == "retryable_unknown":
+            return True
+
+    # DELETE 的 unknown barrier 不是预算续跑可解决的待办；保留原有人工处理语义。
+    if not get_auto_delete_enabled() or _repost_delete_barrier_blocked(uid):
+        return False
+    now_ts = int(time.time())
+    for record in records:
+        original_id = str(getattr(record, "original_dynamic_id", "") or "")
+        ok, _ = _strict_safe(record, assessments.get(original_id), now_ts=now_ts)
+        if not ok:
+            continue
+        guard = get_guard(uid, original_id)
+        if guard is None or guard.repost_status not in {"pending", "unknown", "suspected"}:
+            return True
+    return False
+
+
 def auto_cleanup_delete(
     *,
     on_progress: ProgressCallback | None = None,
@@ -2982,6 +3013,7 @@ __all__ = [
     "RemoteStateUnknown",
     "AUTO_DELETE_BATCH_SIZE",
     "auto_cleanup_delete",
+    "cleanup_has_pending_local_work",
     "auto_maintain",
     "get_auto_delete_enabled",
     "cleanup_maintenance_cycle",
