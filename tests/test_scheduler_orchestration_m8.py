@@ -220,6 +220,76 @@ def test_cycle_calls_auto_maintain_without_assessment_then_single_scan() -> None
     assert result["ok"] is True
 
 
+def test_cleanup_cycle_reuses_one_client_only_within_cycle() -> None:
+    import unittest.mock as um
+
+    import src.repost_cleanup as rc
+
+    class _Client:
+        pass
+
+    class _Manager:
+        def __init__(self, client: _Client) -> None:
+            self.client = client
+            self.entered = 0
+            self.exited = 0
+
+        def __enter__(self):
+            self.entered += 1
+            return self.client
+
+        def __exit__(self, *args) -> None:
+            self.exited += 1
+
+    managers: list[_Manager] = []
+    borrowed_ids: list[int] = []
+
+    def factory():
+        manager = _Manager(_Client())
+        managers.append(manager)
+        return manager
+
+    def safe_maintain(**kwargs):
+        with kwargs["client_factory"]() as client:
+            borrowed_ids.append(id(client))
+        return {"synced": True, "rate_limited": False}
+
+    def safe_scan(**kwargs):
+        with kwargs["client_factory"]() as client:
+            borrowed_ids.append(id(client))
+        return {"rate_limited": False, "stopped_early": False, "stop_reason": "", "pending_originals": 1}
+
+    with um.patch.object(rc, "auto_maintain", safe_maintain), um.patch.object(
+        rc, "scan_expired_reposts", safe_scan
+    ):
+        rc.cleanup_maintenance_cycle(client_factory=factory)
+        rc.cleanup_maintenance_cycle(client_factory=factory)
+
+    assert len(managers) == 2
+    assert all(manager.entered == 1 and manager.exited == 1 for manager in managers)
+    assert borrowed_ids[0] == borrowed_ids[1]
+    assert borrowed_ids[2] == borrowed_ids[3]
+    assert borrowed_ids[0] != borrowed_ids[2]
+
+
+def test_verified_login_cache_reuses_only_successful_same_cookie(monkeypatch) -> None:
+    import src.repost_cleanup as rc
+
+    client = MagicMock()
+    client.request_json.return_value = {"code": 0, "data": {"isLogin": True, "mid": 123}}
+    profile = ["profile-a"]
+    monkeypatch.setattr(rc, "require_login", lambda: ("csrf", 123))
+    monkeypatch.setattr(rc, "get_runtime_profile_id", lambda: profile[0])
+
+    assert rc._require_verified_login(client) == ("csrf", 123)
+    assert rc._require_verified_login(client) == ("csrf", 123)
+    client.request_json.assert_called_once_with(rc.NAV_URL, retries=0)
+
+    profile[0] = "profile-b"
+    assert rc._require_verified_login(client) == ("csrf", 123)
+    assert client.request_json.call_count == 2
+
+
 def test_cycle_pre_maintenance_risk_blocks_assessment_and_delete() -> None:
     import unittest.mock as um
 

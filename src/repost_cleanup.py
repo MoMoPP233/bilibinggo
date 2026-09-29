@@ -114,6 +114,19 @@ class RemoteStateUnknown(RuntimeError):
     """远程状态无法可靠读取；该条记录必须跳过。"""
 
 
+class _SharedClientLease:
+    """Borrow a cycle-scoped client without closing the owner at stage boundaries."""
+
+    def __init__(self, client: BilibiliClient) -> None:
+        self._client = client
+
+    def __enter__(self) -> BilibiliClient:
+        return self._client
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
 class AssessmentRateLimited(RuntimeError):
     """本轮评估/删除命中平台限流或风控，必须立即停止后续同类请求。"""
 
@@ -188,6 +201,16 @@ def _record_dict(record: object) -> dict[str, Any]:
 
 def _require_verified_login(client: BilibiliClient) -> tuple[str, int]:
     csrf, cookie_uid = require_login()
+    profile_id = get_runtime_profile_id()
+    cached = getattr(client, "_cleanup_verified_login", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 3
+        and cached[0] == csrf
+        and str(cached[1]) == str(cookie_uid)
+        and cached[2] == profile_id
+    ):
+        return cached[0], int(cached[1])
     try:
         payload = client.request_json(NAV_URL, retries=0)
     except RequestBudgetExhausted:
@@ -207,6 +230,7 @@ def _require_verified_login(client: BilibiliClient) -> tuple[str, int]:
     nav_uid = _strict_positive_int(data.get("mid"))
     if nav_uid != cookie_uid:
         raise RuntimeError("Cookie UID 与当前登录账号不一致，已停止操作")
+    setattr(client, "_cleanup_verified_login", (csrf, cookie_uid, profile_id))
     return csrf, cookie_uid
 
 
@@ -2991,11 +3015,24 @@ def cleanup_maintenance_cycle(
     steps = ["同步与本地维护", "连续智能评估", "strict-safe 自动删除"]
     phases: list[dict[str, Any]] = []
     stage = 0
+    shared_manager: Any = None
+    shared_client: BilibiliClient | None = None
+    shared_entered = False
+
+    def _shared_client_factory() -> _SharedClientLease:
+        nonlocal shared_manager, shared_client, shared_entered
+        if shared_manager is None:
+            shared_manager = client_factory()
+            shared_client = shared_manager.__enter__()
+            shared_entered = True
+        if shared_client is None:
+            raise RuntimeError("清理周期无法初始化 Bilibili client")
+        return _SharedClientLease(shared_client)
 
     def _report(step: int, message: str, log_line: str | None = None) -> None:
         _progress(on_progress, min(step, len(steps)), len(steps), message, log_line)
 
-    def _run_stage(func, label: str) -> dict[str, Any]:
+    def _run_stage(func, label: str, *, use_shared_client: bool = True) -> dict[str, Any]:
         nonlocal stage
         stage += 1
         _report(stage, f"{label}…", f"{label}开始")
@@ -3003,7 +3040,7 @@ def cleanup_maintenance_cycle(
             on_progress=None,
             cancel_check=cancel_check,
             now_ts=now_ts,
-            client_factory=client_factory,
+            client_factory=_shared_client_factory if use_shared_client else client_factory,
         )
         phases.append({"stage": label, "result": result})
         _report(stage, f"{label}完成", f"{label}完成")
@@ -3011,7 +3048,10 @@ def cleanup_maintenance_cycle(
 
     try:
         _check_cancel(cancel_check)
-        stage1 = _run_stage(lambda **kwargs: auto_maintain(assess=False, **kwargs), "同步与本地维护")
+        stage1 = _run_stage(
+            lambda **kwargs: auto_maintain(assess=False, **kwargs),
+            "同步与本地维护",
+        )
         _check_cancel(cancel_check)
         # stage1 门控：auto_maintain 对风险/失败是"捕获→落盘暂停→优雅返回"，
         # 必须读取其返回结果；未安全完成同步 → 0 assessment、0 DELETE。
@@ -3045,7 +3085,10 @@ def cleanup_maintenance_cycle(
                 "phases": phases,
                 "message": skip_message,
             }
-        stage2 = _run_stage(scan_expired_reposts, "连续智能评估")
+        stage2 = _run_stage(
+            lambda **kwargs: scan_expired_reposts(**kwargs),
+            "连续智能评估",
+        )
         _check_cancel(cancel_check)
         # 进入删除的保守条件：评估无 risk/hard/partial 且 backlog 已全部收口
         scan = stage2
@@ -3059,7 +3102,11 @@ def cleanup_maintenance_cycle(
             phases.append({"stage": "strict-safe 自动删除", "result": stage3})
             _report(len(steps), "本轮自动删除已跳过（保守条件未满足）", str(stage3["message"]))
         else:
-            stage3 = _run_stage(auto_cleanup_delete, "strict-safe 自动删除")
+            stage3 = _run_stage(
+                auto_cleanup_delete,
+                "strict-safe 自动删除",
+                use_shared_client=False,
+            )
         return {
             "ok": True,
             "phases": phases,
@@ -3067,3 +3114,6 @@ def cleanup_maintenance_cycle(
         }
     except Exception:  # noqa: BLE001
         raise
+    finally:
+        if shared_manager is not None and shared_entered:
+            shared_manager.__exit__(None, None, None)
