@@ -64,7 +64,7 @@ def test_case1_4_24h_counts() -> None:
     assert counts["refresh"] == 4
     assert counts["following"] == 4
     assert counts["winner"] == 1
-    assert counts["cleanup"] == 2
+    assert counts["cleanup"] == 1
 
 
 def test_case5_triple_has_no_fixed_cron_slots() -> None:
@@ -91,7 +91,7 @@ def test_case8_winner_keeps_exact_times() -> None:
 
 
 def test_case9_cleanup_new_times() -> None:
-    assert _times(_day_candidates(), "cleanup") == ["04:05", "16:05"]
+    assert _times(_day_candidates(), "cleanup") == ["04:05"]
 
 
 # ---------- CASE 10-11: Triple 与 dedicated 错峰 ----------

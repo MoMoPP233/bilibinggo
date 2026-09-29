@@ -27,7 +27,6 @@ from web.auto_config import (
     ALLOWED_CLICK_ACTIONS,
     AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
     CLEANUP_HOURS,
-    CLEANUP_MAINTAIN_INTERVAL_HOURS,
     CLEANUP_MINUTE,
     FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
     FOLLOWING_FEED_SCAN_HOUR_OFFSET,
@@ -890,7 +889,7 @@ class AutoScheduler:
                 if self._maybe_run_cleanup_budget_resume(now):
                     continue
 
-                # V26: 统一自动维护周期 04:05/16:05（2 次/天，12 小时间隔）。
+                # V59: 每天只启动一次完整清理（04:05）；V58 预算续跑独立处理。
                 if now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS:
                     key = f"cleanup-{now:%Y-%m-%d-%H}"
                     if key not in self._done_cleanup:

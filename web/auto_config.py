@@ -8,13 +8,13 @@ REFRESH_HOURS = frozenset({0, 6, 12, 18})
 # V38：上一轮结束后独立等待 240～420 秒，不再使用固定分钟槽。
 TRIPLE_DELAY_MIN_SECONDS = 240
 TRIPLE_DELAY_MAX_SECONDS = 420
-# 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（04:05/16:05，12 小时一次）。
-CLEANUP_MAINTAIN_INTERVAL_HOURS = 12
+# 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（每天 04:05 一次）。
+CLEANUP_MAINTAIN_INTERVAL_HOURS = 24
 # 中奖深检：沿用 CN_TZ，每天 23:55 一次。
 WINNER_SCAN_HOURS = frozenset({23})
 WINNER_SCAN_MINUTE = 55
-# 清理维护：04:05/16:05（2 次/天，12 小时间隔）。
-CLEANUP_HOURS = frozenset({4, 16})
+# 清理维护：每天 04:05 一次；V58 预算续跑不是固定 slot。
+CLEANUP_HOURS = frozenset({4})
 CLEANUP_MINUTE = 5
 
 ALLOWED_CLICK_ACTIONS = frozenset(
@@ -23,7 +23,6 @@ ALLOWED_CLICK_ACTIONS = frozenset(
         "refresh_watch",
         "refresh_status",
         "participate_triple",
-        "cleanup_auto_maintain",
         "cleanup_maintenance_cycle",
         "following_feed_scan",
         "winner_deep_scan",
@@ -41,6 +40,8 @@ ACTION_LABELS = {
     "winner_deep_scan": "中奖深探",
 }
 
+# Legacy compatibility state for the /api/auto/cleanup-maintain contract.
+# The scheduler never consults this value; fixed cleanup is always 04:05.
 _CLEANUP_MAINTAIN_ENABLED = False
 
 

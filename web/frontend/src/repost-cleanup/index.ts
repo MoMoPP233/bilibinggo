@@ -751,16 +751,11 @@ export function renderHealth(data: RepostHealthResponse): void {
   if (repostHealthStatus) repostHealthStatus.textContent = sanitizeUserText(data?.status_text || "正常");
   if (repostRiskPause) repostRiskPause.textContent = data?.maintenance?.risk_paused ? "是" : "否";
   if (repostHealthLines) {
-    const maintenance = data?.maintenance || {};
-    const enabled = Boolean(maintenance.enabled);
-    const intervalHours = Math.max(1, Number(maintenance.interval_hours) || 6);
-    const toggleLine = enabled
-      ? `自动维护：开启（每 ${intervalHours} 小时一次；只同步与评估，从不自动删除）`
-      : "自动维护：关闭（不会自动联网）";
-    if (repostMaintenance) repostMaintenance.textContent = enabled ? `正常 · 每 ${intervalHours} 小时` : "已关闭";
+    const scheduleLine = "自动维护：由调度器管理（每日 04:05；预算恢复后按需续跑）";
+    if (repostMaintenance) repostMaintenance.textContent = "每日 04:05 · 预算续跑独立";
     const checks = Array.isArray(data?.checks) ? data.checks : [];
     const lines = [
-      { tone: "info", text: toggleLine },
+      { tone: "info", text: scheduleLine },
       ...checks.map((check) => ({ tone: healthLineTone(check?.tone), text: String(check?.text || "") })),
     ].filter((line) => line.text);
     repostHealthLines.innerHTML = lines.map((line) =>

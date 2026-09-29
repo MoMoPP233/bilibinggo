@@ -739,7 +739,7 @@ describe("repost cleanup maintenance health", () => {
       status: "normal",
       status_text: "维护状态正常",
       counts: { all_total: 6, history_total: 3, deleted: 1, delete_pending: 1, delete_failed: 1, unknown: 1 },
-      maintenance: { enabled: true, interval_hours: 6, risk_paused: false, risk_reason: null },
+      maintenance: { enabled: true, interval_hours: 24, risk_paused: false, risk_reason: null },
       issues: [],
       issue_total: 0,
       checks: [{ key: "ok", tone: "ok", text: "没有需要人工检查的删除记录。" }],
@@ -753,26 +753,28 @@ describe("repost cleanup maintenance health", () => {
     expect(document.getElementById("repost-health-failed")?.textContent).toBe("1");
     expect(document.getElementById("repost-health-unknown")?.textContent).toBe("1");
     const lines = document.getElementById("repost-health-lines")?.textContent || "";
-    expect(lines).toContain("自动维护：开启");
-    expect(lines).toContain("每 6 小时");
+    expect(lines).toContain("自动维护：由调度器管理");
+    expect(lines).toContain("每日 04:05");
+    expect(lines).toContain("预算恢复后按需续跑");
     expect(lines).not.toContain("每 2 小时");
     expect(lines).toContain("没有需要人工检查");
     expect(document.getElementById("repost-health-issues")?.hasAttribute("hidden")).toBe(true);
   });
 
-  it("maintenance off shows a clear disabled line", async () => {
+  it("legacy maintenance flag does not disable the scheduler status", async () => {
     const module = await loadModule();
     module.renderHealth({
       status: "normal",
       status_text: "维护状态正常",
       counts: {},
-      maintenance: { enabled: false, interval_hours: 6 },
+      maintenance: { enabled: false, interval_hours: 24 },
       issues: [],
       issue_total: 0,
       checks: [],
     });
     const lines = document.getElementById("repost-health-lines")?.textContent || "";
-    expect(lines).toContain("自动维护：关闭");
+    expect(lines).toContain("自动维护：由调度器管理");
+    expect(lines).not.toContain("自动维护：关闭");
   });
 
   it("issue rows are visible with copy but no auto re-delete controls", async () => {
@@ -781,7 +783,7 @@ describe("repost cleanup maintenance health", () => {
       status: "review_needed",
       status_text: "需要人工检查",
       counts: { all_total: 3, delete_pending: 1, delete_failed: 1, unknown: 1 },
-      maintenance: { enabled: true, interval_hours: 6, risk_paused: false },
+      maintenance: { enabled: true, interval_hours: 24, risk_paused: false },
       issue_total: 2,
       issues: [
         { repost_dynamic_id: "91001", original_dynamic_id: "81001", delete_status: "delete_pending", last_error: null, delete_requested_at: 1_750_000_000 },
@@ -847,7 +849,7 @@ describe("auto-delete toggle confirmation order", () => {
         return { ok: true, enabled: backendState, safe_candidates: 0, counts: { delete_pending: 0, unknown: 0 } };
       }
       if (url === "/api/repost-cleanup/health") {
-        return { status: "normal", maintenance: { enabled: backendState, interval_hours: 6 }, counts: {}, issues: [], issue_total: 0, checks: [] };
+        return { status: "normal", maintenance: { enabled: backendState, interval_hours: 24 }, counts: {}, issues: [], issue_total: 0, checks: [] };
       }
       return { ok: true };
     });

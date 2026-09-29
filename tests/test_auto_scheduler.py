@@ -36,14 +36,13 @@ def _bind_resolve(runner: MagicMock, status_factory) -> None:
     runner.resolve_job_status.side_effect = resolve
 
 
-def test_allowed_actions_include_cleanup_maintain() -> None:
+def test_allowed_actions_keep_only_complete_cleanup_entrypoint() -> None:
     assert ALLOWED_CLICK_ACTIONS == frozenset(
         {
             "refresh_all",
             "refresh_watch",
             "refresh_status",
             "participate_triple",
-            "cleanup_auto_maintain",
             "cleanup_maintenance_cycle",
             "following_feed_scan",
             "winner_deep_scan",

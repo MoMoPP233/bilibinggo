@@ -381,7 +381,7 @@ def test_risk_cooldown_blocks_due_plan(code):
     scheduler._click_and_wait.assert_not_called()
 
 
-@pytest.mark.parametrize("hour, minute", [(0, 0), (6, 0), (1, 3), (7, 3), (4, 5), (16, 5), (23, 55)])
+@pytest.mark.parametrize("hour, minute", [(0, 0), (6, 0), (1, 3), (7, 3), (4, 5), (23, 55)])
 def test_random_plan_yields_to_all_fixed_task_minutes(hour, minute):
     clock = Clock()
     clock.now = clock.now.replace(hour=hour, minute=minute)
@@ -400,11 +400,13 @@ def test_other_schedules_snapshot_unchanged():
     assert snapshot == {
         "refresh": ["00:00", "06:00", "12:00", "18:00"],
         "following": ["01:03", "07:03", "13:03", "19:03"],
-        "cleanup": ["04:05", "16:05"],
+        "cleanup": ["04:05"],
         "winner": ["23:55"],
     }
     assert [s["action"] for s in sch.REFRESH_STEPS] == ["refresh_all", "refresh_watch", "refresh_status"]
-    assert sch.CLEANUP_MAINTAIN_INTERVAL_HOURS == 12
+    from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS
+
+    assert CLEANUP_MAINTAIN_INTERVAL_HOURS == 24
 
 
 def run_one_loop_tick(scheduler, clock):

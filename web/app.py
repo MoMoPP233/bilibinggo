@@ -1208,6 +1208,7 @@ def api_auto_cleanup_maintain_status() -> dict[str, Any]:
 
 @app.post("/api/auto/cleanup-maintain", tags=["stable"])
 async def api_auto_cleanup_maintain_toggle(request: Request) -> dict[str, Any]:
+    """Legacy compatibility endpoint; it does not enable/disable scheduler runs."""
     from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, set_cleanup_maintain_enabled
 
     body = await request.json() or {}
