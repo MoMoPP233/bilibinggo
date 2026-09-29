@@ -57,7 +57,10 @@ function setupDom(): void {
     <button id="repost-stop-btn" data-job-control disabled>停止评估</button>
     <p id="repost-eval-status">尚未开始智能评估</p>
     <span id="repost-history-total">—</span>
+    <span id="repost-existing-total">—</span>
     <span id="repost-deleted-total">0</span>
+    <span id="repost-failed-total">0</span>
+    <span id="repost-unknown-total">0</span>
     <span id="repost-workflow-status">尚未读取</span>
     <span id="repost-safe-total">0</span>
     <span id="repost-manual-total">0</span>
@@ -94,6 +97,7 @@ function setupDom(): void {
     <table><tbody id="repost-history-body"></tbody></table>
     <div id="repost-history-pagination"></div>
     <span id="repost-health-pill">—</span>
+    <strong id="repost-health-status">读取中…</strong>
     <strong id="repost-health-all">—</strong>
     <strong id="repost-health-existing">—</strong>
     <strong id="repost-health-deleted">—</strong>
@@ -645,6 +649,79 @@ describe("repost cleanup UI", () => {
     );
     expect(accountCalls).toHaveLength(0);
     expect(loadAccountMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps each refresh metric owned by its semantic source regardless of response order", async () => {
+    const pending = new Map<string, { resolve: (value: unknown) => void }>();
+    fetchJSONMock.mockImplementation((url: string) => new Promise((resolve) => {
+      pending.set(url, { resolve });
+    }));
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    window.dispatchEvent(
+      new CustomEvent("binggo:section-activated", { detail: { sectionId: "repost-cleanup" } }),
+    );
+
+    pending.get("/api/repost-cleanup/health")!.resolve({
+      status: "normal",
+      status_text: "健康",
+      counts: { history_total: 7, delete_pending: 2 },
+      checkpoint: { full_scan_completed: false, last_synced_at: 100 },
+      maintenance: { enabled: false },
+      issues: [],
+      issue_total: 0,
+      checks: [],
+    });
+    pending.get("/api/repost-cleanup/candidates?show_deleted=1")!.resolve({
+      all_total: 99,
+      pending_evaluation: 3,
+      assessed_total: 8,
+      candidates: [candidate],
+    });
+    pending.get("/api/repost-cleanup/history?page=1&page_size=20")!.resolve({
+      total: 10,
+      page: 1,
+      page_size: 20,
+      checkpoint: { full_scan_completed: true, last_synced_at: 200 },
+    });
+    await vi.waitFor(() => expect(document.querySelector("[data-repost-select='90001']")).not.toBeNull());
+
+    expect(document.getElementById("repost-history-total")?.textContent).toBe("10");
+    expect(document.getElementById("repost-pending-total")?.textContent).toBe("3");
+    expect(document.getElementById("repost-existing-total")?.textContent).toBe("7");
+    expect(document.getElementById("repost-checkpoint-status")?.textContent).toContain("完整历史已同步");
+  });
+
+  it("ignores an older health response and preserves the last successful health display on failure", async () => {
+    const responses: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    fetchJSONMock.mockImplementation((url: string) => {
+      if (url !== "/api/repost-cleanup/health") return Promise.resolve({ ok: true });
+      return new Promise((resolve, reject) => responses.push({ resolve, reject }));
+    });
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const initial = module.loadRepostHealth();
+    responses[0].resolve({ status: "normal", status_text: "第一次", counts: { history_total: 4 }, issues: [], issue_total: 0, checks: [] });
+    await initial;
+    await vi.waitFor(() => expect(document.getElementById("repost-health-status")?.textContent).toBe("第一次"));
+
+    const first = module.loadRepostHealth();
+    const second = module.loadRepostHealth();
+    responses[2].resolve({ status: "normal", status_text: "最新", counts: { history_total: 9 }, issues: [], issue_total: 0, checks: [] });
+    responses[1].reject(new Error("旧请求失败"));
+    await Promise.allSettled([first, second]);
+    expect(document.getElementById("repost-health-status")?.textContent).toBe("最新");
+    expect(document.getElementById("repost-health-existing")?.textContent).toBe("9");
+  });
+
+  it("keeps existing candidates when starting the cleanup job fails", async () => {
+    startJobMock.mockRejectedValueOnce(new Error("启动失败"));
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    module.setCandidates([candidate]);
+    document.getElementById("repost-sync-assess-btn")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await vi.waitFor(() => expect(notifyJobStartErrorMock).toHaveBeenCalled());
+    expect(document.querySelector("[data-repost-select='90001']")).not.toBeNull();
   });
 });
 

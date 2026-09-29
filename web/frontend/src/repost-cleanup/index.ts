@@ -215,6 +215,9 @@ let deletedTotal = 0;
 let deletedCandidates: CleanupCandidate[] = [];
 let searchQuery = "";
 let sortKey = "reposted_desc";
+let historyLoadGeneration = 0;
+let candidatesLoadGeneration = 0;
+let healthLoadGeneration = 0;
 
 function updateEvalStatus(): void {
   if (!repostEvalStatus) return;
@@ -590,21 +593,20 @@ function renderHistory(data: RepostHistoryResponse): void {
 }
 
 export async function loadRepostHistory(page = historyPage): Promise<RepostHistoryResponse> {
+  const generation = ++historyLoadGeneration;
   historyPage = Math.max(1, page);
-  try {
-    const data = await fetchJSON<RepostHistoryResponse>(
-      `/api/repost-cleanup/history?page=${historyPage}&page_size=${HISTORY_PAGE_SIZE}`,
-    );
-    renderHistory(data || {});
-    return data || {};
-  } catch (error) {
-    throw error;
-  }
+  const data = await fetchJSON<RepostHistoryResponse>(
+    `/api/repost-cleanup/history?page=${historyPage}&page_size=${HISTORY_PAGE_SIZE}`,
+  );
+  if (generation === historyLoadGeneration) renderHistory(data || {});
+  return data || {};
 }
 
 export async function loadPersistedCandidates(): Promise<void> {
+  const generation = ++candidatesLoadGeneration;
   try {
     const data = await fetchJSON<RepostCandidatesResponse>("/api/repost-cleanup/candidates?show_deleted=1");
+    if (generation !== candidatesLoadGeneration) return;
     pendingEvaluation = Math.max(0, Number(data?.pending_evaluation) || 0);
     assessedTotal = Math.max(0, Number(data?.assessed_total) || 0);
     deletedTotal = Math.max(0, Number(data?.deleted) || 0);
@@ -613,9 +615,6 @@ export async function loadPersistedCandidates(): Promise<void> {
       level: "deleted",
       delete_status: "deleted",
     }));
-    if (repostHistoryTotal && Number(data?.all_total) >= 0) {
-      repostHistoryTotal.textContent = String(Number(data?.all_total) || 0);
-    }
     updateWorkflowStatus(data);
     updateEvalStatus();
     setCandidates(normalizeCandidates(data?.candidates));
@@ -740,17 +739,7 @@ export function renderHealth(data: RepostHealthResponse): void {
     repostHealthPill.dataset.tone = healthStatusTone(status);
   }
   const counts = data?.counts || {};
-  const checkpoint = data?.checkpoint;
-  if (repostCheckpointStatus) {
-    repostCheckpointStatus.textContent = !checkpoint
-      ? "尚未完成首次同步"
-      : checkpoint.full_scan_completed
-        ? `正常 · 进度已保存（${formatTimestamp(checkpoint.last_synced_at)}）`
-        : `未完成 · ${formatTimestamp(checkpoint.last_synced_at)}`;
-  }
   setHealthNumber(repostExistingTotal, counts?.history_total);
-  setHealthNumber(repostDeletedTotal, counts?.deleted);
-  setHealthNumber(repostPendingTotal, counts?.delete_pending);
   setHealthNumber(repostFailedTotal, counts?.delete_failed);
   setHealthNumber(repostUnknownTotal, counts?.unknown);
   setHealthNumber(repostHealthAll, counts?.all_total);
@@ -782,17 +771,18 @@ export function renderHealth(data: RepostHealthResponse): void {
 }
 
 export async function loadRepostHealth(): Promise<void> {
+  const generation = ++healthLoadGeneration;
   let data: RepostHealthResponse;
   try {
     data = await fetchJSON<RepostHealthResponse>("/api/repost-cleanup/health");
   } catch (error) {
     const message = sanitizeUserText(error instanceof Error ? error.message : String(error));
-    if (repostHealthLines) {
+    if (generation === healthLoadGeneration && repostHealthLines) {
       repostHealthLines.innerHTML = `<p class="repost-health-line is-error">维护状态读取失败：${escapeHtml(message || "未知错误")}</p>`;
     }
     return;
   }
-  renderHealth(data || {});
+  if (generation === healthLoadGeneration) renderHealth(data || {});
 }
 
 export async function deferCandidate(repostId: string): Promise<void> {
@@ -1171,7 +1161,6 @@ async function requestCleanupStart(
   // 同步置锁并立即绘制 loading / 弹窗 / disabled，再发后端请求。
   cleanupStartBusy = action;
   if (action === "scan_expired_reposts" || action === "sync_assess_repost_history") {
-    setCandidates([]);
     if (repostEvalStatus) repostEvalStatus.textContent = "智能评估进行中…";
     if (repostCandidateSummary) repostCandidateSummary.textContent = "正在串行分批评估历史抽奖…";
   }

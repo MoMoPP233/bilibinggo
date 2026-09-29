@@ -13,7 +13,10 @@ from pathlib import Path
 import httpx
 
 from src.bilibili_rate_limit import acquire_bilibili_request_slot
-from src.bilibili_request_budget import reserve_bilibili_http_attempt
+from src.bilibili_request_budget import (
+    RequestBudgetExhausted,
+    reserve_bilibili_http_attempt,
+)
 
 DEFAULT_HEADERS = {
     "User-Agent": (

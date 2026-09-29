@@ -97,6 +97,27 @@ def test_bilibili_client_http_methods_acquire_slots(monkeypatch) -> None:
     assert calls["n"] == 3
 
 
+def test_bilibili_client_warmup_budget_exhaustion_is_handled(monkeypatch) -> None:
+    from src.bilibili_client import BilibiliClient
+    from src.bilibili_request_budget import RequestBudgetExhausted, RequestBudgetSnapshot
+
+    snapshot = RequestBudgetSnapshot(
+        window_started_at=1,
+        window_expires_at=2,
+        used_requests=120,
+        budget_limit=120,
+        window_seconds=21_600,
+        observed_at=1,
+    )
+    monkeypatch.setattr(
+        "src.bilibili_client.reserve_bilibili_http_attempt",
+        lambda _url: (_ for _ in ()).throw(RequestBudgetExhausted(snapshot)),
+    )
+
+    client = BilibiliClient(warmup=True)
+    client.close()
+
+
 def test_post_form_forwards_query_params_without_changing_retry_defaults(monkeypatch) -> None:
     from src.bilibili_client import BilibiliClient
 
