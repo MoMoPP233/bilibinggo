@@ -146,12 +146,6 @@ export const repostHealthPill = document.getElementById("repost-health-pill");
 export const repostHealthStatus = document.getElementById("repost-health-status");
 export const repostRiskPause = document.getElementById("repost-risk-pause");
 export const repostMaintenance = document.getElementById("repost-maintenance");
-export const repostHealthAll = document.getElementById("repost-health-all");
-export const repostHealthExisting = document.getElementById("repost-health-existing");
-export const repostHealthDeleted = document.getElementById("repost-health-deleted");
-export const repostHealthPending = document.getElementById("repost-health-pending");
-export const repostHealthFailed = document.getElementById("repost-health-failed");
-export const repostHealthUnknown = document.getElementById("repost-health-unknown");
 export const repostHealthLines = document.getElementById("repost-health-lines");
 export const repostHealthIssues = document.getElementById("repost-health-issues");
 

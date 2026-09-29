@@ -45,6 +45,21 @@ class ActivityRow(SQLModel, table=True):
     updated_at: int = 0
 
 
+class ActivityFailureRow(SQLModel, table=True):
+    """Profile-local terminal failure evidence for one discovered activity."""
+
+    __tablename__ = "activity_failures"
+    __table_args__ = (
+        Index("ix_activity_failures_failed_at", "failed_at"),
+    )
+
+    dynamic_id: str = Field(primary_key=True, max_length=32)
+    source_url: Optional[str] = None
+    reason: str = Field(default="处理失败", sa_column=Column(Text, nullable=False))
+    source_id: Optional[str] = Field(default=None, max_length=32)
+    failed_at: int = 0
+
+
 class ParticipationRow(SQLModel, table=True):
     __tablename__ = "participations"
     __table_args__ = (Index("ix_participations_uid_status", "uid", "user_status"),)

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Mapping
 
 from src.activity_store import append_activities, known_activity_ids
+from src.activity_failures import record_activity_failure, resolve_activity_failure
 from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
 from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
@@ -89,6 +90,43 @@ class _DedupeResult:
 
 
 _FAILED_SKIP_REASONS = frozenset({"链接失效", "正文不可读取", ENRICH_SKIP_REASON})
+
+
+def _failure_url_by_dynamic_id(raw_urls: list[str]) -> dict[str, str]:
+    """Keep the first local source URL for failure evidence without a new request."""
+    mapping: dict[str, str] = {}
+    for raw_url in raw_urls:
+        dynamic_id = normalize_activity_id(str(raw_url))
+        if dynamic_id and dynamic_id not in mapping:
+            mapping[dynamic_id] = str(raw_url)
+    return mapping
+
+
+def _record_terminal_failure(
+    dynamic_id: str,
+    reason: str,
+    source_urls: Mapping[str, str],
+) -> None:
+    if reason not in _FAILED_SKIP_REASONS:
+        return
+    try:
+        record_activity_failure(
+            dynamic_id,
+            source_url=source_urls.get(dynamic_id),
+            reason=reason,
+        )
+    except Exception:
+        # Failure evidence must never turn a source refresh into a failed job.
+        logger.exception("保存活动单项失败记录失败 dynamic_id=%s reason=%s", dynamic_id, reason)
+
+
+def _resolve_terminal_success(dynamic_id: str) -> None:
+    try:
+        resolve_activity_failure(dynamic_id)
+    except Exception:
+        # Some legacy/offline callers replace the activity writer without
+        # bootstrapping the Profile database.  That must not affect a success.
+        logger.debug("清理活动旧失败记录跳过 dynamic_id=%s", dynamic_id, exc_info=True)
 
 
 def _skip_breakdown(skip_reasons: Mapping[str, int]) -> tuple[int, int, int]:
@@ -189,6 +227,7 @@ def run_new_links_pipeline(
     0 额外 Bilibili 请求：只复用本流水线已抓取的 official lottery_notice 结构化时间。
     """
     dedupe = _dedupe_new_dynamic_ids(raw_urls)
+    failure_source_urls = _failure_url_by_dynamic_id(raw_urls)
     dynamic_ids = dedupe.dynamic_ids
     invalid_ids = invalid_activity_ids()
     skipped_invalid = sum(dynamic_id in invalid_ids for dynamic_id in dynamic_ids)
@@ -323,6 +362,7 @@ def run_new_links_pipeline(
                         raise
 
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    _record_terminal_failure(dynamic_id, reason, failure_source_urls)
                     completed_count += 1
                     done += 1
 
@@ -341,6 +381,7 @@ def run_new_links_pipeline(
                 if outcome.skipped:
                     reason = outcome.skip_reason or "skipped"
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    _record_terminal_failure(outcome.dynamic_id, reason, failure_source_urls)
 
                 elif outcome.lottery_type in ("互动抽奖", "预约抽奖", "转发抽奖"):
                     tasks.append((outcome.dynamic_id, outcome.lottery_type))
@@ -507,7 +548,12 @@ def run_new_links_pipeline(
                     try:
                         activity = future.result()
 
-                    except EnrichSkippedError:
+                    except EnrichSkippedError as exc:
+                        _record_terminal_failure(
+                            exc.dynamic_id,
+                            exc.reason,
+                            failure_source_urls,
+                        )
                         skip_reasons[ENRICH_SKIP_REASON] = (
                             skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
                         )
@@ -560,6 +606,7 @@ def run_new_links_pipeline(
                             continue
 
                         if is_enrich_detail_skip_error(exc):
+                            _record_terminal_failure(candidate_id, ENRICH_SKIP_REASON, failure_source_urls)
                             skip_reasons[ENRICH_SKIP_REASON] = (
                                 skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
                             )
@@ -613,6 +660,8 @@ def run_new_links_pipeline(
         rows_to_persist.append(row)
 
     persisted = append_activities(rows_to_persist)
+    for row in rows_to_persist:
+        _resolve_terminal_success(str(row.get("dynamic_id") or ""))
     persist_skipped_count = max(0, len(rows_to_persist) - persisted)
 
     if on_progress and enriched_rows:

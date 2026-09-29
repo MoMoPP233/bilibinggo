@@ -70,6 +70,7 @@ from web.activity_service import (
     list_activities,
     summarize_triple_participate_targets,
 )
+from src.activity_failures import delete_activity_failure, list_activity_failures
 from web.api_contract import API_CONTRACT_VERSION, ApiContractMiddleware, patch_openapi_schema
 from web.api_errors import AppError, ErrorCode, register_exception_handlers, require_llm_ready, require_login
 from web.auto_scheduler import auto_scheduler
@@ -817,6 +818,19 @@ def api_activities(
         page=page,
         page_size=page_size,
     )
+
+
+@app.get("/api/activity-failures", tags=["stable"])
+def api_activity_failures(q: str | None = Query(default=None)) -> dict[str, Any]:
+    """Read Profile-local item failure evidence; no Bilibili access."""
+    items = list_activity_failures(query=q)
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@app.delete("/api/activity-failures/{dynamic_id}", tags=["stable"])
+def api_delete_activity_failure(dynamic_id: str) -> dict[str, Any]:
+    """Delete only one local failure row; it never mutates activity or participation data."""
+    return {"ok": True, "deleted": delete_activity_failure(dynamic_id)}
 
 
 @app.get("/api/activities/triple-targets", tags=["stable"])

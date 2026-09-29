@@ -98,12 +98,12 @@ function setupDom(): void {
     <div id="repost-history-pagination"></div>
     <span id="repost-health-pill">—</span>
     <strong id="repost-health-status">读取中…</strong>
-    <strong id="repost-health-all">—</strong>
-    <strong id="repost-health-existing">—</strong>
-    <strong id="repost-health-deleted">—</strong>
-    <strong id="repost-health-pending">—</strong>
-    <strong id="repost-health-failed">—</strong>
-    <strong id="repost-health-unknown">—</strong>
+    <strong id="repost-history-total">—</strong>
+    <strong id="repost-existing-total">—</strong>
+    <strong id="repost-deleted-total">—</strong>
+    <strong id="repost-pending-total">—</strong>
+    <strong id="repost-failed-total">—</strong>
+    <strong id="repost-unknown-total">—</strong>
     <div id="repost-health-lines">读取中…</div>
     <div id="repost-health-issues"></div>`;
 }
@@ -140,6 +140,9 @@ describe("repost cleanup UI", () => {
     expect(html).toContain('id="repost-checkpoint-status"');
     expect(html).toContain('id="repost-risk-pause"');
     expect(html).toContain('id="repost-maintenance"');
+    expect(html).toContain('class="repost-health-inline"');
+    expect(html).not.toContain('class="panel repost-health-panel"');
+    expect((html.match(/class="repost-cleanup-metric"/g) || []).length).toBe(6);
   });
 
   beforeEach(() => {
@@ -711,7 +714,7 @@ describe("repost cleanup UI", () => {
     responses[1].reject(new Error("旧请求失败"));
     await Promise.allSettled([first, second]);
     expect(document.getElementById("repost-health-status")?.textContent).toBe("最新");
-    expect(document.getElementById("repost-health-existing")?.textContent).toBe("9");
+    expect(document.getElementById("repost-existing-total")?.textContent).toBe("9");
   });
 
   it("keeps existing candidates when starting the cleanup job fails", async () => {
@@ -746,12 +749,12 @@ describe("repost cleanup maintenance health", () => {
     });
     expect(document.getElementById("repost-health-pill")?.textContent).toBe("维护状态正常");
     expect(document.getElementById("repost-health-pill")?.getAttribute("data-tone")).toBe("ok");
-    expect(document.getElementById("repost-health-all")?.textContent).toBe("6");
-    expect(document.getElementById("repost-health-existing")?.textContent).toBe("3");
-    expect(document.getElementById("repost-health-deleted")?.textContent).toBe("1");
-    expect(document.getElementById("repost-health-pending")?.textContent).toBe("1");
-    expect(document.getElementById("repost-health-failed")?.textContent).toBe("1");
-    expect(document.getElementById("repost-health-unknown")?.textContent).toBe("1");
+    expect(document.getElementById("repost-history-total")?.textContent).toBe("—");
+    expect(document.getElementById("repost-existing-total")?.textContent).toBe("3");
+    expect(document.getElementById("repost-deleted-total")?.textContent).toBe("0");
+    expect(document.getElementById("repost-pending-total")?.textContent).toBe("0");
+    expect(document.getElementById("repost-failed-total")?.textContent).toBe("1");
+    expect(document.getElementById("repost-unknown-total")?.textContent).toBe("1");
     const lines = document.getElementById("repost-health-lines")?.textContent || "";
     expect(lines).toContain("自动维护：由调度器管理");
     expect(lines).toContain("每日 04:05");

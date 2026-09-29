@@ -8,7 +8,7 @@ import { isSetupComplete } from "../account/index";
 import { activitiesBody, activitiesCards, filterDrawWindowHint, filterResultSummary, pagination, statsGrid } from "../dom";
 import { acceptJobUpdate, bindActionButtons, updateJobUI } from "../jobs/index";
 import { showToast } from "../shell/toast";
-import { activityStatusTone, badgeClass, formatFilterSummary, formatHeat, formatLastParticipation, formatLotteryTime, isLotterySoon, lotteryTypeTone } from "../utils/format";
+import { activityStatusTone, badgeClass, formatFilterSummary, formatHeat, formatLastParticipation, formatLotteryTime, formatUnixTimestamp, isLotterySoon, lotteryTypeTone } from "../utils/format";
 import { animateStatValue, flashFilterPill, playActivityListEnter, pulseFilterSummary } from "../utils/motion";
 import { escapeHtml, truncateText } from "../utils/text";
 import { renderSources } from "../watch/index";
@@ -61,7 +61,41 @@ export function buildActivityLink(item) {
   return `<span class="caption">—</span>`;
 }
 
+function renderFailureDeleteButton(item) {
+  return `<button type="button" class="btn btn-secondary btn-compact btn-pill" data-action="delete-activity-failure" data-dynamic-id="${escapeHtml(item.dynamic_id || "")}">删除记录</button>`;
+}
+
+async function deleteActivityFailure(dynamicId) {
+  if (!dynamicId) return;
+  if (!window.confirm("只删除本地失败记录，不会操作 B 站内容。")) return;
+  try {
+    await fetchJSON(`/api/activity-failures/${encodeURIComponent(dynamicId)}`, { method: "DELETE" });
+    await loadActivities();
+    showToast("失败记录已删除", "success");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "删除失败记录失败", "error");
+  }
+}
+
+export function bindFailureButtons() {
+  document.querySelectorAll('[data-action="delete-activity-failure"]').forEach((button) => {
+    button.addEventListener("click", () => deleteActivityFailure(button.getAttribute("data-dynamic-id") || ""));
+  });
+}
+
 export function renderActivityTableRow(item, index = 0) {
+  if (item.activity_status === "失败") {
+    const reason = escapeHtml(item.failure_reason || "处理失败");
+    return `
+      <tr class="activity-row is-failed" data-dynamic-id="${escapeHtml(item.dynamic_id || "")}" style="--row-delay:${Math.min(index, 12) * 28}ms">
+        <td class="activity-cell"><div class="activity-title">${escapeHtml(item.dynamic_id || "失败活动")}</div><div class="last-result">${reason}</div></td>
+        <td class="link-cell">${buildActivityLink(item)}</td>
+        <td class="caption">—</td><td class="caption">—</td>
+        <td class="chip-cell"><span class="badge failed">失败</span></td>
+        <td class="time-cell">${escapeHtml(formatUnixTimestamp(item.failed_at))}</td>
+        <td class="chip-cell action-cell">${renderFailureDeleteButton(item)}</td>
+      </tr>`;
+  }
   const title = escapeHtml(item.activity_title || item.prize || "未知活动");
   const statusTone = activityStatusTone(item.activity_status);
   const soon = isLotterySoon(item.lottery_time);
@@ -82,6 +116,15 @@ export function renderActivityTableRow(item, index = 0) {
 }
 
 export function renderActivityCard(item, index = 0) {
+  if (item.activity_status === "失败") {
+    return `
+      <article class="activity-card is-failed" data-dynamic-id="${escapeHtml(item.dynamic_id || "")}" style="--row-delay:${Math.min(index, 12) * 28}ms">
+        <div class="activity-card-head"><h3 class="activity-card-title">${escapeHtml(item.dynamic_id || "失败活动")}</h3><span class="badge failed">失败</span></div>
+        <div class="last-result">${escapeHtml(item.failure_reason || "处理失败")}</div>
+        <div class="activity-card-meta"><span class="time-pill">${escapeHtml(formatUnixTimestamp(item.failed_at))}</span></div>
+        <div class="activity-card-actions">${buildActivityLink(item)}${renderFailureDeleteButton(item)}</div>
+      </article>`;
+  }
   const title = escapeHtml(item.activity_title || item.prize || "未知活动");
   const statusTone = activityStatusTone(item.activity_status);
   const ended = statusTone === "ended" ? " is-ended" : "";
@@ -183,6 +226,7 @@ export function renderActivities(payload) {
     loadActivities();
   });
   bindActionButtons();
+  bindFailureButtons();
   const preview = resolveTripleTargets(payload);
   if (preview) applyTripleTargets(preview);
 }

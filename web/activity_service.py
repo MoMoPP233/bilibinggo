@@ -5,6 +5,7 @@ from typing import Any
 
 from src.activity_status import resolve_activity_status
 from src.activity_store import load_payload
+from src.activity_failures import list_activity_failures
 from src.db.snapshots import load_ds_check_dict, load_watch_sync_dict
 from src.db.uids import participation_uid
 from src.draw_reminder import matches_draw_window_filter
@@ -574,6 +575,34 @@ def list_activities(
     page: int = 1,
     page_size: int = ACTIVITY_PAGE_SIZE,
 ) -> dict[str, Any]:
+    if str(status or "").strip() == "失败":
+        failures = list_activity_failures(query=q)
+        normalized = [
+            {
+                "dynamic_id": str(item.get("dynamic_id") or ""),
+                "source_url": str(item.get("source_url") or ""),
+                "activity_title": str(item.get("dynamic_id") or "失败活动"),
+                "lottery_type": "",
+                "activity_status": "失败",
+                "failure_reason": str(item.get("reason") or "处理失败"),
+                "failed_at": item.get("failed_at"),
+                "source_id": item.get("source_id"),
+                "can_participate": False,
+            }
+            for item in failures
+        ]
+        total = len(normalized)
+        page = max(1, page)
+        page_size = max(1, min(int(page_size), ACTIVITY_PAGE_SIZE))
+        start = (page - 1) * page_size
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size),
+            "items": normalized[start : start + page_size],
+            "triple_targets": build_triple_target_preview([]),
+        }
     normalized = _filtered_activity_rows(
         status=status,
         lottery_type=lottery_type,

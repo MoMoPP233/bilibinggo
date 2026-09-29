@@ -30,12 +30,6 @@ import {
   repostHealthStatus,
   repostRiskPause,
   repostMaintenance,
-  repostHealthAll,
-  repostHealthExisting,
-  repostHealthDeleted,
-  repostHealthPending,
-  repostHealthFailed,
-  repostHealthUnknown,
   repostHealthLines,
   repostHealthIssues,
 } from "../dom";
@@ -742,12 +736,6 @@ export function renderHealth(data: RepostHealthResponse): void {
   setHealthNumber(repostExistingTotal, counts?.history_total);
   setHealthNumber(repostFailedTotal, counts?.delete_failed);
   setHealthNumber(repostUnknownTotal, counts?.unknown);
-  setHealthNumber(repostHealthAll, counts?.all_total);
-  setHealthNumber(repostHealthExisting, counts?.history_total);
-  setHealthNumber(repostHealthDeleted, counts?.deleted);
-  setHealthNumber(repostHealthPending, counts?.delete_pending);
-  setHealthNumber(repostHealthFailed, counts?.delete_failed);
-  setHealthNumber(repostHealthUnknown, counts?.unknown);
   if (repostHealthStatus) repostHealthStatus.textContent = sanitizeUserText(data?.status_text || "正常");
   if (repostRiskPause) repostRiskPause.textContent = data?.maintenance?.risk_paused ? "是" : "否";
   if (repostHealthLines) {

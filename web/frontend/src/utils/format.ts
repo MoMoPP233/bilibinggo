@@ -46,6 +46,7 @@ export function isLotterySoon(value: unknown): boolean {
 export function activityStatusTone(status: unknown): string {
   if (status === "已参加") return "joined";
   if (status === "已结束") return "ended";
+  if (status === "失败") return "failed";
   return "pending";
 }
 
@@ -113,6 +114,7 @@ export function formatLastParticipation(last: LastParticipationLike | null | und
 export function badgeClass(status: unknown): string {
   if (status === "已参加") return "badge joined";
   if (status === "已结束") return "badge ended";
+  if (status === "失败") return "badge failed";
   return "badge pending";
 }
 

@@ -504,6 +504,7 @@
                 <button type="button" class="filter-pill" data-filter-status="未参加">未参加</button>
                 <button type="button" class="filter-pill" data-filter-status="已参加">已参加</button>
                 <button type="button" class="filter-pill" data-filter-status="已结束">已结束</button>
+                <button type="button" class="filter-pill" data-filter-status="失败">失败</button>
               </div>
               <div class="filter-group" id="filter-sort-group" role="group" aria-label="热度排序">
                 <button type="button" class="filter-pill" data-filter-sort="heat" data-filter-order="desc">热度 ↓</button>
@@ -591,30 +592,26 @@
                   <span class="repost-cleanup-metric-label">结果未知</span>
                   <strong class="repost-cleanup-metric-value" id="repost-unknown-total">—</strong>
                 </div>
-                <div class="repost-cleanup-metric repost-cleanup-metric-wide">
-                  <span class="repost-cleanup-metric-label">处理进度</span>
-                  <strong class="repost-cleanup-metric-text" id="repost-workflow-status">尚未读取</strong>
+              </div>
+              <p class="repost-workflow-status" id="repost-workflow-status">尚未读取</p>
+              <section class="repost-health-inline" id="repost-maintenance" aria-labelledby="repost-health-title">
+                <div class="panel-head-row repost-list-head repost-health-inline-head">
+                  <div>
+                    <p class="eyebrow">Maintenance Health</p>
+                    <h2 class="section-title" id="repost-health-title">清理维护状态</h2>
+                    <p class="section-desc">纯本地健康检查；只展示问题，绝不自动恢复或重新删除任何记录。</p>
+                  </div>
+                  <span class="repost-health-pill" id="repost-health-pill" data-tone="idle">—</span>
                 </div>
-              </div>
-            </article>
-
-            <article class="panel repost-health-panel">
-              <div class="panel-head-row repost-list-head">
-                <div>
-                  <p class="eyebrow">Maintenance Health</p>
-                  <h2 class="section-title">清理维护状态</h2>
-                  <p class="section-desc">纯本地健康检查，打开 / 刷新页面 0 远程请求；只展示问题，绝不自动恢复或重新删除任何记录。</p>
+                <div class="repost-health-summary" aria-live="polite">
+                  <p><span>清理状态</span><strong id="repost-health-status">读取中…</strong></p>
+                  <p><span>清理进度</span><strong id="repost-checkpoint-status">读取中…</strong></p>
+                  <p><span>风险暂停</span><strong id="repost-risk-pause">读取中…</strong></p>
+                  <p><span>自动清理计划</span><strong id="repost-maintenance">读取中…</strong></p>
                 </div>
-                <span class="repost-health-pill" id="repost-health-pill" data-tone="idle">—</span>
-              </div>
-              <div class="repost-health-summary" aria-live="polite">
-                <p><span>清理状态</span><strong id="repost-health-status">读取中…</strong></p>
-                <p><span>清理进度</span><strong id="repost-checkpoint-status">读取中…</strong></p>
-                <p><span>风险暂停</span><strong id="repost-risk-pause">读取中…</strong></p>
-                <p><span>自动维护</span><strong id="repost-maintenance">读取中…</strong></p>
-              </div>
-              <div class="repost-health-lines" id="repost-health-lines" aria-live="polite"></div>
-              <div class="repost-health-issues" id="repost-health-issues" hidden></div>
+                <div class="repost-health-lines" id="repost-health-lines" aria-live="polite"></div>
+                <div class="repost-health-issues" id="repost-health-issues" hidden></div>
+              </section>
             </article>
 
             <article class="panel repost-candidates-panel">
