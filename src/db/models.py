@@ -310,6 +310,58 @@ class Ds9RejectionAuditRow(SQLModel, table=True):
     last_seen_at: int = 0
 
 
+class Ds9ContributionPageRow(SQLModel, table=True):
+    """Bounded, Profile-local DS9 page contribution aggregates."""
+
+    __tablename__ = "ds9_contribution_pages"
+    __table_args__ = (
+        Index("ix_ds9_contribution_pages_scanned_at", "scanned_at"),
+        Index("ix_ds9_contribution_pages_canonical", "topic_id", "page_index"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_id: str = Field(max_length=64)
+    source_id: str = Field(default="DS-9", max_length=32)
+    topic_id: str = Field(default="", max_length=32)
+    topic_name: str = Field(default="", sa_column=Column(Text, nullable=False))
+    page_index: int = 0
+    scanned_at: int = 0
+    discovered_count: int = 0
+    batch_duplicate_count: int = 0
+    existing_count: int = 0
+    new_candidate_count: int = 0
+    valid_lottery_count: int = 0
+    overlap_other_source_count: int = 0
+    ds9_unique_valid_count: int = 0
+    non_lottery_count: int = 0
+    expired_count: int = 0
+    failed_count: int = 0
+    unprocessed_count: int = 0
+
+
+class Ds9ContributionCandidateRow(SQLModel, table=True):
+    """One real DS9/source observation and its final public-pipeline outcome."""
+
+    __tablename__ = "ds9_contribution_candidates"
+    __table_args__ = (
+        Index("ix_ds9_contribution_candidates_scanned_at", "scanned_at"),
+        Index("ix_ds9_contribution_candidates_canonical", "canonical_dynamic_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scan_id: str = Field(max_length=64)
+    source_id: str = Field(default="DS-9", max_length=32)
+    topic_id: str = Field(default="", max_length=32)
+    topic_name: str = Field(default="", sa_column=Column(Text, nullable=False))
+    page_index: Optional[int] = None
+    raw_dynamic_id: str = Field(default="", max_length=32)
+    canonical_dynamic_id: str = Field(default="", max_length=32)
+    outcome: str = Field(default="unprocessed", max_length=32)
+    valid_lottery: bool = False
+    persisted: bool = False
+    scanned_at: int = 0
+
+
 class WatchSyncSnapshotRow(SQLModel, table=True):
     __tablename__ = "watch_sync_snapshots"
 

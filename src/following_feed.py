@@ -152,6 +152,17 @@ def _pipeline_accepts_identity_map() -> bool:
     )
 
 
+def _pipeline_accepts_source_observations() -> bool:
+    try:
+        signature = inspect.signature(run_new_links_pipeline)
+    except (TypeError, ValueError):
+        return False
+    return "source_observations" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 def _slice_before_checkpoint(ids: list[str], checkpoint: str | None) -> list[str]:
     """在 checkpoint（含）之前截断，只留下“尚未推进到 checkpoint”的新动态。"""
     if not checkpoint:
@@ -332,6 +343,11 @@ def scan_following_feed(
         "scan_started_at": scan_started_at,
         "on_progress": on_progress,
     }
+    if _pipeline_accepts_source_observations():
+        pipeline_kwargs["source_observations"] = [
+            {"source_id": "following_feed", "dynamic_id": dynamic_id, "page_index": None}
+            for dynamic_id in accepted_ids
+        ]
     if accepted_identities and _pipeline_accepts_identity_map():
         pipeline_kwargs["identity_by_raw"] = accepted_identities
     pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)

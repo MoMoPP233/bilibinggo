@@ -44,6 +44,11 @@ class CheckResult:
     # Optional source metadata used by diagnostic side channels.  Business
     # deduplication and activity persistence continue to use activity_links.
     activity_source_context: dict[str, dict[str, str]] = field(default_factory=dict)
+    # One entry per source observation.  Unlike activity_source_context this
+    # intentionally preserves cross-topic/page duplicates for audit only.
+    activity_source_observations: list[dict[str, str]] = field(default_factory=list)
+    # Source-owned page aggregates; page_index is assigned by the fetcher.
+    source_page_stats: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

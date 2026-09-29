@@ -444,6 +444,37 @@ def _fetch_topic_history_pages(
     return entries
 
 
+def _fetch_topic_history_pages_with_index(
+    client: BilibiliClient,
+    topic_id: str,
+    *,
+    first_offset: str,
+    first_has_more: bool,
+    max_pages: int = TOPIC_HISTORY_MAX_PAGES - 1,
+) -> list[tuple[int, list[dict]]]:
+    """Fetch the same bounded history window while retaining real page numbers."""
+    pages: list[tuple[int, list[dict]]] = []
+    offset = str(first_offset or "")
+    has_more = bool(first_has_more)
+    seen_offsets: set[str] = set()
+    for page_index in range(2, max_pages + 2):
+        if not has_more or not offset or offset in seen_offsets:
+            break
+        seen_offsets.add(offset)
+        page_entries, next_offset, has_more = _fetch_topic_page(
+            client,
+            topic_id,
+            offset=offset,
+        )
+        if not page_entries:
+            break
+        pages.append((page_index, page_entries))
+        if not next_offset:
+            break
+        offset = next_offset
+    return pages
+
+
 # ---------------------------------------------------------------------------
 # 扫描 + 流水线成功后再提交的 per-topic checkpoint
 # ---------------------------------------------------------------------------
@@ -494,6 +525,8 @@ def check_update(*, force: bool = False) -> CheckResult:
     activity_source_context: dict[str, dict[str, str]] = {}
     seen_links: set[str] = set()
     pending: list[dict[str, Any]] = []
+    activity_source_observations: list[dict[str, str]] = []
+    source_page_stats: list[dict[str, object]] = []
     failed_topic_ids: list[str] = []
     nochange_topic_ids: list[str] = []
 
@@ -509,14 +542,17 @@ def check_update(*, force: bool = False) -> CheckResult:
                 resolved, incomplete, outers = normalize_topic_entries(new_entries)
                 fp = fingerprint_of_topic(outers)
                 needs = force or fp != prev_fp or bool(prev_incomplete)
+                page_entries: list[tuple[int, list[dict]]] = [(1, new_entries)]
                 if needs:
                     # 现代话题 Feed：最新页 + 最多 2 个 offset 历史页，总计 ≤3 页/话题。
-                    history = _fetch_topic_history_pages(
+                    history_pages = _fetch_topic_history_pages_with_index(
                         client,
                         topic_id,
                         first_offset=first_offset,
                         first_has_more=first_has_more,
                     )
+                    page_entries.extend(history_pages)
+                    history = [entry for _, page in history_pages for entry in page]
                     resolved_h, incomplete_h, outers_h = normalize_topic_entries(history)
                     for item in incomplete_h:
                         if item not in incomplete:
@@ -541,6 +577,35 @@ def check_update(*, force: bool = False) -> CheckResult:
                     record["last_scan_at"] = now
                     nochange_topic_ids.append(topic_id)
                     continue
+
+                seen_page_ids: set[str] = set()
+                for page_index, entries in page_entries:
+                    page_resolved, _page_incomplete, _page_outers = normalize_topic_entries(entries)
+                    duplicate_count = 0
+                    for canonical in page_resolved:
+                        if canonical in seen_page_ids:
+                            duplicate_count += 1
+                        seen_page_ids.add(canonical)
+                        activity_source_observations.append(
+                            {
+                                "source_id": SOURCE_ID,
+                                "dynamic_id": canonical,
+                                "topic_id": topic_id,
+                                "topic_name": str(record.get("name") or topic_id),
+                                "page_index": str(page_index),
+                            }
+                        )
+                    source_page_stats.append(
+                        {
+                            "source_id": SOURCE_ID,
+                            "topic_id": topic_id,
+                            "topic_name": str(record.get("name") or topic_id),
+                            "page_index": page_index,
+                            "discovered_ids": page_resolved,
+                            "discovered_count": len(page_resolved),
+                            "batch_duplicate_count": duplicate_count,
+                        }
+                    )
             except Exception as exc:  # noqa: BLE001 - 普通失败按话题隔离；风险继续上抛
                 if risk_code_of(exc) is not None:
                     raise
@@ -600,6 +665,8 @@ def check_update(*, force: bool = False) -> CheckResult:
         activity_links=links,
         checked_at=now,
         activity_source_context=activity_source_context,
+        activity_source_observations=activity_source_observations,
+        source_page_stats=source_page_stats,
     )
     # 提交钩子：公共流水线成功（common.commit_source_checkpoint）后执行。
     result.ds9_summary = summary  # type: ignore[attr-defined]

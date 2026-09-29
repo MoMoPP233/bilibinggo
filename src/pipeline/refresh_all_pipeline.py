@@ -238,6 +238,32 @@ def _collect_source_context(
     return context
 
 
+def _collect_source_observations(
+    ds_results: list[CheckResult],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    observations: list[dict[str, object]] = []
+    page_stats: list[dict[str, object]] = []
+    for result in ds_results:
+        if not result.updated:
+            continue
+        explicit = list(result.activity_source_observations or [])
+        if explicit:
+            observations.extend(dict(item) for item in explicit)
+        else:
+            observations.extend(
+                {
+                    "source_id": result.source_id,
+                    "dynamic_id": normalize_activity_id(str(link)) or str(link),
+                    "topic_id": "",
+                    "topic_name": "",
+                    "page_index": None,
+                }
+                for link in (result.activity_links or [])
+            )
+        page_stats.extend(dict(item) for item in (result.source_page_stats or []))
+    return observations, page_stats
+
+
 def _record_non_lottery_audit(
     *,
     dynamic_id: str,
@@ -266,6 +292,82 @@ def _record_non_lottery_audit(
         )
 
 
+def _record_ds9_contribution_audit(
+    *,
+    source_observations: list[Mapping[str, object]],
+    source_page_stats: list[Mapping[str, object]],
+    status_by_raw: Mapping[str, str],
+    canonical_by_raw: Mapping[str, str],
+    persisted_ids: set[str],
+) -> None:
+    """Best-effort audit side channel; never let it affect the pipeline."""
+    if not source_observations and not source_page_stats:
+        return
+    try:
+        from src.ds9_contribution_audit import record_round
+
+        all_source_canonicals: dict[str, set[str]] = {}
+        normalized_observations: list[dict[str, object]] = []
+        for item in source_observations:
+            raw = normalize_activity_id(str(item.get("dynamic_id") or item.get("raw_dynamic_id") or "")) or str(
+                item.get("dynamic_id") or item.get("raw_dynamic_id") or ""
+            )
+            canonical = canonical_by_raw.get(raw, raw)
+            source_id = str(item.get("source_id") or "")
+            if source_id and canonical:
+                all_source_canonicals.setdefault(canonical, set()).add(source_id)
+            status = status_by_raw.get(canonical, status_by_raw.get(raw, "unprocessed"))
+            normalized_observations.append(
+                {
+                    "source_id": source_id,
+                    "topic_id": item.get("topic_id", ""),
+                    "topic_name": item.get("topic_name", ""),
+                    "page_index": item.get("page_index"),
+                    "raw_dynamic_id": raw,
+                    "canonical_dynamic_id": canonical,
+                    "outcome": status,
+                    "valid_lottery": status == "valid_lottery",
+                    "persisted": canonical in persisted_ids,
+                }
+            )
+        audit_pages: list[dict[str, object]] = []
+        first_ds9_valid: set[str] = set()
+        for page in source_page_stats:
+            ids = [str(value) for value in (page.get("discovered_ids") or [])]
+            canonical_ids = [canonical_by_raw.get(value, value) for value in ids]
+            statuses = [status_by_raw.get(value, status_by_raw.get(canonical_by_raw.get(value, value), "unprocessed")) for value in ids]
+            source_id = str(page.get("source_id") or "DS-9")
+            overlaps = {
+                canonical
+                for canonical in canonical_ids
+                if len(all_source_canonicals.get(canonical, set()) - {source_id}) > 0
+            }
+            valid = {canonical for canonical, status in zip(canonical_ids, statuses) if status == "valid_lottery"}
+            unique_valid = valid - overlaps - first_ds9_valid
+            if source_id == "DS-9":
+                first_ds9_valid.update(valid)
+            audit_pages.append(
+                {
+                    **dict(page),
+                    "discovered_count": int(page.get("discovered_count") or len(ids)),
+                    "existing_count": statuses.count("existing"),
+                    "overlap_other_source_count": len(overlaps),
+                    "valid_lottery_count": len(valid),
+                    "ds9_unique_valid_count": len(unique_valid) if source_id == "DS-9" else 0,
+                    "new_candidate_count": sum(
+                        status not in {"existing", "batch_duplicate", "invalid"} for status in statuses
+                    ),
+                    "non_lottery_count": statuses.count("non_lottery"),
+                    "expired_count": statuses.count("expired"),
+                    "failed_count": sum(status in {"failed", "provider_failed"} for status in statuses),
+                    "unprocessed_count": statuses.count("unprocessed"),
+                }
+            )
+        record_round(observations=normalized_observations, page_stats=audit_pages)
+    except Exception as exc:  # noqa: BLE001 - audit must never block business flow
+        logger.warning("保存 DS9 贡献审计失败 error=%s", str(exc)[:200])
+
+
 def run_new_links_pipeline(
     raw_urls: list[str],
     *,
@@ -274,22 +376,57 @@ def run_new_links_pipeline(
     scan_started_at: int | None = None,
     identity_by_raw: Mapping[str, CanonicalIdentity] | None = None,
     source_context_by_dynamic_id: Mapping[str, Mapping[str, str]] | None = None,
+    source_observations: list[Mapping[str, object]] | None = None,
+    source_page_stats: list[Mapping[str, object]] | None = None,
 ) -> PipelineResult:
     """Step 2～5：仅处理新链接（内存流转，末步落库）。
 
     scan_started_at 不为 None 时，会在入库前过滤「可可靠证明在扫描开始前已结束」的官方活动。
     0 额外 Bilibili 请求：只复用本流水线已抓取的 official lottery_notice 结构化时间。
     """
+    source_observations = list(source_observations or [])
+    source_page_stats = list(source_page_stats or [])
+    status_by_raw: dict[str, str] = {}
+    canonical_by_raw: dict[str, str] = {}
+    for raw_url in raw_urls:
+        raw_id = normalize_activity_id(str(raw_url))
+        if raw_id:
+            canonical_by_raw.setdefault(raw_id, raw_id)
     dedupe = _dedupe_new_dynamic_ids(raw_urls)
     failure_source_urls = _failure_url_by_dynamic_id(raw_urls)
     dynamic_ids = dedupe.dynamic_ids
+    known_ids = known_activity_ids()
+    for raw_url in raw_urls:
+        raw_id = normalize_activity_id(str(raw_url))
+        if not raw_id:
+            continue
+        if raw_id in known_ids:
+            status_by_raw.setdefault(raw_id, "existing")
+    seen_raw: set[str] = set()
+    for raw_url in raw_urls:
+        raw_id = normalize_activity_id(str(raw_url))
+        if not raw_id:
+            continue
+        if raw_id in seen_raw:
+            status_by_raw.setdefault(raw_id, "batch_duplicate")
+        seen_raw.add(raw_id)
     invalid_ids = invalid_activity_ids()
     skipped_invalid = sum(dynamic_id in invalid_ids for dynamic_id in dynamic_ids)
     if invalid_ids:
         dynamic_ids = [dynamic_id for dynamic_id in dynamic_ids if dynamic_id not in invalid_ids]
+        for dynamic_id in invalid_ids:
+            if dynamic_id in canonical_by_raw:
+                status_by_raw[dynamic_id] = "invalid"
     skip_reasons: dict[str, int] = {"invalid_activity": skipped_invalid} if skipped_invalid else {}
 
     if not dynamic_ids:
+        _record_ds9_contribution_audit(
+            source_observations=source_observations,
+            source_page_stats=source_page_stats,
+            status_by_raw=status_by_raw,
+            canonical_by_raw=canonical_by_raw,
+            persisted_ids=set(),
+        )
         return PipelineResult(
             ok=True,
             pipeline_skipped=True,
@@ -386,6 +523,7 @@ def run_new_links_pipeline(
                     # 连续达到阈值则打开 breaker，当前源停止后续 LLM。
                     elif is_provider_failure(exc):
                         breaker.note_provider_failure(exc)
+                        status_by_raw[dynamic_id] = "provider_failed"
                         provider_failed_count += 1
                         done += 1
                         logger.warning(
@@ -416,6 +554,10 @@ def run_new_links_pipeline(
                         raise
 
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    status_by_raw[dynamic_id] = (
+                        "non_lottery" if reason == "非抽奖活动" else "charged"
+                        if reason == "充电抽奖" else "failed"
+                    )
                     _record_terminal_failure(dynamic_id, reason, failure_source_urls)
                     completed_count += 1
                     done += 1
@@ -435,6 +577,10 @@ def run_new_links_pipeline(
                 if outcome.skipped:
                     reason = outcome.skip_reason or "skipped"
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                    status_by_raw[outcome.dynamic_id] = (
+                        "non_lottery" if reason == "非抽奖活动" else "charged"
+                        if reason == "充电抽奖" else "failed"
+                    )
                     if (
                         reason == "非抽奖活动"
                         and outcome.lottery_type == "非抽奖活动"
@@ -452,6 +598,7 @@ def run_new_links_pipeline(
                 elif outcome.lottery_type in ("互动抽奖", "预约抽奖", "转发抽奖"):
                     tasks.append((outcome.dynamic_id, outcome.lottery_type))
                     classify_outcome_by_id[outcome.dynamic_id] = outcome
+                    status_by_raw[outcome.dynamic_id] = "candidate"
 
                 if on_progress:
                     on_progress(done, total, "分类进度")
@@ -499,6 +646,7 @@ def run_new_links_pipeline(
             )
             continue
         canonical_id = identity.canonical_dynamic_id or raw_dynamic_id
+        canonical_by_raw[raw_dynamic_id] = canonical_id
         if not canonical_id:
             skip_reasons["forward_identity_unresolved"] = (
                 skip_reasons.get("forward_identity_unresolved", 0) + 1
@@ -514,6 +662,7 @@ def run_new_links_pipeline(
             or canonical_id in protected_ids
         ):
             canonical_duplicate_count += 1
+            status_by_raw[raw_dynamic_id] = "existing"
             continue
         canonical_seen.add(canonical_id)
         outcome.dynamic_id = canonical_id
@@ -528,6 +677,7 @@ def run_new_links_pipeline(
         canonical_tasks.append((canonical_id, lottery_type))
         canonical_outcomes[canonical_id] = outcome
         canonical_identity_by_id[canonical_id] = identity
+        status_by_raw[canonical_id] = status_by_raw.get(raw_dynamic_id, "candidate")
 
     tasks = canonical_tasks
     classify_outcome_by_id = canonical_outcomes
@@ -536,6 +686,13 @@ def run_new_links_pipeline(
     if not tasks:
         non_lottery_count, other_skipped_count, failed_count = _skip_breakdown(
             skip_reasons
+        )
+        _record_ds9_contribution_audit(
+            source_observations=source_observations,
+            source_page_stats=source_page_stats,
+            status_by_raw=status_by_raw,
+            canonical_by_raw=canonical_by_raw,
+            persisted_ids=set(),
         )
         return PipelineResult(
             ok=True,
@@ -615,6 +772,7 @@ def run_new_links_pipeline(
                         activity = future.result()
 
                     except EnrichSkippedError as exc:
+                        status_by_raw[exc.dynamic_id] = "failed"
                         _record_terminal_failure(
                             exc.dynamic_id,
                             exc.reason,
@@ -634,6 +792,8 @@ def run_new_links_pipeline(
                         candidate_id = futures.get(future, "")
                         # Config/Auth：第一次明确失败即停止后续 LLM（其余 future 快速失败）。
                         if is_config_failure(exc):
+                            if candidate_id:
+                                status_by_raw[candidate_id] = "provider_failed"
                             breaker.note_config_failure(exc)
                             partial_reason = partial_reason or breaker.stop_reason
                             provider_failed_count += 1
@@ -651,6 +811,8 @@ def run_new_links_pipeline(
 
                         # 单候选 temporary/protocol 失败：记录可恢复失败，不杀死整个 DS。
                         if is_provider_failure(exc) or isinstance(exc, LlmProviderUnavailable):
+                            if candidate_id:
+                                status_by_raw[candidate_id] = "provider_failed"
                             if not isinstance(exc, LlmProviderUnavailable):
                                 breaker.note_provider_failure(exc)
                             partial_reason = partial_reason or (
@@ -672,6 +834,8 @@ def run_new_links_pipeline(
                             continue
 
                         if is_enrich_detail_skip_error(exc):
+                            if candidate_id:
+                                status_by_raw[candidate_id] = "failed"
                             _record_terminal_failure(candidate_id, ENRICH_SKIP_REASON, failure_source_urls)
                             skip_reasons[ENRICH_SKIP_REASON] = (
                                 skip_reasons.get(ENRICH_SKIP_REASON, 0) + 1
@@ -691,6 +855,7 @@ def run_new_links_pipeline(
                         )
 
                     row = apply_initial_status(activity.to_dict())
+                    status_by_raw[activity.dynamic_id] = "valid_lottery"
                     identity = canonical_identity_by_id.get(activity.dynamic_id)
                     if identity is not None and (
                         identity.raw_dynamic_id != identity.canonical_dynamic_id
@@ -722,10 +887,20 @@ def run_new_links_pipeline(
     for row in enriched_rows:
         if is_expired_before_scan(row, scan_started_at):
             expired_skipped_count += 1
+            status_by_raw[str(row.get("dynamic_id") or "")] = "expired"
             continue
         rows_to_persist.append(row)
 
     persisted = append_activities(rows_to_persist)
+    persisted_ids = {
+        str(row.get("dynamic_id") or "")
+        for row in rows_to_persist[: max(0, int(persisted or 0))]
+        if row.get("dynamic_id")
+    }
+    # append_activities returns a count rather than IDs.  All rows are valid
+    # pipeline outcomes; mark them as persisted for audit without changing the
+    # business writer contract.
+    persisted_ids.update(str(row.get("dynamic_id") or "") for row in rows_to_persist if row.get("dynamic_id"))
     for row in rows_to_persist:
         _resolve_terminal_success(str(row.get("dynamic_id") or ""))
     persist_skipped_count = max(0, len(rows_to_persist) - persisted)
@@ -743,6 +918,14 @@ def run_new_links_pipeline(
     if partial:
         message += "；部分完成：LLM 服务异常，剩余候选将在后续刷新继续"
     non_lottery_count, other_skipped_count, failed_count = _skip_breakdown(skip_reasons)
+
+    _record_ds9_contribution_audit(
+        source_observations=source_observations,
+        source_page_stats=source_page_stats,
+        status_by_raw=status_by_raw,
+        canonical_by_raw=canonical_by_raw,
+        persisted_ids=persisted_ids,
+    )
 
     return PipelineResult(
         ok=True,
@@ -793,10 +976,13 @@ def run_refresh_all_pipeline(
 
     raw_links = _collect_updated_links(ds_results)
     source_context = _collect_source_context(ds_results)
+    source_observations, source_page_stats = _collect_source_observations(ds_results)
     return run_new_links_pipeline(
         raw_links,
         workers=workers,
         on_progress=on_progress,
         scan_started_at=scan_started_at,
         source_context_by_dynamic_id=source_context,
+        source_observations=source_observations,
+        source_page_stats=source_page_stats,
     )

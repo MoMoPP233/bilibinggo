@@ -3505,6 +3505,16 @@ html.sidebar-init-collapsed .system-btn {
   border-top: 1px solid var(--border-soft);
 }
 
+.ds9-audit-section.is-collapsed .ds9-audit-rows {
+  display: none;
+}
+
+.ds9-unique-section {
+  border-top: 0;
+  margin-top: 18px;
+  padding-top: 0;
+}
+
 .ds9-audit-section-head {
   display: flex;
   align-items: flex-start;

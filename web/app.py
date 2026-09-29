@@ -72,6 +72,7 @@ from web.activity_service import (
 )
 from src.activity_failures import delete_activity_failure, list_activity_failures
 from src.ds9_rejection_audit import clear_rejections, export_rejections_csv, list_rejections
+from src.ds9_contribution_audit import export_contributions_csv, list_page_contributions, list_unique_valid
 from web.api_contract import API_CONTRACT_VERSION, ApiContractMiddleware, patch_openapi_schema
 from web.api_errors import AppError, ErrorCode, register_exception_handlers, require_llm_ready, require_login
 from web.auto_scheduler import auto_scheduler
@@ -532,6 +533,29 @@ def api_ds9_rejection_audit_csv(topic_id: str | None = Query(default=None)) -> R
 def api_ds9_clear_rejection_audit() -> dict[str, Any]:
     """Delete only local DS9 rejection audit rows."""
     return {"ok": True, "deleted_count": clear_rejections()}
+
+
+@app.get("/api/ds9/contribution", tags=["stable"])
+def api_ds9_contribution() -> dict[str, Any]:
+    """Read bounded local DS9 page contribution evidence; no remote calls."""
+    rows = list_page_contributions()
+    return {"rows": rows, "count": len(rows), "retention_days": 7}
+
+
+@app.get("/api/ds9/contribution/unique", tags=["stable"])
+def api_ds9_unique_contribution() -> dict[str, Any]:
+    rows = list_unique_valid()
+    return {"records": rows, "count": len(rows), "retention_days": 7}
+
+
+@app.get("/api/ds9/contribution.csv", tags=["stable"])
+def api_ds9_contribution_csv() -> Response:
+    filename, content = export_contributions_csv()
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 class Ds9TopicCreateRequest(BaseModel):

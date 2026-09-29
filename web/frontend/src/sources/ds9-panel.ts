@@ -95,6 +95,29 @@ function renderAudit(samples, topicId = "") {
     : '<li class="ds9-audit-empty">暂无非抽奖审计样本</li>';
 }
 
+function uniqueRecordHtml(record) {
+  const topic = `${String(record?.topic_name || record?.topic_id || "未知话题")} · ${String(record?.topic_id || "")}`;
+  const dynamicId = String(record?.dynamic_id || record?.canonical_dynamic_id || "");
+  const url = String(record?.canonical_url || (dynamicId ? `https://www.bilibili.com/opus/${dynamicId}` : ""));
+  return `
+    <li class="ds9-audit-item ds9-unique-item">
+      <div class="ds9-audit-head"><strong>${escapeHtml(topic)}</strong><span class="ds9-status-pill is-ok">DS9 独有</span></div>
+      <div class="ds9-audit-meta">第 ${Number(record?.page_index) || "—"} 页 · 动态 ID：${escapeHtml(dynamicId)}</div>
+      ${url ? `<a class="ds9-audit-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">打开原动态</a>` : ""}
+      <div class="ds9-audit-meta">发现时间：${escapeHtml(timeText(record?.scanned_at))}</div>
+    </li>`;
+}
+
+function renderUnique(records) {
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel) return;
+  const rows = Array.isArray(records) ? records : [];
+  panel.querySelector("[data-ds9-unique-count]").textContent = String(rows.length);
+  panel.querySelector("[data-ds9-unique-rows]").innerHTML = rows.length
+    ? rows.map(uniqueRecordHtml).join("")
+    : '<li class="ds9-audit-empty">暂无 DS9 独有有效抽奖记录</li>';
+}
+
 function render(state) {
   const topics = Array.isArray(state?.topics) ? state.topics : [];
   const summary = state?.summary || {};
@@ -114,14 +137,16 @@ function render(state) {
 
 async function refreshView() {
   try {
-    const [state, audit] = await Promise.all([
+    const [state, audit, unique] = await Promise.all([
       fetchJSON("/api/ds9"),
       fetchJSON("/api/ds9/rejection-audit"),
+      fetchJSON("/api/ds9/contribution/unique"),
     ]);
     render(state);
     const panel = document.getElementById(PANEL_ID);
     if (panel) panel._ds9AuditSamples = Array.isArray(audit?.samples) ? audit.samples : [];
     renderAudit(audit?.samples);
+    renderUnique(unique?.records);
   } catch (error) {
     showToast(String(error?.message || error), "error", "DS9 状态读取失败");
   }
@@ -176,6 +201,14 @@ function handleAddTopic(event) {
 }
 
 function handleAuditAction(event) {
+  const toggle = event.target.closest("[data-ds9-audit-toggle]");
+  if (toggle) {
+    const section = toggle.closest("[data-ds9-audit]");
+    const collapsed = section?.classList.toggle("is-collapsed");
+    toggle.textContent = collapsed ? "展开" : "收起";
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    return;
+  }
   const select = event.target.closest("[data-ds9-audit-filter]");
   if (select) {
     const panel = document.getElementById(PANEL_ID);
@@ -232,13 +265,21 @@ function ensurePanel() {
       <button type="submit" class="btn btn-secondary btn-compact btn-pill">添加话题</button>
     </form>
     <ul class="ds9-topic-rows" data-ds9-rows></ul>
-    <section class="ds9-audit-section" data-ds9-audit>
+    <section class="ds9-audit-section ds9-unique-section" data-ds9-unique>
+      <div class="ds9-audit-section-head">
+        <div><h3>DS9 独有有效抽奖记录</h3><p class="section-desc">其他正式数据源尚未发现的有效抽奖。</p></div>
+        <div class="action-row"><span class="caption">共 <b data-ds9-unique-count>0</b> 条</span><button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-contribution-export>导出统计 CSV</button></div>
+      </div>
+      <ul class="ds9-audit-rows" data-ds9-unique-rows></ul>
+    </section>
+    <section class="ds9-audit-section ds9-rejection-section is-collapsed" data-ds9-audit>
       <div class="ds9-audit-section-head">
         <div>
           <h3>非抽奖审计样本</h3>
           <p class="section-desc">仅保存本地最近 100 条分类为非抽奖活动的样本。</p>
         </div>
         <div class="action-row">
+          <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-toggle aria-expanded="false">展开</button>
           <select class="form-control" data-ds9-audit-filter aria-label="按话题筛选">
             <option value="">全部话题</option>
             <option value="1261901">抽奖！！！ · 1261901</option>
@@ -270,5 +311,11 @@ export function bindDs9Panel() {
   panel.querySelector("[data-ds9-rows]")?.addEventListener("click", handleTopicAction);
   panel.querySelector("[data-ds9-audit]")?.addEventListener("click", handleAuditAction);
   panel.querySelector("[data-ds9-audit]")?.addEventListener("change", handleAuditAction);
+  panel.querySelector("[data-ds9-contribution-export]")?.addEventListener("click", () => {
+    const link = document.createElement("a");
+    link.href = "/api/ds9/contribution.csv";
+    link.download = "";
+    link.click();
+  });
   refreshView().catch(() => {});
 }

@@ -1535,6 +1535,14 @@ def _run_action_impl(
                     progress,
                     span_tracker=pipeline_spans,
                 ),
+                source_observations=[
+                    {
+                        "source_id": "refresh_watch",
+                        "dynamic_id": link,
+                        "page_index": None,
+                    }
+                    for link in watch_result.activity_links
+                ],
             )
         except Exception as exc:
             pipeline_error = type(exc).__name__
