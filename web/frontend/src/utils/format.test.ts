@@ -37,7 +37,7 @@ const EXP: Record<string, unknown[]> = {
   formatAccountStat: [0, "—", "…", "—", 0, 0, "", 123, "42", "—"],
   formatFilterSummary: ["未找到匹配活动", "共 <strong class=\"filter-summary-count\">100</strong> 条 · 第 2/5 页", "未找到匹配活动"],
   formatHeat: ["0", "—", "1.5万", "9999", "0", "2.0万", "—", "0", "0"],
-  formatLotteryTime: ["—", "—", "—", "—", "2026-09-06 13:30", "—", "—", "—"],
+  formatLotteryTime: ["无开奖日期", "无开奖日期", "无开奖日期", "无开奖日期", "2026-09-06 13:30", "无开奖日期", "无开奖日期", "无开奖日期"],
 };
 
 describe("format equivalence (baseline snapshot)", () => {

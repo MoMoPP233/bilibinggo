@@ -1,19 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-from src.lottery_time import SIX_MONTHS_SECONDS, resolve_effective_lottery_time_unix
-from src.participation_store import ParticipationRecord
+from src.lottery_time import resolve_effective_lottery_time_unix
 
 
-def test_resolve_effective_lottery_time_uses_participation(tmp_path: Path) -> None:
-    participate_at = 1_600_000_000
-    item = {"dynamic_id": "1", "enriched_at": participate_at, "conditions": {}}
-    participation = ParticipationRecord(
-        dynamic_id="1",
-        user_status="已参加",
-        updated_at=participate_at,
-    )
-    inferred = resolve_effective_lottery_time_unix(item, participation, persist=True)
-    assert inferred == participate_at + SIX_MONTHS_SECONDS
-    assert item["lottery_time_inferred"] is True
+def test_resolve_effective_lottery_time_does_not_infer_missing_value() -> None:
+    item = {"dynamic_id": "1", "enriched_at": 1_600_000_000, "conditions": {}}
+    assert resolve_effective_lottery_time_unix(item, persist=True) is None
+    assert "lottery_time" not in item

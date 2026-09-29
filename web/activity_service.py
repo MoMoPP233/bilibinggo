@@ -9,7 +9,12 @@ from src.db.snapshots import load_ds_check_dict, load_watch_sync_dict
 from src.db.uids import participation_uid
 from src.draw_reminder import matches_draw_window_filter
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
-from src.lottery_time import format_timestamp, is_activity_past_end, lottery_time_text
+from src.lottery_time import (
+    format_timestamp,
+    is_activity_past_end,
+    lottery_time_text,
+    reliable_lottery_time_unix,
+)
 from src.participation_log import (
     TRIPLE_LOCAL_FAILURE_BACKOFF_SECONDS,
     load_action_entries_for_uid,
@@ -147,9 +152,13 @@ def _sort_key(item: dict, *, sort: str, order: str) -> tuple:
     draw_rank = {"active": 0, "ended": 1}
     activity_status = str(item.get("activity_status") or "")
     draw_status = str(item.get("draw_status") or "")
+    reliable_time = item.get("_reliable_lottery_time")
+    has_reliable_time = reliable_time is not None
     return (
         status_rank.get(activity_status, 9),
         draw_rank.get(draw_status, 9),
+        0 if has_reliable_time else 1,
+        int(reliable_time or 0),
         str(item.get("dynamic_id") or ""),
     )
 
@@ -197,7 +206,8 @@ def _normalize_activity(
         "repost_count": repost_count,
         "repost_fetched": repost_fetched,
         "heat_missing": heat_missing,
-        "lottery_time": lottery_time_text(item) or "—",
+        "lottery_time": lottery_time_text(item) or None,
+        "_reliable_lottery_time": reliable_lottery_time_unix(item),
         "check_at_recommended": False,
         "skipped": bool(item.get("skipped")),
         "skip_reason": str(item.get("skip_reason") or ""),
@@ -391,6 +401,8 @@ def _filtered_activity_rows(
     if sort_mode not in ("heat", "default"):
         sort_mode = "default"
     normalized.sort(key=lambda item: _sort_key(item, sort=sort_mode, order=sort_order))
+    for item in normalized:
+        item.pop("_reliable_lottery_time", None)
     return normalized
 
 

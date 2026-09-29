@@ -19,7 +19,7 @@ from src.lottery_api import (
 )
 from src.participation_errors import ParticipationReadError
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
-from src.lottery_time import lottery_time_unix
+from src.lottery_time import reliable_lottery_time_unix
 from src.participation_store import ParticipationRecord, get_participation, load_participations
 from src.sources.common import is_valid_dynamic_id, load_previous_output
 from src.status_refresh import persist_activity_record
@@ -135,12 +135,12 @@ def _sync_live_fields(
             notice, _, _ = resolved
             _apply_notice_fields(item, notice)
         else:
-            lottery_ts = lottery_time_unix(item)
+            lottery_ts = reliable_lottery_time_unix(item)
             item["draw_status"] = "ended" if lottery_ts and lottery_ts <= int(time.time()) else "active"
         return
 
     if lottery_type == "转发抽奖":
-        lottery_ts = lottery_time_unix(item)
+        lottery_ts = reliable_lottery_time_unix(item)
         item["draw_status"] = "ended" if lottery_ts and lottery_ts <= int(time.time()) else "active"
         return
 

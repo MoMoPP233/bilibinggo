@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 from src.lottery_enricher import EnrichedActivity, PrizeTier, _apply_default_lottery_time
-from src.lottery_time import SIX_MONTHS_SECONDS, default_lottery_time_from_now
-
-
-def test_default_lottery_time_from_now() -> None:
-    now = 1_000_000
-    assert default_lottery_time_from_now(now=now) == now + SIX_MONTHS_SECONDS
+from src.lottery_time import is_lottery_time_inferred
 
 
 def test_apply_default_lottery_time_on_missing() -> None:
@@ -27,6 +22,7 @@ def test_apply_default_lottery_time_on_missing() -> None:
         repost_fetched=True,
     )
     updated = _apply_default_lottery_time(activity)
-    assert updated.lottery_time == default_lottery_time_from_now()
+    assert updated.lottery_time is None
     assert updated.conditions.get("lottery_time_inferred") is True
-    assert updated.conditions.get("lottery_time_text")
+    assert is_lottery_time_inferred(updated.to_dict()) is True
+    assert "lottery_time_text" not in updated.conditions

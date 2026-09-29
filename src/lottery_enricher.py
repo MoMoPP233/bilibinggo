@@ -22,8 +22,6 @@ from src.lottery_classifier import LotteryType, UPOWER_BUSINESS_TYPE
 from src.lottery_time import (
     BEIJING_TZ,
     LOTTERY_TIME_DISPLAY_FMT,
-    default_lottery_time_from_now,
-    format_timestamp,
     is_standard_lottery_time_display,
     migrate_lottery_time_fields,
 )
@@ -57,7 +55,7 @@ def is_enrich_detail_skip_error(exc: BaseException) -> bool:
     return False
 
 
-def _lottery_time_from_llm_parse(parsed: dict) -> tuple[int, dict[str, int | bool | str]]:
+def _lottery_time_from_llm_parse(parsed: dict) -> tuple[int | None, dict[str, int | bool | str]]:
     """转发抽奖：只接受 LLM 的 YYYY-MM-DD HH:mm（北京时间），再转为 Unix 入库。"""
     conditions: dict[str, int | bool | str] = {}
     display = str(parsed.get("lottery_time") or "").strip()
@@ -70,10 +68,8 @@ def _lottery_time_from_llm_parse(parsed: dict) -> tuple[int, dict[str, int | boo
         )
         return unix, conditions
 
-    inferred = default_lottery_time_from_now()
     conditions["lottery_time_inferred"] = True
-    conditions["lottery_time_text"] = format_timestamp(inferred)
-    return inferred, conditions
+    return None, conditions
 
 
 @dataclass
@@ -148,11 +144,10 @@ def normalize_enriched_lottery_time(activity: EnrichedActivity) -> EnrichedActiv
 def _apply_default_lottery_time(activity: EnrichedActivity) -> EnrichedActivity:
     if activity.lottery_time:
         return activity
-    inferred_ts = default_lottery_time_from_now()
     conditions = dict(activity.conditions)
-    conditions["lottery_time_text"] = format_timestamp(inferred_ts)
     conditions["lottery_time_inferred"] = True
-    return replace(activity, lottery_time=inferred_ts, conditions=conditions)
+    conditions.pop("lottery_time_text", None)
+    return replace(activity, lottery_time=None, conditions=conditions)
 
 
 def _validate_enriched(activity: EnrichedActivity) -> EnrichedActivity:
@@ -250,7 +245,10 @@ def _parse_winners(notice: dict) -> dict[str, list[WinnerEntry]] | None:
 
 def _resolve_draw_status(notice: dict) -> DrawStatus:
     status = int(notice.get("status") or 0)
-    lottery_time = int(notice.get("lottery_time") or 0)
+    try:
+        lottery_time = int(notice.get("lottery_time") or 0)
+    except (TypeError, ValueError):
+        lottery_time = 0
     if status != 0 or notice.get("lottery_result"):
         return "ended"
     if lottery_time and lottery_time <= int(time.time()):
@@ -277,6 +275,10 @@ def _build_from_notice(
     reserve_reserved: bool | None = None,
     participation: ParticipationRecord | None = None,
 ) -> EnrichedActivity:
+    try:
+        notice_lottery_time = int(notice.get("lottery_time") or 0) or None
+    except (TypeError, ValueError):
+        notice_lottery_time = None
     activity = EnrichedActivity(
         dynamic_id=dynamic_id,
         source_url=opus_link(dynamic_id),
@@ -285,7 +287,7 @@ def _build_from_notice(
         business_id=business_id,
         business_type=business_type,
         draw_status=_resolve_draw_status(notice),
-        lottery_time=int(notice.get("lottery_time") or 0) or None,
+        lottery_time=notice_lottery_time,
         prizes=_parse_prizes(notice),
         participants=int(notice.get("participants") or 0),
         conditions=_build_conditions(notice),
@@ -353,7 +355,7 @@ def enrich_forward_activity(
         business_id=dynamic_id,
         business_type=0,
         draw_status=draw_status,
-        lottery_time=int(lottery_ts),
+        lottery_time=lottery_ts,
         prizes=prizes,
         participants=0,
         conditions=conditions,

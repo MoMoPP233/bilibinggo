@@ -17,7 +17,7 @@ from src.activity_store import (
 from src.draw_reminder import classify_participated_draw
 from src.fetch_activity_info import ENRICHED_OUTPUT_PATH
 from src.lottery_classifier import PARTICIPATABLE_TYPES, is_charging_lottery_activity
-from src.lottery_time import infer_and_persist_lottery_time, lottery_time_unix
+from src.lottery_time import infer_and_persist_lottery_time, reliable_lottery_time_unix
 from src.participation_store import ParticipationRecord, load_participations
 
 DrawTag = str  # "" | "即将开奖"
@@ -44,7 +44,7 @@ def _classify_activity(
     *,
     now: int,
 ) -> tuple[str, DrawTag, DrawStatus] | None:
-    effective_ts = lottery_time_unix(item)
+    effective_ts = reliable_lottery_time_unix(item)
     if not effective_ts:
         return None
 
@@ -78,11 +78,11 @@ def _apply_classification(
     participation: ParticipationRecord | None,
     *,
     now: int,
-) -> tuple[bool, bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool, bool]:
     """返回 (是否处理, 是否有字段变更, 是否新标记结束, 是否标记即将开奖)。"""
     classified = _classify_activity(item, participation, now=now)
     if classified is None:
-        return False, False, False, False
+        return False, False, False, False, False
 
     activity_status, draw_tag, draw_status = classified
     prev_status = str(item.get("activity_status") or "")
@@ -203,7 +203,7 @@ def refresh_local_activity_statuses(*, path: Path | None = None) -> dict[str, An
 
 
 def backfill_missing_lottery_times(*, path: Path | None = None) -> dict[str, Any]:
-    """为本地缺失开奖时间的活动补全推断时间（参奖后半年）。"""
+    """Compatibility endpoint; missing draw dates remain unknown."""
     _ = path
     with activity_file_lock():
         activities = load_activities()

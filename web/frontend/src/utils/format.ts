@@ -218,7 +218,7 @@ export function formatHeat(item: { heat_missing?: unknown; repost_count?: unknow
 
 export function formatLotteryTime(value: unknown): string {
   const text = String(value || "").trim();
-  if (!text || text === "—") return "—";
+  if (!text || text === "—") return "无开奖日期";
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(text)) return text;
-  return "—";
+  return "无开奖日期";
 }
