@@ -15,12 +15,14 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal
 
 from src.app_logging import get_logger
 from src.platform_risk import risk_code_of
+from src.profile_writer_lease import _ProfileWriterLease
 from src.restart_control import restart_control
 from web.auto_config import (
     ACTION_LABELS,
@@ -75,6 +77,8 @@ _LEGACY_CLEANUP_RESUME_KEYS = frozenset(
     {"cleanup_budget_resume", "cleanup_budget_resume_claim"}
 )
 _slot_state_lock = threading.Lock()
+_SLOT_STATE_LOCK_FILE = "scheduler_slots.lock"
+_SLOT_STATE_LOCK_WAIT_SECONDS = 5.0
 
 
 class SlotStateError(RuntimeError):
@@ -88,6 +92,28 @@ def _slot_state_path() -> Any:
     from src.data_paths import get_profile_dir
 
     return get_profile_dir() / _SLOT_STATE_FILE
+
+
+@contextmanager
+def _slot_state_process_lock(path: Any):
+    """持有 Profile-local OS 锁，仅覆盖 slot 状态的短暂 RMW 临界区。
+
+    复用 ProfileWriterLease 的跨平台 msvcrt/fcntl 原语，但不取得业务
+    ProfileWriterLease；锁文件独立于 ``binggo.writer.lock``，因此不会改变
+    任何 JobRunner 的写入互斥语义。
+    """
+    lock_path = path.parent / _SLOT_STATE_LOCK_FILE
+    lease = _ProfileWriterLease(lock_path, owner="scheduler-slot-state")
+    deadline = time.monotonic() + _SLOT_STATE_LOCK_WAIT_SECONDS
+    while not lease.acquire():
+        if time.monotonic() >= deadline:
+            raise SlotStateError("调度槽位跨进程锁获取失败，已停止自动远程任务")
+        # 等待发生在锁尚未取得时；持锁临界区本身不包含 sleep 或远程工作。
+        time.sleep(0.01)
+    try:
+        yield
+    finally:
+        lease.release()
 
 
 def _read_slot_state(path: Any) -> dict[str, str]:
@@ -141,25 +167,26 @@ def _persist_slot_claimed(task: str, slot: str) -> bool:
     """
     path = _slot_state_path()
     with _slot_state_lock:
-        state = _read_slot_state(path)
-        if state.get(task) == slot:
-            return False
-        state[task] = slot
-        if len(state) > _SLOT_STATE_MAX_TASKS:
-            # 有界：只保留最近消费的少量 task；key 天然含 task 身份，不会错判当前 slot。
-            for key in sorted(state):
-                if key in {
-                    _TRIPLE_NEXT_RUN,
-                    *_LEGACY_CLEANUP_RESUME_KEYS,
-                }:
-                    continue
-                del state[key]
-                if len(state) <= _SLOT_STATE_MAX_TASKS:
-                    break
-        try:
-            _write_slot_state_atomic(path, state)
-        except OSError as exc:
-            raise SlotStateError(f'调度槽位状态写入失败：{exc}') from exc
+        with _slot_state_process_lock(path):
+            state = _read_slot_state(path)
+            if state.get(task) == slot:
+                return False
+            state[task] = slot
+            if len(state) > _SLOT_STATE_MAX_TASKS:
+                # 有界：只保留最近消费的少量 task；key 天然含 task 身份，不会错判当前 slot。
+                for key in sorted(state):
+                    if key in {
+                        _TRIPLE_NEXT_RUN,
+                        *_LEGACY_CLEANUP_RESUME_KEYS,
+                    }:
+                        continue
+                    del state[key]
+                    if len(state) <= _SLOT_STATE_MAX_TASKS:
+                        break
+            try:
+                _write_slot_state_atomic(path, state)
+            except OSError as exc:
+                raise SlotStateError(f'调度槽位状态写入失败：{exc}') from exc
     return True
 
 
@@ -167,10 +194,11 @@ def _reset_slot_state_for_tests() -> None:
     """仅测试用：清除 slot 状态文件，避免跨用例污染。"""
     with _slot_state_lock:
         path = _slot_state_path()
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        with _slot_state_process_lock(path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def _log_slot_skip(scheduler: "AutoScheduler", task: str, slot: str) -> None:
@@ -778,17 +806,18 @@ class AutoScheduler:
                 return
             with _slot_state_lock:
                 path = _slot_state_path()
-                state = _read_slot_state(path)
-                if state.get(_TRIPLE_NEXT_RUN) != expected:
-                    return
-                delay = self._delay_sampler(TRIPLE_DELAY_MIN_SECONDS, TRIPLE_DELAY_MAX_SECONDS)
-                if type(delay) is not int or not TRIPLE_DELAY_MIN_SECONDS <= delay <= TRIPLE_DELAY_MAX_SECONDS:
-                    raise SlotStateError("自动参与随机等待时间必须在 240～420 秒之间")
-                state[_TRIPLE_NEXT_RUN] = (now + timedelta(seconds=delay)).isoformat()
-                try:
-                    _write_slot_state_atomic(path, state)
-                except OSError as exc:
-                    raise SlotStateError(f"自动参与 next_run 写入失败：{exc}") from exc
+                with _slot_state_process_lock(path):
+                    state = _read_slot_state(path)
+                    if state.get(_TRIPLE_NEXT_RUN) != expected:
+                        return
+                    delay = self._delay_sampler(TRIPLE_DELAY_MIN_SECONDS, TRIPLE_DELAY_MAX_SECONDS)
+                    if type(delay) is not int or not TRIPLE_DELAY_MIN_SECONDS <= delay <= TRIPLE_DELAY_MAX_SECONDS:
+                        raise SlotStateError("自动参与随机等待时间必须在 240～420 秒之间")
+                    state[_TRIPLE_NEXT_RUN] = (now + timedelta(seconds=delay)).isoformat()
+                    try:
+                        _write_slot_state_atomic(path, state)
+                    except OSError as exc:
+                        raise SlotStateError(f"自动参与 next_run 写入失败：{exc}") from exc
 
     def _tick_triple(self, now: datetime) -> None:
         """仅执行已保存计划的到期分钟；错过/已消费只规划未来，绝不补跑。
