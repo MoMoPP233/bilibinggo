@@ -10,9 +10,9 @@ TRIPLE_DELAY_MIN_SECONDS = 240
 TRIPLE_DELAY_MAX_SECONDS = 420
 # Legacy compatibility value for old API consumers. Cleanup has no scheduler cadence.
 CLEANUP_MAINTAIN_INTERVAL_HOURS = 24
-# 中奖深检：沿用 CN_TZ，每天 23:55 一次。
-WINNER_SCAN_HOURS = frozenset({23})
-WINNER_SCAN_MINUTE = 55
+# 中奖深检：沿用 CN_TZ，每天 12:10、22:10 两次。
+WINNER_SCAN_HOURS = frozenset({12, 22})
+WINNER_SCAN_MINUTE = 10
 ALLOWED_CLICK_ACTIONS = frozenset(
     {
         "refresh_all",

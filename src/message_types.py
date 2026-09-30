@@ -63,6 +63,8 @@ class DmSession:
     last_text: str
     is_follow: bool
     system_msg_type: int
+    session_type: int = 1
+    session_ts: int = 0
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

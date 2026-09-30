@@ -333,7 +333,7 @@ def test_next_auto_task_participate_after_refresh_hour() -> None:
     assert task["minutes"] == 5
 
 
-def test_next_auto_task_winner_uses_real_2355_slot() -> None:
-    task = next_auto_task(_cn(datetime(2026, 7, 17, 23, 53)))
+def test_next_auto_task_winner_uses_twice_daily_slot() -> None:
+    task = next_auto_task(_cn(datetime(2026, 7, 17, 12, 8)))
     assert task["label"] == "中奖深探"
     assert task["minutes"] == 2

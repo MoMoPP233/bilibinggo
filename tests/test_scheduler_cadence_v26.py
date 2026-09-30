@@ -1,7 +1,7 @@
 """V26 Scheduler Cadence 专项（fake clock / mock，零真实网络/通知/mutation）。
 
 V38 更新参与/中奖预期；保留 V26 其余 cadence 与全部安全回归。
-CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 1。
+CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 2。
 CASE 5    Triple 不再枚举固定 cron slot。
 CASE 6-9  精确时间（refresh/Following/Winner）。
 CASE 10-11 Triple 仅展示已保存计划；固定任务分钟仍优先。
@@ -63,7 +63,7 @@ def test_case1_4_24h_counts() -> None:
     counts = Counter(kind for kind, _label, _due in _day_candidates())
     assert counts["refresh"] == 4
     assert counts["following"] == 4
-    assert counts["winner"] == 1
+    assert counts["winner"] == 2
     assert counts["cleanup"] == 0
 
 
@@ -86,8 +86,8 @@ def test_case7_following_exact_times() -> None:
     assert _times(_day_candidates(), "following") == ["01:03", "07:03", "13:03", "19:03"]
 
 
-def test_case8_winner_keeps_exact_times() -> None:
-    assert _times(_day_candidates(), "winner") == ["23:55"]
+def test_case8_winner_uses_twice_daily_times() -> None:
+    assert _times(_day_candidates(), "winner") == ["12:10", "22:10"]
 
 
 def test_case9_cleanup_is_manual_only() -> None:

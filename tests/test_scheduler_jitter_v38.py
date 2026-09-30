@@ -381,7 +381,7 @@ def test_risk_cooldown_blocks_due_plan(code):
     scheduler._click_and_wait.assert_not_called()
 
 
-@pytest.mark.parametrize("hour, minute", [(0, 0), (6, 0), (1, 3), (7, 3), (23, 55)])
+@pytest.mark.parametrize("hour, minute", [(0, 0), (6, 0), (1, 3), (7, 3), (12, 10), (22, 10)])
 def test_random_plan_yields_to_all_fixed_task_minutes(hour, minute):
     clock = Clock()
     clock.now = clock.now.replace(hour=hour, minute=minute)
@@ -400,7 +400,7 @@ def test_other_schedules_snapshot_unchanged():
     assert snapshot == {
         "refresh": ["00:00", "06:00", "12:00", "18:00"],
         "following": ["01:03", "07:03", "13:03", "19:03"],
-        "winner": ["23:55"],
+        "winner": ["12:10", "22:10"],
     }
     assert [s["action"] for s in sch.REFRESH_STEPS] == ["refresh_all", "refresh_watch", "refresh_status"]
     from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS
@@ -414,9 +414,9 @@ def run_one_loop_tick(scheduler, clock):
     scheduler._loop(0, stop)
 
 
-def test_winner_actual_loop_once_daily_and_restart():
+def test_winner_actual_loop_twice_daily_and_restart():
     clock = Clock()
-    clock.now = clock.now.replace(hour=23, minute=54)
+    clock.now = clock.now.replace(hour=12, minute=9)
     scheduler = make(clock)
     run_one_loop_tick(scheduler, clock)
     scheduler._click_and_wait.assert_not_called()
@@ -425,11 +425,11 @@ def test_winner_actual_loop_once_daily_and_restart():
     run_one_loop_tick(scheduler, clock)
     scheduler._click_and_wait.assert_called_once_with("winner_deep_scan")
     for offset in [0, 1]:
-        clock.now = clock.now.replace(minute=55 + offset)
+        clock.now = clock.now.replace(minute=10 + offset)
         restarted = make(clock)
         run_one_loop_tick(restarted, clock)
         restarted._click_and_wait.assert_not_called()
-    clock.now = clock.now.replace(minute=55) + timedelta(days=1)
+    clock.now = clock.now.replace(hour=22, minute=10)
     next_day = make(clock)
     run_one_loop_tick(next_day, clock)
     next_day._click_and_wait.assert_called_once_with("winner_deep_scan")
@@ -437,7 +437,7 @@ def test_winner_actual_loop_once_daily_and_restart():
 
 def test_winner_missed_minute_is_not_replayed():
     clock = Clock()
-    clock.now = clock.now.replace(hour=23, minute=56)
+    clock.now = clock.now.replace(hour=12, minute=11)
     scheduler = make(clock)
     run_one_loop_tick(scheduler, clock)
     scheduler._click_and_wait.assert_not_called()

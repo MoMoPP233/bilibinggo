@@ -770,9 +770,9 @@ class AutoScheduler:
                         self._run_refresh_batch(key)
                         continue
 
-                # V38: 中奖深检每天 23:55；仍仅当前分钟触发，错过不补跑。
+                # V70: 中奖深检每天 12:10、22:10；仍仅当前分钟触发，错过不补跑。
                 if now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS:
-                    key = f"winner-{now:%Y-%m-%d-%H}"
+                    key = f"winner-{now:%Y-%m-%d-%H-%M}"
                     if key not in self._done_winner:
                         self._run_winner_scan(key)
                         continue

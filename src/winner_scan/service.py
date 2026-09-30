@@ -32,7 +32,7 @@ from typing import Any, Callable
 
 from src.bilibili_auth import require_login
 from src.data_paths import get_atomic_path_lock, get_profile_dir
-from src.message_api import fetch_dm_messages, list_dm_sessions, list_feed
+from src.message_api import fetch_dm_messages, list_dm_sessions, list_dm_sessions_page, list_feed
 from src.message_types import MessageEntry, MessageType
 from src.notification.service import NotificationLocalError, NotificationService
 from src.platform_risk import risk_code_of
@@ -44,9 +44,22 @@ _NICKNAME_CACHE_FILE = "winner_nickname_cache.json"
 _NICKNAME_CACHE_LIMIT = 500
 _NICKNAME_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_REPLY_ENTRIES = 20
-MAX_DM_SESSIONS = 20
+DM_SESSION_PAGE_SIZE = 20
+MAX_DM_SESSION_LIST_PAGES = 20
 MAX_DM_MESSAGES_PER_SESSION = 20
+MAX_FEED_PAGES = 20
+MAX_DM_PAGES_PER_SESSION = 20
 KEYWORD_LIMIT = 30
+
+
+class DmSessionListIncomplete(RuntimeError):
+    """The session list could not be fully enumerated in this run."""
+
+    def __init__(self, reason: str, *, pages_fetched: int) -> None:
+        self.reason = reason
+        self.pages_fetched = pages_fetched
+        super().__init__(f"分页未完整结束：{reason}")
+
 
 DEFAULT_KEYWORDS = [
     "~预约成功|预约主题|预约已成功",
@@ -331,9 +344,35 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _default_sources_state() -> dict[str, Any]:
     return {
-        "mention": {"cursor_id": 0, "cursor_time": 0, "last_success_at": None, "last_error": "", "last_scan_at": None},
-        "reply": {"cursor_id": 0, "cursor_time": 0, "last_success_at": None, "last_error": "", "last_scan_at": None},
-        "dm": {"last_success_at": None, "last_error": "", "last_scan_at": None},
+        "mention": {
+            "cursor_id": 0,
+            "cursor_time": 0,
+            "last_success_at": None,
+            "last_error": "",
+            "last_scan_at": None,
+            "last_pages_fetched": 0,
+            "last_stop_reason": "",
+            "last_catch_up_complete": None,
+        },
+        "reply": {
+            "cursor_id": 0,
+            "cursor_time": 0,
+            "last_success_at": None,
+            "last_error": "",
+            "last_scan_at": None,
+            "last_pages_fetched": 0,
+            "last_stop_reason": "",
+            "last_catch_up_complete": None,
+        },
+        "dm": {
+            "last_success_at": None,
+            "last_error": "",
+            "last_scan_at": None,
+            "last_pages_fetched": 0,
+            "last_stop_reason": "",
+            "last_catch_up_complete": None,
+            "session_checkpoints": {},
+        },
     }
 
 
@@ -748,6 +787,214 @@ class WinnerScanService:
 
     # -- 单来源实现（各自独立成功/失败与推进） --
 
+    @staticmethod
+    def _cursor_tuple(cursor: dict[str, Any] | None) -> tuple[int, int] | None:
+        if not isinstance(cursor, dict):
+            return None
+        try:
+            cursor_id = int(cursor.get("id") or 0)
+            cursor_time = int(cursor.get("time") or 0)
+        except (TypeError, ValueError):
+            return None
+        if cursor_id <= 0 and cursor_time <= 0:
+            return None
+        return cursor_id, cursor_time
+
+    def _fetch_feed_window(
+        self,
+        client: Any,
+        msg_type: MessageType,
+        *,
+        state: dict[str, Any],
+    ) -> tuple[list[MessageEntry], dict[str, Any], dict[str, Any]]:
+        """从最新页开始，在本次 run 内追到旧 feed cursor。
+
+        ``list_feed`` 的 response cursor 是该 endpoint 已验证的历史翻页
+        契约；持久化 cursor 只用于判断历史边界，不作为下一轮的请求起点。
+        """
+        old_cursor = self._cursor_tuple(
+            {"id": state.get("cursor_id"), "time": state.get("cursor_time")}
+        )
+        first_run = not state.get("last_success_at") and old_cursor is None
+        entries: list[MessageEntry] = []
+        seen_keys: set[str] = set()
+        seen_cursors: set[tuple[int, int]] = set()
+        request_cursor = (0, 0)
+        pages_fetched = 0
+        stop_reason = ""
+        complete = False
+        latest_cursor: dict[str, Any] = {}
+
+        for page_no in range(1, MAX_FEED_PAGES + 1):
+            if request_cursor == (0, 0):
+                page_entries, cursor = list_feed(client, msg_type)
+            else:
+                page_entries, cursor = list_feed(
+                    client,
+                    msg_type,
+                    cursor_id=request_cursor[0],
+                    cursor_time=request_cursor[1],
+                )
+            pages_fetched = page_no
+            latest_cursor = dict(cursor or {})
+            for entry in page_entries:
+                key = _source_entry_key(
+                    "mention" if msg_type is MessageType.AT else "reply", entry
+                )
+                # Malformed entries are retained once so existing fail-closed
+                # accounting can explain them, while valid duplicates are removed.
+                dedupe_key = key or f"malformed:{entry.id}:{entry.timestamp}:{len(entries)}"
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                entries.append(entry)
+
+            cursor_pair = self._cursor_tuple(cursor)
+            is_end = cursor.get("is_end") if isinstance(cursor, dict) else None
+            if is_end is True:
+                stop_reason = "api_history_end"
+                complete = True
+                break
+            if "is_end" not in (cursor or {}):
+                # Legacy/offline providers without the explicit signal are
+                # treated as one-page windows; no cursor is guessed.
+                stop_reason = "legacy_single_page"
+                complete = True
+                break
+            if is_end is not False or cursor_pair is None:
+                stop_reason = "invalid_cursor"
+                break
+            if old_cursor is not None and cursor_pair == old_cursor:
+                stop_reason = "checkpoint_reached"
+                complete = True
+                break
+            if cursor_pair in seen_cursors:
+                stop_reason = "pagination_loop"
+                break
+            if first_run and page_no == 1:
+                stop_reason = "first_run_baseline"
+                complete = True
+                break
+            seen_cursors.add(cursor_pair)
+            request_cursor = cursor_pair
+        else:
+            stop_reason = "hard_cap_reached"
+
+        if not complete:
+            raise RuntimeError(
+                f"{msg_type.label} 分页未完整结束：{stop_reason or 'incomplete'}"
+            )
+        return entries, latest_cursor, {
+            "pages_fetched": pages_fetched,
+            "stop_reason": stop_reason,
+            "catch_up_complete": True,
+        }
+
+    @staticmethod
+    def _dm_seqno(entry: MessageEntry) -> int:
+        raw = entry.raw or {}
+        value = raw.get("msg_seqno") or entry.id
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _fetch_dm_session_window(
+        self,
+        client: Any,
+        session: Any,
+        *,
+        old_checkpoint: int,
+        first_run: bool,
+    ) -> tuple[list[MessageEntry], int, dict[str, Any]]:
+        """Fetch one unread session newest-first using ``end_seqno`` locally."""
+        requested = min(max(1, int(getattr(session, "unread_count", 0) or 0)), MAX_DM_MESSAGES_PER_SESSION)
+        entries: list[MessageEntry] = []
+        seen_keys: set[str] = set()
+        seen_cursors: set[int] = set()
+        end_seqno = 0
+        pages = 0
+        stop_reason = ""
+        complete = False
+        boundary_seqno = old_checkpoint
+        for page_no in range(1, MAX_DM_PAGES_PER_SESSION + 1):
+            page = fetch_dm_messages(
+                client,
+                int(session.talker_id),
+                session_type=1,
+                size=requested,
+                end_seqno=end_seqno,
+            )
+            pages = page_no
+            page_seqnos: list[int] = []
+            hit_boundary = False
+            page_ordered_desc = all(
+                left >= right
+                for left, right in zip(
+                    [self._dm_seqno(item) for item in page],
+                    [self._dm_seqno(item) for item in page][1:],
+                )
+                if left > 0 and right > 0
+            )
+            for entry in page:
+                seqno = self._dm_seqno(entry)
+                key = _source_entry_key("dm", entry) or f"malformed:{entry.id}:{entry.timestamp}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if old_checkpoint and seqno == old_checkpoint:
+                    hit_boundary = True
+                    boundary_seqno = old_checkpoint
+                    if page_ordered_desc:
+                        break
+                    # Legacy fixtures and providers without strict ordering
+                    # still get all non-boundary messages from this page.
+                    continue
+                entries.append(entry)
+                if seqno > 0:
+                    page_seqnos.append(seqno)
+            if hit_boundary:
+                stop_reason = "checkpoint_reached"
+                complete = True
+                break
+            if first_run and page_no == 1:
+                stop_reason = "first_run_baseline"
+                complete = True
+                break
+            if not page:
+                stop_reason = "api_history_end"
+                complete = True
+                break
+            # A short page is the only endpoint-level end signal available for
+            # this legacy session API.  The existing unread-count bound makes
+            # the first page complete when it is <= the requested size.
+            if len(page) < requested or int(getattr(session, "unread_count", 0) or 0) <= requested:
+                stop_reason = "api_history_end"
+                complete = True
+                break
+            next_seqno = min(page_seqnos or [self._dm_seqno(item) for item in page if self._dm_seqno(item) > 0], default=0)
+            if next_seqno <= 0 or next_seqno in seen_cursors:
+                stop_reason = "pagination_loop"
+                break
+            seen_cursors.add(next_seqno)
+            # The endpoint accepts the previous page's oldest msg_seqno as
+            # its end cursor; overlap is intentional and removed by key.
+            end_seqno = next_seqno
+        else:
+            stop_reason = "hard_cap_reached"
+        if not complete:
+            raise RuntimeError(
+                f"私信会话 {int(session.talker_id)} 分页未完整结束：{stop_reason or 'incomplete'}"
+            )
+        if boundary_seqno <= 0:
+            observed = [self._dm_seqno(item) for item in entries if self._dm_seqno(item) > 0]
+            boundary_seqno = min(observed) if observed else 0
+        return entries, boundary_seqno, {
+            "pages_fetched": pages,
+            "stop_reason": stop_reason,
+            "catch_up_complete": True,
+        }
+
     def _scan_feed_source(
         self,
         source_type: str,
@@ -761,7 +1008,7 @@ class WinnerScanService:
         found_keys: list[str] = []
         newly_saved = 0
         suppressed_keys = suppressed if suppressed is not None else _suppressed_candidate_keys()
-        for entry in entries[:MAX_REPLY_ENTRIES]:
+        for entry in entries:
             text = str(entry.text or entry.title or "")
             if not judge_keywords(text):
                 continue
@@ -819,13 +1066,36 @@ class WinnerScanService:
         *,
         state: dict[str, Any],
         existing: dict[str, dict[str, Any]],
-    ) -> tuple[int, list[str], int]:
-        """返回 (newly_saved, found_keys, auto_reply_skipped)。
+    ) -> tuple[int, list[str], int, dict[str, Any]]:
+        """返回 (newly_saved, found_keys, auto_reply_skipped, pagination)。
 
         过滤只发生在 candidate/dispatch 之前；被过滤的消息不落 candidate、不通知。
         同一 stable key 已记录过滤后不再重复计数（V25 去噪）。
         """
-        sessions = list_dm_sessions(client, size=MAX_DM_SESSIONS)
+        sessions, session_pagination = self._collect_dm_sessions(client)
+        dm_state = state["dm"]
+        checkpoints = dm_state.get("session_checkpoints")
+        if not isinstance(checkpoints, dict):
+            checkpoints = {}
+        first_run = not dm_state.get("last_success_at") and not checkpoints
+        session_windows: list[tuple[Any, list[MessageEntry], int, dict[str, Any]]] = []
+        total_pages = int(session_pagination["session_pages_fetched"])
+        for session in sessions:
+            if session.unread_count <= 0:
+                continue
+            talker_key = str(int(session.talker_id))
+            try:
+                old_checkpoint = int(checkpoints.get(talker_key) or 0)
+            except (TypeError, ValueError):
+                old_checkpoint = 0
+            messages, boundary_seqno, pagination = self._fetch_dm_session_window(
+                client,
+                session,
+                old_checkpoint=old_checkpoint,
+                first_run=first_run,
+            )
+            total_pages += max(0, int(pagination.get("pages_fetched") or 0) - 1)
+            session_windows.append((session, messages, boundary_seqno, pagination))
         filtered = {
             str(item)
             for item in (state.get("filtered_auto_replies") or [])
@@ -839,15 +1109,9 @@ class WinnerScanService:
         nickname_cache = _load_nickname_cache()
         nickname_attempted: set[int] = set()
         nickname_lookup_blocked = [False]
-        for session in sessions:
-            if session.unread_count <= 0:
-                continue
-            messages = fetch_dm_messages(
-                client,
-                session.talker_id,
-                session_type=1,
-                size=min(max(1, session.unread_count), MAX_DM_MESSAGES_PER_SESSION),
-            )
+        new_checkpoints: dict[str, int] = dict(checkpoints)
+        for session, messages, boundary_seqno, _pagination in session_windows:
+            new_checkpoints[str(int(session.talker_id))] = boundary_seqno
             for entry in messages:
                 if entry.msg_type != MessageType.DM:
                     continue
@@ -907,7 +1171,85 @@ class WinnerScanService:
                 seen.add(value)
                 merged.append(value)
             state["filtered_auto_replies"] = merged[-_FILTERED_AUTO_REPLIES_LIMIT:]
-        return newly_saved, found_keys, auto_reply_skipped
+        return newly_saved, found_keys, auto_reply_skipped, {
+            "pages_fetched": total_pages,
+            "stop_reason": "session_windows_complete",
+            "catch_up_complete": True,
+            "session_pages_fetched": int(session_pagination["session_pages_fetched"]),
+            "sessions_collected": len(sessions),
+            "session_checkpoints": new_checkpoints,
+        }
+
+    def _collect_dm_sessions(self, client: Any) -> tuple[list[Any], dict[str, Any]]:
+        """Collect and deduplicate the complete session list before message GETs."""
+        try:
+            first_page = list_dm_sessions(client, size=DM_SESSION_PAGE_SIZE)
+        except Exception as exc:
+            if risk_code_of(exc) is not None:
+                raise
+            raise DmSessionListIncomplete("provider_failure", pages_fetched=0) from exc
+
+        page_sessions = list(first_page)
+        all_sessions = list(page_sessions)
+        has_more = bool(getattr(first_page, "has_more", False))
+        page_last_session_ts = int(getattr(first_page, "last_session_ts", 0) or 0)
+        pages_fetched = 1
+        seen_end_ts: set[int] = set()
+
+        while has_more:
+            if pages_fetched >= MAX_DM_SESSION_LIST_PAGES:
+                raise DmSessionListIncomplete("hard_cap_reached", pages_fetched=pages_fetched)
+            if not page_sessions:
+                raise DmSessionListIncomplete("missing_next_end_ts", pages_fetched=pages_fetched)
+
+            next_end_ts = page_last_session_ts or int(
+                getattr(page_sessions[-1], "session_ts", 0) or 0
+            )
+            if next_end_ts <= 0:
+                raise DmSessionListIncomplete("missing_next_end_ts", pages_fetched=pages_fetched)
+            if next_end_ts in seen_end_ts:
+                raise DmSessionListIncomplete("repeated_end_ts", pages_fetched=pages_fetched)
+            seen_end_ts.add(next_end_ts)
+
+            try:
+                next_page = list_dm_sessions_page(
+                    client,
+                    size=DM_SESSION_PAGE_SIZE,
+                    end_ts=next_end_ts,
+                )
+            except Exception as exc:
+                if risk_code_of(exc) is not None:
+                    raise
+                raise DmSessionListIncomplete(
+                    "provider_failure", pages_fetched=pages_fetched
+                ) from exc
+
+            pages_fetched += 1
+            page_sessions = list(next_page)
+            all_sessions.extend(page_sessions)
+            has_more = bool(getattr(next_page, "has_more", False))
+            page_last_session_ts = int(getattr(next_page, "last_session_ts", 0) or 0)
+
+        unique_sessions: list[Any] = []
+        seen_sessions: set[tuple[int, int]] = set()
+        for session in all_sessions:
+            raw = getattr(session, "raw", {})
+            session_type = int(
+                getattr(session, "session_type", 0)
+                or (raw.get("session_type") if isinstance(raw, dict) else 0)
+                or 1
+            )
+            talker_id = int(getattr(session, "talker_id", 0) or 0)
+            identity = (session_type, talker_id)
+            if identity in seen_sessions:
+                continue
+            seen_sessions.add(identity)
+            unique_sessions.append(session)
+
+        return unique_sessions, {
+            "session_pages_fetched": pages_fetched,
+            "session_list_complete": True,
+        }
 
     def run(
         self,
@@ -944,15 +1286,19 @@ class WinnerScanService:
             if cancel_check and cancel_check():
                 raise RuntimeError("任务已取消")
             try:
-                entries, cursor = list_feed(active_client, MessageType.AT)
+                entries, cursor, pagination = self._fetch_feed_window(
+                    active_client, MessageType.AT, state=state["mention"]
+                )
                 saved, keys = self._scan_feed_source(
                     "mention", MessageType.AT, entries, state=state["mention"], existing=existing, suppressed=suppressed
                 )
                 # 1) candidate durable；2) 通知（claim→HTTP→terminal durable）；3) 最后推进 checkpoint
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
-                self._advance_source_state(state, "mention", cursor=cursor)
-                outcomes["mention"] = {"status": "success", "found": saved, "advance": True}
+                self._advance_source_state(state, "mention", cursor=cursor, pagination=pagination)
+                outcomes["mention"] = {
+                    "status": "success", "found": saved, "advance": True, **pagination
+                }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
                     raise
@@ -964,14 +1310,18 @@ class WinnerScanService:
             if cancel_check and cancel_check():
                 raise RuntimeError("任务已取消")
             try:
-                entries, cursor = list_feed(active_client, MessageType.REPLY)
+                entries, cursor, pagination = self._fetch_feed_window(
+                    active_client, MessageType.REPLY, state=state["reply"]
+                )
                 saved, keys = self._scan_feed_source(
                     "reply", MessageType.REPLY, entries, state=state["reply"], existing=existing, suppressed=suppressed
                 )
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
-                self._advance_source_state(state, "reply", cursor=cursor)
-                outcomes["reply"] = {"status": "success", "found": saved, "advance": True}
+                self._advance_source_state(state, "reply", cursor=cursor, pagination=pagination)
+                outcomes["reply"] = {
+                    "status": "success", "found": saved, "advance": True, **pagination
+                }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
                     raise
@@ -983,17 +1333,30 @@ class WinnerScanService:
             if cancel_check and cancel_check():
                 raise RuntimeError("任务已取消")
             try:
-                saved, keys, auto_reply_skipped = self._scan_dm_source(
+                saved, keys, auto_reply_skipped, dm_pagination = self._scan_dm_source(
                     active_client, state=state, existing=existing
                 )
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
-                self._advance_source_state(state, "dm")
+                self._advance_source_state(state, "dm", pagination=dm_pagination)
                 outcomes["dm"] = {
                     "status": "success",
                     "found": saved,
                     "advance": True,
                     "auto_reply_skipped": auto_reply_skipped,
+                    **dm_pagination,
+                }
+            except DmSessionListIncomplete as exc:
+                partial = True
+                self._record_source_error(state, "dm", exc)
+                outcomes["dm"] = {
+                    "status": "incomplete",
+                    "error": _safe_error(exc),
+                    "advance": False,
+                    "auto_reply_skipped": 0,
+                    "pages_fetched": exc.pages_fetched,
+                    "catch_up_complete": False,
+                    "stop_reason": exc.reason,
                 }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
@@ -1030,12 +1393,23 @@ class WinnerScanService:
         source_type: str,
         *,
         cursor: dict[str, Any] | None = None,
+        pagination: dict[str, Any] | None = None,
     ) -> None:
         """checkpoint 推进：只在候选已落库且通知 durable state 就绪后调用。"""
         entry = state[source_type]
         entry["last_success_at"] = int(time.time())
         entry["last_scan_at"] = int(time.time())
         entry["last_error"] = ""
+        if pagination:
+            entry["last_pages_fetched"] = int(pagination.get("pages_fetched") or 0)
+            entry["last_stop_reason"] = str(pagination.get("stop_reason") or "")
+            entry["last_catch_up_complete"] = bool(pagination.get("catch_up_complete"))
+            if source_type == "dm" and isinstance(pagination.get("session_checkpoints"), dict):
+                entry["session_checkpoints"] = {
+                    str(key): int(value or 0)
+                    for key, value in pagination["session_checkpoints"].items()
+                    if str(key).isdigit() and int(value or 0) >= 0
+                }
         if cursor:
             cursor_id = str(cursor.get("id") or "0").strip()
             if cursor_id.isdigit():
@@ -1050,6 +1424,14 @@ class WinnerScanService:
         entry = state[source_type]
         entry["last_error"] = _safe_error(exc)
         entry["last_scan_at"] = int(time.time())
+        entry["last_catch_up_complete"] = False
+        message = str(exc)
+        marker = "分页未完整结束："
+        entry["last_stop_reason"] = (
+            message.split(marker, 1)[1].strip()
+            if marker in message
+            else "provider_failure"
+        )
         _save_state(state)
 
     def _dispatch_new(

@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from src.message_api import get_unread_summary, list_dm_sessions, list_feed
+from src.message_api import get_unread_summary, list_dm_sessions, list_dm_sessions_page, list_feed
 from src.message_types import (
     DmSession,
     MessageType,
@@ -245,6 +245,91 @@ def test_list_dm_sessions_preserves_nested_talker_nickname() -> None:
 
     sessions = list_dm_sessions(client)
     assert sessions[0].talker_name == "中奖好友"
+
+
+def test_list_dm_sessions_page_preserves_session_ts_and_has_more() -> None:
+    client = _FakeClient(
+        {
+            "get_sessions": {
+                "code": 0,
+                "data": {
+                    "has_more": 1,
+                    "session_list": [
+                        {
+                            "talker_id": 7,
+                            "session_type": 1,
+                            "session_ts": 1790532042031220,
+                            "unread_count": 1,
+                            "last_msg": {"timestamp": 1790532041, "content": "中奖"},
+                        }
+                    ],
+                },
+            }
+        }
+    )
+    page = list_dm_sessions_page(client, size=20, end_ts=123)
+
+    assert page.has_more is True
+    assert page[0].session_ts == 1790532042031220
+    assert page.last_session_ts == 1790532042031220
+    assert client.calls[0][1]["size"] == 20
+    assert client.calls[0][1]["end_ts"] == 123
+
+
+def test_list_dm_sessions_compatibility_wrapper_keeps_page_metadata() -> None:
+    client = _FakeClient(
+        {
+            "get_sessions": {
+                "code": 0,
+                "data": {
+                    "has_more": True,
+                    "session_list": [],
+                },
+            }
+        }
+    )
+
+    page = list_dm_sessions(client)
+
+    assert isinstance(page, list)
+    assert page.has_more is True
+    assert "end_ts" not in client.calls[0][1]
+
+
+def test_list_dm_sessions_page_cursor_uses_raw_last_item_before_filtering() -> None:
+    client = _FakeClient(
+        {
+            "get_sessions": {
+                "code": 0,
+                "data": {
+                    "has_more": 1,
+                    "session_list": [
+                        {
+                            "talker_id": 7,
+                            "session_type": 1,
+                            "session_ts": 100,
+                            "unread_count": 1,
+                            "system_msg_type": 0,
+                            "last_msg": {"timestamp": 1},
+                        },
+                        {
+                            "talker_id": 8,
+                            "session_type": 1,
+                            "session_ts": 200,
+                            "unread_count": 1,
+                            "system_msg_type": 5,
+                            "last_msg": {"timestamp": 2},
+                        },
+                    ],
+                },
+            }
+        }
+    )
+
+    page = list_dm_sessions_page(client)
+
+    assert [session.talker_id for session in page] == [7]
+    assert page.last_session_ts == 200
 
 
 def test_list_feed_reply() -> None:

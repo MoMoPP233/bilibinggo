@@ -25,6 +25,21 @@ MSGFEED_BASE_URL = "https://api.bilibili.com/x/msgfeed"
 _WEB_PARAMS = {"build": 0, "mobi_app": "web"}
 
 
+class DmSessionPage(list[DmSession]):
+    """One server page of DM sessions with its continuation flag."""
+
+    def __init__(
+        self,
+        sessions: list[DmSession],
+        *,
+        has_more: bool,
+        last_session_ts: int = 0,
+    ) -> None:
+        super().__init__(sessions)
+        self.has_more = has_more
+        self.last_session_ts = last_session_ts
+
+
 def _api_code(payload: dict[str, Any]) -> int:
     code = payload.get("code")
     if code is None:
@@ -83,8 +98,27 @@ def list_dm_sessions(
     size: int = 20,
     begin_ts: int = 0,
     include_system: bool = False,
-) -> list[DmSession]:
-    """获取私信会话列表。"""
+    end_ts: int | None = None,
+) -> DmSessionPage:
+    """获取私信会话列表，保留兼容的 list 返回值。"""
+    return list_dm_sessions_page(
+        client,
+        size=size,
+        begin_ts=begin_ts,
+        include_system=include_system,
+        end_ts=end_ts,
+    )
+
+
+def list_dm_sessions_page(
+    client: BilibiliClient,
+    *,
+    size: int = 20,
+    begin_ts: int = 0,
+    include_system: bool = False,
+    end_ts: int | None = None,
+) -> DmSessionPage:
+    """获取一页私信会话及服务端的同轮分页标记。"""
     params: dict[str, Any] = {
         **_WEB_PARAMS,
         "session_type": 4 if include_system else 1,
@@ -95,13 +129,17 @@ def list_dm_sessions(
     }
     if begin_ts:
         params["begin_ts"] = begin_ts
+    if end_ts is not None:
+        params["end_ts"] = end_ts
 
     data = _require_ok(
         client.request_json(GET_SESSIONS_URL, params=params, referer=MESSAGE_REFERER),
         action="获取私信会话",
     )
+    raw_items = [item for item in data.get("session_list") or [] if isinstance(item, dict)]
+    raw_last_session_ts = int(raw_items[-1].get("session_ts") or 0) if raw_items else 0
     sessions: list[DmSession] = []
-    for item in data.get("session_list") or []:
+    for item in raw_items:
         if not isinstance(item, dict):
             continue
         system_msg_type = int(item.get("system_msg_type") or 0)
@@ -121,10 +159,21 @@ def list_dm_sessions(
                 last_text=text or title,
                 is_follow=bool(int(item.get("is_follow") or 0)),
                 system_msg_type=system_msg_type,
+                session_type=int(item.get("session_type") or (4 if include_system else 1)),
+                session_ts=int(item.get("session_ts") or 0),
                 raw=item,
             )
         )
-    return sessions
+    raw_has_more = data.get("has_more", False)
+    if isinstance(raw_has_more, str):
+        has_more = raw_has_more.strip().lower() in {"1", "true", "yes"}
+    else:
+        has_more = bool(raw_has_more)
+    return DmSessionPage(
+        sessions,
+        has_more=has_more,
+        last_session_ts=raw_last_session_ts,
+    )
 
 
 def fetch_dm_messages(
