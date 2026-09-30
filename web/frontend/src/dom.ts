@@ -292,6 +292,10 @@ export const autoDockStartBtn = document.getElementById("auto-dock-start");
 
 export const autoDockStopBtn = document.getElementById("auto-dock-stop");
 
+export const autoNightContinue = document.getElementById("auto-night-continue") as HTMLInputElement | null;
+
+export const autoNightContinueStatus = document.getElementById("auto-night-continue-status");
+
 export const PARTICIPATE_STEP_LABELS = ["点赞", "关注", "收藏", "转发", "评论"];
 
 export const PARTICIPATE_ACTIVE_KEYWORDS = ["点赞", "关注", "收藏", "转发", "评论", "预约", "正在", "准备", "检查"];

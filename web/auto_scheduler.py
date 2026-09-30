@@ -28,17 +28,19 @@ from web.auto_config import (
     ACTION_LABELS,
     ALLOWED_CLICK_ACTIONS,
     AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
-    FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
-    FOLLOWING_FEED_SCAN_HOUR_OFFSET,
     FOLLOWING_FEED_SCAN_MINUTE,
     JOB_POLL_INTERVAL_SEC,
     JOB_POLL_TIMEOUT_SEC,
     MIN_REMOTE_STAGE_GAP_SECONDS,
+    REFRESH_SLOTS,
     REFRESH_HOURS,
     TRIPLE_DELAY_MIN_SECONDS,
     TRIPLE_DELAY_MAX_SECONDS,
     WINNER_SCAN_HOURS,
     WINNER_SCAN_MINUTE,
+    FOLLOWING_FEED_SCAN_HOURS,
+    get_night_continue_enabled,
+    is_night_quiet,
 )
 from web.auto_remote_state import (
     clear_expired_risk_pause,
@@ -262,6 +264,8 @@ class SchedulerStatus:
     server_now_unix: int = 0
     logs: list[dict[str, str]] = field(default_factory=list)
     tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    night_continue_enabled: bool = False
+    night_quiet: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -284,9 +288,13 @@ class SchedulerStatus:
             "server_now_unix": self.server_now_unix,
             "logs": list(self.logs),
             "tasks": {key: dict(value) for key, value in self.tasks.items()},
+            "night_continue_enabled": self.night_continue_enabled,
+            "night_quiet": self.night_quiet,
             "next_task": next_auto_task(),
             "schedule": {
                 "refresh_hours": sorted(REFRESH_HOURS),
+                "refresh_slots": [f"{hour:02d}:{minute:02d}" for hour, minute in REFRESH_SLOTS],
+                "following_hours": sorted(FOLLOWING_FEED_SCAN_HOURS),
                 "triple_minutes": [],  # 兼容旧状态消费者；不再有固定分钟槽。
                 "triple_delay_seconds": [TRIPLE_DELAY_MIN_SECONDS, TRIPLE_DELAY_MAX_SECONDS],
                 "actions": [
@@ -363,6 +371,7 @@ class AutoScheduler:
 
     def get_status(self) -> dict[str, Any]:
         now = datetime.now(CN_TZ)
+        night_continue_enabled = get_night_continue_enabled()
         slot = _next_slot(now)
         probe = _probe_job(self._runner)
         next_runs = _next_runs_by_task(now)
@@ -376,6 +385,8 @@ class AutoScheduler:
             self._status.job_probe = probe
             self._status.server_now = _now_iso()
             self._status.server_now_unix = int(now.timestamp())
+            self._status.night_continue_enabled = night_continue_enabled
+            self._status.night_quiet = is_night_quiet(now, config=night_continue_enabled)
             for key, task in self._status.tasks.items():
                 task["next_run_at"] = next_runs.get(key)
                 if risk_view.get("paused") and task.get("status") != "running":
@@ -603,6 +614,12 @@ class AutoScheduler:
                 resume_at=resume_at,
             )
         clear_expired_risk_pause()
+        if is_night_quiet(self._clock()):
+            return RemoteGateDecision(
+                False,
+                "night_quiet",
+                "夜间静默中（00:00～07:00）：新的自动远程任务跳过；调度器继续运行。",
+            )
         now_mono = time.monotonic()
         if (
             self._last_remote_stage_finished_mono > 0
@@ -622,7 +639,7 @@ class AutoScheduler:
 
     def _log_remote_gate_skip(self, task: str, gate: RemoteGateDecision) -> None:
         """同一 slot 只记录一次主要跳过日志。"""
-        if gate.kind in ("cooldown", "invalid_state"):
+        if gate.kind in ("cooldown", "invalid_state", "night_quiet"):
             self._log("warn", f"{gate.message}（{task}）")
         elif gate.kind == "gap":
             self._log("info", gate.message)
@@ -642,6 +659,8 @@ class AutoScheduler:
         status = (
             "skipped_by_platform_cooldown"
             if gate.kind in ("cooldown", "invalid_state")
+            else "skipped_night_quiet"
+            if gate.kind == "night_quiet"
             else "skipped_busy"
         )
         self._set_task_status(task, status, gate.message)
@@ -764,7 +783,7 @@ class AutoScheduler:
                     self._status.next_slot = slot
                     self._status.next_hint = slot.get("hint") or ""
 
-                if now.hour in REFRESH_HOURS and now.minute == 0:
+                if (now.hour, now.minute) in REFRESH_SLOTS:
                     key = f"{now:%Y-%m-%d-%H}"
                     if key not in self._done_refresh:
                         self._run_refresh_batch(key)
@@ -777,11 +796,7 @@ class AutoScheduler:
                         self._run_winner_scan(key)
                         continue
 
-                if (
-                    now.minute == FOLLOWING_FEED_SCAN_MINUTE
-                    and now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL
-                    == FOLLOWING_FEED_SCAN_HOUR_OFFSET
-                ):
+                if now.minute == FOLLOWING_FEED_SCAN_MINUTE and now.hour in FOLLOWING_FEED_SCAN_HOURS:
                     key = f"following-{now:%Y-%m-%d-%H}"
                     if key not in self._done_following:
                         self._run_following_scan(key)
@@ -1234,10 +1249,9 @@ def _triple_due(state: dict[str, str]) -> datetime | None:
 
 def _dedicated_minute(now: datetime) -> bool:
     return (
-        (now.hour in REFRESH_HOURS and now.minute == 0)
+        ((now.hour, now.minute) in REFRESH_SLOTS)
         or (now.hour in WINNER_SCAN_HOURS and now.minute == WINNER_SCAN_MINUTE)
-        or (now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
-            and now.minute == FOLLOWING_FEED_SCAN_MINUTE)
+        or (now.hour in FOLLOWING_FEED_SCAN_HOURS and now.minute == FOLLOWING_FEED_SCAN_MINUTE)
     )
 
 
@@ -1248,14 +1262,11 @@ def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]
     for offset_min in range(1, 24 * 60 + 1):
         candidate = base + timedelta(minutes=offset_min)
         h, m = candidate.hour, candidate.minute
-        if h in REFRESH_HOURS and m == 0:
+        if (h, m) in REFRESH_SLOTS:
             candidates.append(("refresh", "刷新批次", candidate))
         if m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS:
             candidates.append(("winner", "中奖深探", candidate))
-        if (
-            m == FOLLOWING_FEED_SCAN_MINUTE
-            and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
-        ):
+        if m == FOLLOWING_FEED_SCAN_MINUTE and h in FOLLOWING_FEED_SCAN_HOURS:
             candidates.append(("following", "关注补漏", candidate))
     # 只读真实已保存的下一轮，不虚构后续随机时间，也不在页面读取时写文件。
     try:

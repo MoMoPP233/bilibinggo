@@ -86,6 +86,7 @@ from web.schemas import (
     JobStartOut,
     JobStatusOut,
     LlmSettingsRequest,
+    NightContinueRequest,
     OkResponse,
     ParticipateTextRequest,
     RepostCleanupDeleteRequest,
@@ -1220,6 +1221,36 @@ def api_job_by_id(job_id: int) -> dict[str, Any]:
 @app.get("/api/auto/status", tags=["stable"])
 def api_auto_status() -> dict[str, Any]:
     return auto_scheduler.get_status()
+
+
+def _night_continue_payload() -> dict[str, Any]:
+    from web.auto_config import get_night_continue_enabled, is_night_quiet
+    from web.auto_scheduler import CN_TZ
+    from datetime import datetime
+
+    enabled = get_night_continue_enabled()
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "night_continue_enabled": enabled,
+        "night_quiet": is_night_quiet(datetime.now(CN_TZ), config=enabled),
+    }
+
+
+@app.get("/api/auto/night-continue", tags=["stable"])
+def api_auto_night_continue_status() -> dict[str, Any]:
+    """读取当前 Profile 的夜间继续运行开关；纯本地只读。"""
+    return _night_continue_payload()
+
+
+@app.put("/api/auto/night-continue", tags=["stable"])
+@app.post("/api/auto/night-continue", tags=["stable"])
+def api_auto_night_continue_toggle(body: NightContinueRequest) -> dict[str, Any]:
+    """保存夜间继续运行开关，不启动或停止任何任务。"""
+    from web.auto_config import set_night_continue_enabled
+
+    set_night_continue_enabled(body.enabled)
+    return _night_continue_payload()
 
 
 @app.post("/api/auto/start", tags=["stable"])

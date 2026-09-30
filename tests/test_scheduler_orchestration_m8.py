@@ -80,21 +80,20 @@ def test_ds9_uses_same_refresh_path() -> None:
 
 def _intended_actions(now):
     from web.auto_config import (
-        FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
-        FOLLOWING_FEED_SCAN_HOUR_OFFSET,
         FOLLOWING_FEED_SCAN_MINUTE,
-        REFRESH_HOURS,
+        FOLLOWING_FEED_SCAN_HOURS,
+        REFRESH_SLOTS,
         WINNER_SCAN_HOURS,
         WINNER_SCAN_MINUTE,
     )
 
     actions = []
     h, m = now.hour, now.minute
-    if h in REFRESH_HOURS and m == 0:
+    if (h, m) in REFRESH_SLOTS:
         actions.append("refresh_all")
     if (
         m == FOLLOWING_FEED_SCAN_MINUTE
-        and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
+        and h in FOLLOWING_FEED_SCAN_HOURS
     ):
         actions.append("following_feed_scan")
     if m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS:
@@ -128,9 +127,8 @@ def test_cleanup_minutes_have_no_scheduler_intent() -> None:
 
 def test_winner_following_minutes_have_single_intent() -> None:
     from web.auto_config import (
-        FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
-        FOLLOWING_FEED_SCAN_HOUR_OFFSET,
         FOLLOWING_FEED_SCAN_MINUTE,
+        FOLLOWING_FEED_SCAN_HOURS,
         WINNER_SCAN_HOURS,
         WINNER_SCAN_MINUTE,
     )
@@ -138,7 +136,7 @@ def test_winner_following_minutes_have_single_intent() -> None:
     for hour in range(24):
         if hour in WINNER_SCAN_HOURS:
             assert _intended_actions(_dt(hour, WINNER_SCAN_MINUTE)) == ["winner_deep_scan"]
-        if hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET:
+        if hour in FOLLOWING_FEED_SCAN_HOURS:
             assert _intended_actions(_dt(hour, FOLLOWING_FEED_SCAN_MINUTE)) == [
                 "following_feed_scan"
             ]

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-# V26 调度频率（单一事实来源）。
-# refresh_all：00:00/06:00/12:00/18:00（4 次/天）。
-REFRESH_HOURS = frozenset({0, 6, 12, 18})
+from datetime import datetime
+from typing import Any
+
+from src.user_data_io import atomic_write_json
+
+# V72 调度频率（单一事实来源）。固定任务全部错峰并落在 07:00～24:00。
+REFRESH_SLOTS = ((7, 10), (12, 40), (18, 10), (22, 40))
+# 兼容旧状态/测试消费者；实际判断统一使用 REFRESH_SLOTS。
+REFRESH_HOURS = frozenset(hour for hour, _minute in REFRESH_SLOTS)
 # V38：上一轮结束后独立等待 240～420 秒，不再使用固定分钟槽。
 TRIPLE_DELAY_MIN_SECONDS = 240
 TRIPLE_DELAY_MAX_SECONDS = 420
@@ -13,6 +19,13 @@ CLEANUP_MAINTAIN_INTERVAL_HOURS = 24
 # 中奖深检：沿用 CN_TZ，每天 12:10、22:10 两次。
 WINNER_SCAN_HOURS = frozenset({12, 22})
 WINNER_SCAN_MINUTE = 10
+# V72：关注动态每天 6 次，固定在 08:00/11:00/14:00/17:00/20:00/23:00。
+FOLLOWING_FEED_SCAN_HOURS = frozenset({8, 11, 14, 17, 20, 23})
+FOLLOWING_FEED_SCAN_MINUTE = 0
+# Legacy names retained for read-only consumers; scheduler no longer derives cadence from them.
+FOLLOWING_FEED_SCAN_HOUR_INTERVAL = 3
+FOLLOWING_FEED_SCAN_HOUR_OFFSET = 2
+
 ALLOWED_CLICK_ACTIONS = frozenset(
     {
         "refresh_all",
@@ -39,6 +52,40 @@ ACTION_LABELS = {
 # The scheduler never consults this value; cleanup is manual-only.
 _CLEANUP_MAINTAIN_ENABLED = False
 
+NIGHT_CONTINUE_CONFIG_FILE = "auto_scheduler_config.json"
+_NIGHT_CONTINUE_KEY = "night_continue_enabled"
+
+
+def _night_continue_path() -> Any:
+    from src.data_paths import get_profile_dir
+
+    return get_profile_dir() / NIGHT_CONTINUE_CONFIG_FILE
+
+
+def get_night_continue_enabled() -> bool:
+    """读取当前 Profile 的夜间继续运行开关；缺失/损坏均按默认 OFF。"""
+    try:
+        import json
+
+        payload = json.loads(_night_continue_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return bool(payload.get(_NIGHT_CONTINUE_KEY)) if isinstance(payload, dict) else False
+
+
+def set_night_continue_enabled(enabled: bool) -> bool:
+    value = bool(enabled)
+    atomic_write_json(_night_continue_path(), {_NIGHT_CONTINUE_KEY: value})
+    return value
+
+
+def is_night_quiet(now: datetime, *, config: bool | None = None) -> bool:
+    """返回当前本地时间是否处于 00:00（含）至 07:00（不含）的静默窗。"""
+    enabled = config if config is not None else get_night_continue_enabled()
+    if enabled:
+        return False
+    return 0 <= now.hour < 7
+
 
 def cleanup_maintain_enabled() -> bool:
     return _CLEANUP_MAINTAIN_ENABLED
@@ -59,8 +106,4 @@ MIN_REMOTE_STAGE_GAP_SECONDS = 60
 # 明确风控后的自动远程固定冷却（6 小时）。用户不可配置；冷却只恢复调度资格。
 AUTO_REMOTE_RISK_COOLDOWN_SECONDS = 20 * 60
 
-# 关注动态补漏 cadence：每 6 小时一次，落在 hour%6==1 的 :03（01:03/07:03/13:03/19:03），
-# 与公共刷新分钟错开；随机参与仍让专用分钟优先。
-FOLLOWING_FEED_SCAN_HOUR_INTERVAL = 6
-FOLLOWING_FEED_SCAN_HOUR_OFFSET = 1
-FOLLOWING_FEED_SCAN_MINUTE = 3
+# 关注动态 cadence 的旧常量在上方保留，仅供旧只读消费者导入；实际调度使用明确小时集合。

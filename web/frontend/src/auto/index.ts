@@ -4,7 +4,7 @@
 
 import { state } from "../state";
 import { fetchJSON } from "../api/client";
-import { autoDock, autoDockBadge, autoDockCountdown, autoDockFatal, autoDockFatalText, autoDockHint, autoDockJob, autoDockPanel, autoDockPhase, autoDockPipeline, autoDockScheduler, autoDockStartBtn, autoDockStatus, autoDockStopBtn, autoDockToggle, autoDockToggleMeta } from "../dom";
+import { autoDock, autoDockBadge, autoDockCountdown, autoDockFatal, autoDockFatalText, autoDockHint, autoDockJob, autoDockPanel, autoDockPhase, autoDockPipeline, autoDockScheduler, autoDockStartBtn, autoDockStatus, autoDockStopBtn, autoDockToggle, autoDockToggleMeta, autoNightContinue, autoNightContinueStatus } from "../dom";
 import { openAppConfirm } from "../shell/confirm";
 import { showToast } from "../shell/toast";
 import { formatAutoCountdown } from "../utils/format";
@@ -229,6 +229,15 @@ function renderNextAutoTask(status) {
   el.textContent = `${fmtNextTaskWhen(task.minutes)}：${label}`;
 }
 
+function renderNightContinue(status) {
+  if (!autoNightContinue || !autoNightContinueStatus) return;
+  const enabled = Boolean(status?.night_continue_enabled);
+  autoNightContinue.checked = enabled;
+  autoNightContinueStatus.textContent = enabled
+    ? "夜间继续运行：00:00～07:00 仍按正常调度执行。"
+    : "夜间静默：00:00～07:00 不启动新的自动远程任务。";
+}
+
 export function renderAutoDock(status) {
   if (!status) return;
   state.autoScheduler = status;
@@ -284,6 +293,7 @@ export function renderAutoDock(status) {
   renderAutoLogs(status.logs);
   updateAutoCollapsedMeta(status);
   renderNextAutoTask(status);
+  renderNightContinue(status);
 
   const running = schedulerState === "running";
   const fatal = schedulerState === "fatal";
@@ -510,6 +520,33 @@ export function bindAutoDock() {
       .finally(() => {
         autoDockStopBtn.disabled = false;
       });
+  });
+  autoNightContinue?.addEventListener("change", async () => {
+    if (!autoNightContinue) return;
+    const enabled = autoNightContinue.checked;
+    autoNightContinue.disabled = true;
+    try {
+      const payload = await fetchJSON("/api/auto/night-continue", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      const current = state.autoScheduler || {};
+      renderAutoDock({
+        ...current,
+        night_continue_enabled: Boolean(payload?.enabled),
+        night_quiet: Boolean(payload?.night_quiet),
+      });
+      showToast(enabled ? "已开启夜间继续运行" : "已关闭夜间继续运行", "success");
+    } catch (error) {
+      autoNightContinue.checked = !enabled;
+      if (autoNightContinueStatus) {
+        autoNightContinueStatus.textContent = "保存失败，请稍后重试。";
+      }
+      showToast(sanitizeUserText(error?.message || error) || "保存失败", "error");
+    } finally {
+      autoNightContinue.disabled = false;
+    }
   });
 }
 

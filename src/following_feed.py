@@ -236,22 +236,29 @@ def _slice_before_checkpoint(ids: list[str], checkpoint: str | None) -> list[str
 def next_following_scan_at(
     now_ts: int | None = None,
     *,
-    hour_interval: int = 6,
-    hour_offset: int = 1,
-    minute: int = 3,
+    hour_interval: int | None = None,
+    hour_offset: int | None = None,
+    minute: int | None = None,
 ) -> int | None:
-    """按固定 cadence（每 hour_interval 小时、hour%interval==hour_offset、minute 分）计算下一次时刻。"""
+    """计算下一次关注动态扫描；默认使用 V72 明确固定时刻。"""
     from datetime import datetime, timedelta, timezone
+    from web.auto_config import FOLLOWING_FEED_SCAN_HOURS, FOLLOWING_FEED_SCAN_MINUTE
 
     now = int(time.time()) if now_ts is None else int(now_ts)
     tz = timezone(timedelta(hours=8))
     base = datetime.fromtimestamp(now, tz).replace(second=0, microsecond=0)
     for offset_min in range(1, 24 * 60 * 7 + 1):
         candidate = base + timedelta(minutes=offset_min)
-        if (
-            candidate.minute == minute
-            and candidate.hour % hour_interval == hour_offset
-        ):
+        if hour_interval is None and hour_offset is None and minute is None:
+            matches = (
+                candidate.minute == FOLLOWING_FEED_SCAN_MINUTE
+                and candidate.hour in FOLLOWING_FEED_SCAN_HOURS
+            )
+        else:
+            if hour_interval is None or hour_offset is None or minute is None:
+                raise ValueError("hour_interval/hour_offset/minute 必须同时提供")
+            matches = candidate.minute == minute and candidate.hour % hour_interval == hour_offset
+        if matches:
             return int(candidate.timestamp())
     return None
 

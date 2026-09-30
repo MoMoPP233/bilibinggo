@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
 
 import web.auto_scheduler as scheduler_mod
 from web import auto_remote_state as state_mod
-from web.auto_config import REFRESH_HOURS
+from web.auto_config import REFRESH_SLOTS
 from web.auto_scheduler import AutoScheduler
 from web.job_runner import JobStatus
 
@@ -121,9 +121,9 @@ def state_path(tmp_path: Path, monkeypatch) -> Path:
 @pytest.fixture
 def fast_clock(monkeypatch):
     """把调度时钟冻结在整点刷新刻度（选非 winner/cleanup/following 的刷新小时）。"""
-    refresh_hour = sorted(REFRESH_HOURS)[1] if len(REFRESH_HOURS) > 1 else next(iter(REFRESH_HOURS))
+    refresh_hour, refresh_minute = REFRESH_SLOTS[1]
     today = datetime.now(CN_TZ).replace(
-        hour=refresh_hour, minute=0, second=0, microsecond=0
+        hour=refresh_hour, minute=refresh_minute, second=0, microsecond=0
     )
     FrozenClock._fixed = today
     monkeypatch.setattr(scheduler_mod, "datetime", FrozenClock)

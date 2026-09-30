@@ -201,11 +201,12 @@ def test_next_scan_follows_cadence() -> None:
     from datetime import datetime, timedelta, timezone
 
     dt = datetime.fromtimestamp(result, tz=timezone(timedelta(hours=8)))
-    assert dt.minute == 3
-    assert dt.hour % 6 == 1
+    from web.auto_config import FOLLOWING_FEED_SCAN_HOURS, FOLLOWING_FEED_SCAN_MINUTE
+    assert dt.minute == FOLLOWING_FEED_SCAN_MINUTE
+    assert dt.hour in FOLLOWING_FEED_SCAN_HOURS
 
 
-def test_next_scan_hours_are_0103_0703_1303_1903() -> None:
+def test_next_scan_hours_are_v72_fixed_slots() -> None:
     from datetime import datetime, timedelta, timezone
 
     tz = timezone(timedelta(hours=8))
@@ -218,9 +219,9 @@ def test_next_scan_hours_are_0103_0703_1303_1903() -> None:
     for now in samples:
         result = ff.next_following_scan_at(int(now.timestamp()))
         dt = datetime.fromtimestamp(result, tz=tz)
-        assert dt.minute == 3
-        assert dt.hour in (1, 7, 13, 19)
-        assert dt.hour % 6 == 1
+        from web.auto_config import FOLLOWING_FEED_SCAN_HOURS, FOLLOWING_FEED_SCAN_MINUTE
+        assert dt.minute == FOLLOWING_FEED_SCAN_MINUTE
+        assert dt.hour in FOLLOWING_FEED_SCAN_HOURS
 
 
 def test_next_scan_crosses_day() -> None:
@@ -230,14 +231,14 @@ def test_next_scan_crosses_day() -> None:
     now = datetime(2026, 7, 17, 19, 40, tzinfo=tz)
     result = ff.next_following_scan_at(int(now.timestamp()))
     dt = datetime.fromtimestamp(result, tz=tz)
-    assert dt.day == 18
-    assert (dt.hour, dt.minute) == (1, 3)
+    assert dt.day == 17
+    assert (dt.hour, dt.minute) == (20, 0)
 
 
 def test_cadence_does_not_overlap_refresh_following_triple() -> None:
     from datetime import datetime, timedelta, timezone
 
-    from web.auto_config import REFRESH_HOURS
+    from web.auto_config import REFRESH_SLOTS, FOLLOWING_FEED_SCAN_HOURS, FOLLOWING_FEED_SCAN_MINUTE
     from web.auto_scheduler import _dedicated_minute
 
     tz = timezone(timedelta(hours=8))
@@ -245,9 +246,8 @@ def test_cadence_does_not_overlap_refresh_following_triple() -> None:
     for _ in range(3):
         result = ff.next_following_scan_at(int(now.timestamp()))
         dt = datetime.fromtimestamp(result, tz=tz)
-        assert dt.hour % 6 == 1
-        assert dt.minute == 3
-        # V38：固定 following 分钟保持原样；随机参与在该分钟让路。
-        assert dt.hour not in REFRESH_HOURS
+        assert dt.hour in FOLLOWING_FEED_SCAN_HOURS
+        assert dt.minute == FOLLOWING_FEED_SCAN_MINUTE
+        assert (dt.hour, dt.minute) not in REFRESH_SLOTS
         assert _dedicated_minute(dt)
         now = datetime.fromtimestamp(result + 1, tz=tz)

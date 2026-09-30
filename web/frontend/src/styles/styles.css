@@ -8266,6 +8266,22 @@ body.job-running .main-shell .topbar {
   line-height: 1.5;
 }
 
+.auto-night-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.auto-night-status {
+  margin: 3px 0 0;
+  color: var(--foreground-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .auto-following-info {
   margin: 2px 0 0;
   color: var(--foreground-muted);

@@ -381,7 +381,7 @@ def test_risk_cooldown_blocks_due_plan(code):
     scheduler._click_and_wait.assert_not_called()
 
 
-@pytest.mark.parametrize("hour, minute", [(0, 0), (6, 0), (1, 3), (7, 3), (12, 10), (22, 10)])
+@pytest.mark.parametrize("hour, minute", [(7, 10), (12, 40), (18, 10), (22, 40), (8, 0), (11, 0), (12, 10), (22, 10)])
 def test_random_plan_yields_to_all_fixed_task_minutes(hour, minute):
     clock = Clock()
     clock.now = clock.now.replace(hour=hour, minute=minute)
@@ -398,8 +398,8 @@ def test_other_schedules_snapshot_unchanged():
     for kind, _, at in sch._next_occurrence_candidates(now):
         snapshot.setdefault(kind, []).append(at.strftime("%H:%M"))
     assert snapshot == {
-        "refresh": ["00:00", "06:00", "12:00", "18:00"],
-        "following": ["01:03", "07:03", "13:03", "19:03"],
+        "refresh": ["07:10", "12:40", "18:10", "22:40"],
+        "following": ["08:00", "11:00", "14:00", "17:00", "20:00", "23:00"],
         "winner": ["12:10", "22:10"],
     }
     assert [s["action"] for s in sch.REFRESH_STEPS] == ["refresh_all", "refresh_watch", "refresh_status"]
@@ -508,6 +508,7 @@ def test_poison_candidate_backoff_survives_many_fast_rounds(monkeypatch):
         "context_snapshot": {"result_class": "failed_local", "backoff_until": start + 3600},
     }}, _row(_id(702), can_participate=True)]
     clock = Clock()
+    clock.now = clock.now.replace(minute=1)
     scheduler = make(clock)
     arm(scheduler, clock)
     monkeypatch.setattr(activity.time, "time", lambda: clock.now.timestamp())

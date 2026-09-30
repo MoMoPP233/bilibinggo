@@ -97,16 +97,22 @@
         <div class="auto-dock-pipeline-block">
           <div class="auto-dock-pipeline-head">
             <span class="auto-dock-meta-label">刷新批次</span>
-            <span class="auto-dock-pipeline-note">整点串行执行：1 链接 → 2 动态 → 3 状态</span>
+            <span class="auto-dock-pipeline-note">按计划错峰执行刷新任务</span>
           </div>
           <div class="auto-dock-pipeline" id="auto-dock-pipeline"></div>
         </div>
         <div class="auto-schedule-list">
-          <p class="caption auto-dock-schedule-note">自动参与：按既定三连时间执行</p>
-          <p class="caption auto-dock-schedule-note">转发清理：仅手动运行</p>
-          <p class="caption auto-dock-schedule-note">关注补漏：每 6 小时自动执行</p>
-          <p class="caption auto-dock-schedule-note" id="auto-next-task">—</p>
+          <p class="caption auto-dock-schedule-note">自动参与：07:00～24:00，每4～7分钟自动检查并参与符合条件的活动。</p>
+          <p class="caption auto-dock-schedule-note">Following Feed：每天08:00、11:00、14:00、17:00、20:00、23:00扫描关注动态。</p>
+          <p class="caption auto-dock-schedule-note">数据源刷新：每天07:10、12:40、18:10、22:40刷新抽奖数据源。</p>
+          <p class="caption auto-dock-schedule-note">中奖深探：每天12:10和22:10检查中奖消息。</p>
+          <p class="caption" id="auto-next-task">—</p>
         </div>
+        <label class="auto-night-toggle">
+          <input type="checkbox" id="auto-night-continue">
+          <span>夜间继续运行</span>
+        </label>
+        <p class="caption auto-night-status" id="auto-night-continue-status">夜间静默：00:00～07:00 不启动新的自动远程任务。</p>
         <p class="caption auto-following-info" id="auto-following-info" hidden></p>
         <div class="auto-dock-actions">
           <button type="button" class="btn btn-primary btn-pill auto-dock-action-btn" id="auto-dock-start">启动调度</button>

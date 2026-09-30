@@ -1,6 +1,7 @@
 """API Pydantic schemas（请求/响应边界模型）。"""
 
 from web.schemas.account import AckAtUnreadRequest
+from web.schemas.auto import NightContinueRequest
 from web.schemas.common import ErrorBody, ErrorObject, OkResponse
 from web.schemas.diagnostics import DiagnosticsBundleOut, DiagnosticsLogsOut
 from web.schemas.jobs import (
@@ -25,6 +26,7 @@ __all__ = [
     "JobStartOut",
     "JobStatusOut",
     "LlmSettingsRequest",
+    "NightContinueRequest",
     "OkResponse",
     "ParticipateTextRequest",
     "RepostCleanupDeleteRequest",

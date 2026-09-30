@@ -287,7 +287,7 @@ def test_next_slot_before_refresh() -> None:
     now = datetime(2026, 7, 17, 5, 56, tzinfo=timezone(timedelta(hours=8)))
     slot = _next_slot(now)
     assert slot["kind"] == "refresh"
-    assert slot["hour"] == 6
+    assert slot["hour"] == 7
     assert slot["action"] == "refresh_all"
     assert slot["action_label"] == "一键更新活动链接"
     assert slot["at_unix"]
@@ -310,19 +310,19 @@ def _cn(dt):
 def test_next_auto_task_refresh_priority_on_tie() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 5, 56)))
     assert task["label"] == "刷新批次"
-    assert task["minutes"] == 4
+    assert task["minutes"] == 74
 
 
 def test_next_auto_task_following_at_1258() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 12, 58)))
     assert task["label"] == "关注补漏"
-    assert task["minutes"] == 5
+    assert task["minutes"] == 62
 
 
 def test_next_auto_task_skips_removed_cleanup_slot() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 50)))
     assert task["label"] == "刷新批次"
-    assert task["minutes"] == 130
+    assert task["minutes"] == 200
 
 
 def test_next_auto_task_participate_after_refresh_hour() -> None:

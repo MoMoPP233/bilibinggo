@@ -1,7 +1,7 @@
 """V26 Scheduler Cadence 专项（fake clock / mock，零真实网络/通知/mutation）。
 
 V38 更新参与/中奖预期；保留 V26 其余 cadence 与全部安全回归。
-CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 2。
+CASE 1-4  24h 计数：refresh 4 / Following 6 / Winner 2。
 CASE 5    Triple 不再枚举固定 cron slot。
 CASE 6-9  精确时间（refresh/Following/Winner）。
 CASE 10-11 Triple 仅展示已保存计划；固定任务分钟仍优先。
@@ -62,7 +62,7 @@ def _times(candidates, kind: str) -> list[str]:
 def test_case1_4_24h_counts() -> None:
     counts = Counter(kind for kind, _label, _due in _day_candidates())
     assert counts["refresh"] == 4
-    assert counts["following"] == 4
+    assert counts["following"] == 6
     assert counts["winner"] == 2
     assert counts["cleanup"] == 0
 
@@ -79,11 +79,11 @@ def test_case5_triple_has_no_fixed_cron_slots() -> None:
 
 
 def test_case6_refresh_exact_times() -> None:
-    assert _times(_day_candidates(), "refresh") == ["00:00", "06:00", "12:00", "18:00"]
+    assert _times(_day_candidates(), "refresh") == ["07:10", "12:40", "18:10", "22:40"]
 
 
 def test_case7_following_exact_times() -> None:
-    assert _times(_day_candidates(), "following") == ["01:03", "07:03", "13:03", "19:03"]
+    assert _times(_day_candidates(), "following") == ["08:00", "11:00", "14:00", "17:00", "20:00", "23:00"]
 
 
 def test_case8_winner_uses_twice_daily_times() -> None:
@@ -152,7 +152,7 @@ def test_case13_old_persistent_slot_no_replay(tmp_path: Path, monkeypatch) -> No
     # 03:00 不再产生 refresh slot；下一项是新的 06:00 刻度。
     slot = _next_slot(datetime(2026, 7, 17, 3, 0, tzinfo=CN_TZ))
     assert slot["kind"] == "refresh"
-    assert slot["at"].endswith("06:00:00")
+    assert slot["at"].endswith("07:10:00")
 
     # 新调度只在新 slot（00:00）执行一次；旧 key 不会自行触发任何执行。
     scheduler, runner = _scheduler()
