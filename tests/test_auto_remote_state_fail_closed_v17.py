@@ -204,10 +204,9 @@ def test_corrupt_state_blocks_all_auto_remote_stages(state_path: Path) -> None:
         return {"skipped": False}
 
     scheduler = _scheduler_with_fake_click(fake)
-    # 自动 refresh / participate / cleanup 三连入口共用远程门禁。
+    # 自动 refresh / participate / following 入口共用远程门禁。
     scheduler._run_refresh_batch("2026-07-17-6")
     scheduler._run_triple_slot("2026-07-17-06-05")
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
     scheduler._run_following_scan("following-2026-07-17-06")
     # V24：fail-closed 只拦远程动作；本地 refresh_status 仍可运行。
     assert calls == ["refresh_status"]

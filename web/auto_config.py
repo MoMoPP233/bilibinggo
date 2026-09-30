@@ -8,22 +8,17 @@ REFRESH_HOURS = frozenset({0, 6, 12, 18})
 # V38：上一轮结束后独立等待 240～420 秒，不再使用固定分钟槽。
 TRIPLE_DELAY_MIN_SECONDS = 240
 TRIPLE_DELAY_MAX_SECONDS = 420
-# 仅用于 UI/状态展示口径；真实执行 cadence 由 slot 决定（每天 04:05 一次）。
+# Legacy compatibility value for old API consumers. Cleanup has no scheduler cadence.
 CLEANUP_MAINTAIN_INTERVAL_HOURS = 24
 # 中奖深检：沿用 CN_TZ，每天 23:55 一次。
 WINNER_SCAN_HOURS = frozenset({23})
 WINNER_SCAN_MINUTE = 55
-# 清理维护：每天 04:05 一次；V58 预算续跑不是固定 slot。
-CLEANUP_HOURS = frozenset({4})
-CLEANUP_MINUTE = 5
-
 ALLOWED_CLICK_ACTIONS = frozenset(
     {
         "refresh_all",
         "refresh_watch",
         "refresh_status",
         "participate_triple",
-        "cleanup_maintenance_cycle",
         "following_feed_scan",
         "winner_deep_scan",
     }
@@ -41,7 +36,7 @@ ACTION_LABELS = {
 }
 
 # Legacy compatibility state for the /api/auto/cleanup-maintain contract.
-# The scheduler never consults this value; fixed cleanup is always 04:05.
+# The scheduler never consults this value; cleanup is manual-only.
 _CLEANUP_MAINTAIN_ENABLED = False
 
 
@@ -57,7 +52,7 @@ def set_cleanup_maintain_enabled(enabled: bool) -> bool:
 JOB_POLL_INTERVAL_SEC = 2.0
 JOB_POLL_TIMEOUT_SEC = 6 * 60 * 60
 
-# 不同“自动远程大任务”之间的最小间隔（如刷新批次→cleanup/自动参与）。
+# 不同“自动远程大任务”之间的最小间隔（如刷新批次→自动参与）。
 # 同一刷新批次内部的 refresh_all → refresh_watch → refresh_status 不受影响。
 MIN_REMOTE_STAGE_GAP_SECONDS = 60
 
@@ -65,7 +60,7 @@ MIN_REMOTE_STAGE_GAP_SECONDS = 60
 AUTO_REMOTE_RISK_COOLDOWN_SECONDS = 20 * 60
 
 # 关注动态补漏 cadence：每 6 小时一次，落在 hour%6==1 的 :03（01:03/07:03/13:03/19:03），
-# 与公共刷新及 cleanup 分钟错开；随机参与仍让专用分钟优先。
+# 与公共刷新分钟错开；随机参与仍让专用分钟优先。
 FOLLOWING_FEED_SCAN_HOUR_INTERVAL = 6
 FOLLOWING_FEED_SCAN_HOUR_OFFSET = 1
 FOLLOWING_FEED_SCAN_MINUTE = 3

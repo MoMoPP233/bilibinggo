@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from web.auto_config import ALLOWED_CLICK_ACTIONS
+import web.auto_scheduler as scheduler_mod
 from web.auto_scheduler import AutoScheduler, CollisionError, _next_slot, _probe_job, next_auto_task
 from web.job_runner import JobRunner, JobStatus
 
@@ -36,14 +37,13 @@ def _bind_resolve(runner: MagicMock, status_factory) -> None:
     runner.resolve_job_status.side_effect = resolve
 
 
-def test_allowed_actions_keep_only_complete_cleanup_entrypoint() -> None:
+def test_allowed_actions_exclude_cleanup_scheduler_entrypoint() -> None:
     assert ALLOWED_CLICK_ACTIONS == frozenset(
         {
             "refresh_all",
             "refresh_watch",
             "refresh_status",
             "participate_triple",
-            "cleanup_maintenance_cycle",
             "following_feed_scan",
             "winner_deep_scan",
         }
@@ -56,18 +56,12 @@ def test_cleanup_maintain_defaults_off() -> None:
     assert cleanup_maintain_enabled() is False
 
 
-def test_cleanup_maintenance_paused_tick_never_starts_remote_job(monkeypatch) -> None:
+def test_cleanup_is_not_a_scheduler_task() -> None:
     runner = MagicMock()
     scheduler = AutoScheduler(job_runner=runner)
-    monkeypatch.setattr(
-        "src.repost_cleanup.auto_maintenance_paused_state",
-        lambda: (True, "-352 风控暂停"),
-    )
-
-    scheduler._run_cleanup_cycle("cleanup-2026-09-02")
-
+    assert "cleanup" not in scheduler.get_status()["tasks"]
+    assert next_auto_task(datetime(2026, 9, 2, 4, 5, tzinfo=scheduler_mod.CN_TZ))["action"] != "cleanup_maintenance_cycle"
     runner.try_start.assert_not_called()
-    assert "cleanup-2026-09-02" in scheduler._done_cleanup
 
 
 def test_task_status_rejects_stale_scheduler_generation() -> None:
@@ -85,17 +79,17 @@ def test_stop_releases_visible_running_task_without_cancelling_job() -> None:
     runner = MagicMock()
     runner.get_status.return_value.to_dict.return_value = {
         "state": "running",
-        "action": "cleanup_maintenance_cycle",
+        "action": "winner_deep_scan",
         "message": "仍由 JobRunner 执行",
     }
     scheduler = AutoScheduler(job_runner=runner)
     scheduler._status.state = "running"
-    scheduler._status.tasks["cleanup"]["status"] = "running"
+    scheduler._status.tasks["winner"]["status"] = "running"
 
     status = scheduler.stop()
 
-    assert status["tasks"]["cleanup"]["status"] == "waiting"
-    assert "不会被取消" in status["tasks"]["cleanup"]["last_result"]
+    assert status["tasks"]["winner"]["status"] == "waiting"
+    assert "不会被取消" in status["tasks"]["winner"]["last_result"]
     runner.cancel.assert_not_called()
 
 
@@ -325,10 +319,10 @@ def test_next_auto_task_following_at_1258() -> None:
     assert task["minutes"] == 5
 
 
-def test_next_auto_task_cleanup_uses_real_0405_slot() -> None:
+def test_next_auto_task_skips_removed_cleanup_slot() -> None:
     task = next_auto_task(_cn(datetime(2026, 7, 17, 3, 50)))
-    assert task["label"] == "清理维护"
-    assert task["minutes"] == 15
+    assert task["label"] == "刷新批次"
+    assert task["minutes"] == 130
 
 
 def test_next_auto_task_participate_after_refresh_hour() -> None:

@@ -1,9 +1,9 @@
 """V26 Scheduler Cadence 专项（fake clock / mock，零真实网络/通知/mutation）。
 
 V38 更新参与/中奖预期；保留 V26 其余 cadence 与全部安全回归。
-CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 1 / Cleanup 2。
+CASE 1-4  24h 计数：refresh 4 / Following 4 / Winner 1。
 CASE 5    Triple 不再枚举固定 cron slot。
-CASE 6-9  精确时间（refresh/Following/Winner/Cleanup）。
+CASE 6-9  精确时间（refresh/Following/Winner）。
 CASE 10-11 Triple 仅展示已保存计划；固定任务分钟仍优先。
 CASE 12   collision 只 skip（无 fatal / 无补跑 / 无并发）。
 CASE 13-14 旧 persistent slot 不补跑；restart 同 slot 不重复。
@@ -64,14 +64,14 @@ def test_case1_4_24h_counts() -> None:
     assert counts["refresh"] == 4
     assert counts["following"] == 4
     assert counts["winner"] == 1
-    assert counts["cleanup"] == 1
+    assert counts["cleanup"] == 0
 
 
 def test_case5_triple_has_no_fixed_cron_slots() -> None:
     counts = Counter(kind for kind, _label, _due in _day_candidates())
     assert counts["participate"] == 0
     assert counts["refresh"] != 8
-    assert counts["cleanup"] != 4
+    assert counts["cleanup"] == 0
     assert counts["participate"] != 220
 
 
@@ -90,8 +90,8 @@ def test_case8_winner_keeps_exact_times() -> None:
     assert _times(_day_candidates(), "winner") == ["23:55"]
 
 
-def test_case9_cleanup_new_times() -> None:
-    assert _times(_day_candidates(), "cleanup") == ["04:05"]
+def test_case9_cleanup_is_manual_only() -> None:
+    assert _times(_day_candidates(), "cleanup") == []
 
 
 # ---------- CASE 10-11: Triple 与 dedicated 错峰 ----------
@@ -149,9 +149,10 @@ def test_case13_old_persistent_slot_no_replay(tmp_path: Path, monkeypatch) -> No
     # 旧版本（8 次/天）已消费的 03:00 refresh slot 仍留在 slot 文件里。
     assert scheduler_mod._persist_slot_claimed("refresh", "2026-07-16-03") is True
 
-    # 03:00 不再产生 refresh slot（旧槽位自然成为历史，不补跑）。
+    # 03:00 不再产生 refresh slot；下一项是新的 06:00 刻度。
     slot = _next_slot(datetime(2026, 7, 17, 3, 0, tzinfo=CN_TZ))
-    assert slot["kind"] != "refresh"
+    assert slot["kind"] == "refresh"
+    assert slot["at"].endswith("06:00:00")
 
     # 新调度只在新 slot（00:00）执行一次；旧 key 不会自行触发任何执行。
     scheduler, runner = _scheduler()
@@ -275,7 +276,7 @@ def test_case18_ordinary_network_error_not_fatal(monkeypatch) -> None:
 # ---------- CASE 19-22: 其他语义不受 cadence 调整影响 ----------
 
 
-def test_case19_cleanup_slot_does_not_reset_budget(tmp_path: Path, monkeypatch) -> None:
+def test_case19_cleanup_slot_does_not_exist_or_reset_budget(tmp_path: Path, monkeypatch) -> None:
     from src.bilibili_request_budget import (
         get_bilibili_request_budget,
         reserve_bilibili_request,
@@ -284,15 +285,11 @@ def test_case19_cleanup_slot_does_not_reset_budget(tmp_path: Path, monkeypatch) 
     now = 1_800_000_000
     for _ in range(3):
         reserve_bilibili_request(now=now, limit=120, window_seconds=6 * 3600)
-    scheduler, _runner = _scheduler()
-    monkeypatch.setattr(
-        scheduler, "_click_and_wait", lambda action, pipeline_index=None: {"skipped": False}
-    )
-    monkeypatch.setattr(
-        "src.repost_cleanup.auto_maintenance_paused_state", lambda: (False, "")
-    )
+    from web.auto_scheduler import _next_occurrence_candidates
 
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-04")
+    assert all(kind != "cleanup" for kind, _label, _due in _next_occurrence_candidates(
+        datetime(2026, 7, 17, 4, 5, tzinfo=CN_TZ)
+    ))
 
     snap = get_bilibili_request_budget(now=now, limit=120, window_seconds=6 * 3600)
     assert snap.used_requests == 3

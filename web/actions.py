@@ -1647,7 +1647,7 @@ def _run_action_impl(
         if result.get("budget_exhausted"):
             message = str(
                 result.get("message")
-                or "Bilibili 请求预算已用完，同步已安全暂停，剩余将在下一预算窗口继续"
+                or "Bilibili 请求预算已用完，同步已安全暂停；额度恢复后请手动再次执行，系统会从已有进度继续"
             )
         else:
             message = f"转发历史同步完成：发现 {discovered} 条，本次新增 {imported} 条"
@@ -1680,7 +1680,7 @@ def _run_action_impl(
             # V22：同步已耗尽预算 → 0 assessment 请求，返回结构化 paused 结果。
             message = str(
                 synced.get("message")
-                or "Bilibili 请求预算已用完，本轮同步/评估已安全暂停"
+                or "Bilibili 请求预算已用完，本轮同步/评估已安全暂停；额度恢复后请手动再次执行，系统会从已有进度继续"
             )
             progress(step=2, total=2, message=message, log_append=message)
             return {

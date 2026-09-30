@@ -114,13 +114,12 @@ def test_cooldown_blocks_consecutive_ticks_with_zero_remote(state_path: Path) ->
     scheduler = _scheduler_with_fake_click(fake)
     for i in range(4):
         scheduler._run_triple_slot(f"triple-{i}")
-        scheduler._run_cleanup_cycle(f"cleanup-{i}")
         scheduler._run_refresh_batch(f"refresh-{i}")
     # V24：cooldown 内远程任务 0 请求；本地 refresh_status 仍按批执行。
     assert calls == ["refresh_status"] * 4
     assert all(
         action not in calls
-        for action in ("refresh_all", "refresh_watch", "participate_triple", "cleanup_maintenance_cycle")
+        for action in ("refresh_all", "refresh_watch", "participate_triple")
     )
     assert scheduler._status.state != "fatal"
 
@@ -194,69 +193,9 @@ def test_rerisk_extends_cooldown(state_path: Path) -> None:
     assert second_until == 5000 + AUTO_REMOTE_RISK_COOLDOWN_SECONDS
 
 
-def test_cleanup_risk_sets_global_cooldown(state_path: Path, monkeypatch) -> None:
-    cleanup_read, cleanup_set = _cleanup_paused_factory()
-    monkeypatch.setattr("src.repost_cleanup.auto_maintenance_paused_state", cleanup_read)
-    calls: list[str] = []
-
-    def fake(action, *, pipeline_index=None):
-        calls.append(action)
-        cleanup_set(True, "自动维护命中平台风控（-352）")
-        return {"skipped": False}
-
-    scheduler = _scheduler_with_fake_click(fake)
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
-
-    assert calls == ["cleanup_maintenance_cycle"]
-    assert cleanup_read()[0] is True
-    assert state_mod.is_risk_paused() is True
-    assert "cleanup" in state_mod.risk_pause_state()["trigger_stage"]
-
-
-def test_cleanup_local_pause_auto_clears_after_cooldown(
-    state_path: Path, monkeypatch,
-) -> None:
-    cleanup_read, cleanup_set = _cleanup_paused_factory()
-    cleanup_set(True, "风控冷却已到期")
-    monkeypatch.setattr("src.repost_cleanup.auto_maintenance_paused_state", cleanup_read)
-    monkeypatch.setattr(
-        "src.repost_cleanup.auto_clear_expired_maintenance_risk",
-        lambda **kwargs: cleanup_set(False) or True,
-    )
-    calls: list[str] = []
-
-    def fake(action, *, pipeline_index=None):
-        calls.append(action)
-        return {"skipped": False}
-
-    scheduler = _scheduler_with_fake_click(fake)
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
-    # 冷却到期 → 本地恢复资格 → 本轮（正常维护刻度）执行 cleanup。
-    assert calls == ["cleanup_maintenance_cycle"]
-    assert state_mod.is_risk_paused() is False
-
-
-def test_cleanup_local_pause_within_cooldown_skips_zero_remote(
-    state_path: Path, monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "src.repost_cleanup.auto_maintenance_paused_state",
-        lambda: (True, "风控冷却中"),
-    )
-    monkeypatch.setattr(
-        "src.repost_cleanup.auto_clear_expired_maintenance_risk",
-        lambda **kwargs: False,
-    )
-    calls: list[str] = []
-
-    def fake(action, *, pipeline_index=None):
-        calls.append(action)
-        return {"skipped": False}
-
-    scheduler = _scheduler_with_fake_click(fake)
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
-    assert calls == []
-    assert "cleanup-2026-07-17-08" in scheduler._done_cleanup
+def test_cleanup_risk_state_does_not_add_scheduler_work(state_path: Path) -> None:
+    scheduler = AutoScheduler(job_runner=MagicMock())
+    assert "cleanup" not in scheduler.get_status()["tasks"]
 
 
 def test_min_remote_stage_gap_still_blocks(state_path: Path) -> None:

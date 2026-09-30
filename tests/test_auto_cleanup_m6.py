@@ -220,22 +220,11 @@ def test_structured_risk_blocks_all_following(monkeypatch, message) -> None:
     assert len(client.deleted) == 1
     assert result["deleted_count"] == 0
 
-def test_scheduler_cleanup_cycle_never_starts_auto_delete(isolated_home, monkeypatch) -> None:
+def test_manual_delete_remains_writer_leased_without_scheduler_authority(isolated_home) -> None:
+    import web.actions as actions
+    from web.auto_scheduler import AutoScheduler
     from unittest.mock import MagicMock
 
-    from web.auto_scheduler import AutoScheduler
-    import web.actions as actions
-
     assert "cleanup_auto_delete" in actions.WRITER_LEASE_ACTIONS
-    calls: list[str] = []
-
-    def fake(action, *, pipeline_index=None):
-        calls.append(action)
-        return {"skipped": False}
-
     scheduler = AutoScheduler(job_runner=MagicMock())
-    scheduler._click_and_wait = fake
-    # 触发现有维护周期：不得因此启动 DELETE（M6 不隐式接入 Scheduler）
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
-    assert "cleanup_auto_delete" not in calls
-    assert calls == ["cleanup_maintenance_cycle"]
+    assert "cleanup" not in scheduler.get_status()["tasks"]

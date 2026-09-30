@@ -756,9 +756,8 @@ describe("repost cleanup maintenance health", () => {
     expect(document.getElementById("repost-failed-total")?.textContent).toBe("1");
     expect(document.getElementById("repost-unknown-total")?.textContent).toBe("1");
     const lines = document.getElementById("repost-health-lines")?.textContent || "";
-    expect(lines).toContain("自动维护：由调度器管理");
-    expect(lines).toContain("每日 04:05");
-    expect(lines).toContain("预算恢复后按需续跑");
+    expect(lines).toContain("转发清理：仅手动运行");
+    expect(lines).toContain("不会后台自动同步、评估或删除");
     expect(lines).not.toContain("每 2 小时");
     expect(lines).toContain("没有需要人工检查");
     expect(document.getElementById("repost-health-issues")?.hasAttribute("hidden")).toBe(true);
@@ -776,8 +775,8 @@ describe("repost cleanup maintenance health", () => {
       checks: [],
     });
     const lines = document.getElementById("repost-health-lines")?.textContent || "";
-    expect(lines).toContain("自动维护：由调度器管理");
-    expect(lines).not.toContain("自动维护：关闭");
+    expect(lines).toContain("转发清理：仅手动运行");
+    expect(lines).not.toContain("每日 04:05");
   });
 
   it("issue rows are visible with copy but no auto re-delete controls", async () => {

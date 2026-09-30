@@ -26,8 +26,6 @@ from web.auto_config import (
     ACTION_LABELS,
     ALLOWED_CLICK_ACTIONS,
     AUTO_REMOTE_RISK_COOLDOWN_SECONDS,
-    CLEANUP_HOURS,
-    CLEANUP_MINUTE,
     FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
     FOLLOWING_FEED_SCAN_HOUR_OFFSET,
     FOLLOWING_FEED_SCAN_MINUTE,
@@ -71,8 +69,11 @@ _AUTO_SNAPSHOT_LOG_LIMIT = 100
 _SLOT_STATE_FILE = "scheduler_slots.json"
 _SLOT_STATE_MAX_TASKS = 8
 _TRIPLE_NEXT_RUN = "triple_next_run"
-_CLEANUP_BUDGET_RESUME = "cleanup_budget_resume"
-_CLEANUP_BUDGET_RESUME_CLAIM = "cleanup_budget_resume_claim"
+# Kept in the retention set so pre-V67 state remains inert and readable during
+# ordinary slot writes. No scheduler code reads or claims these legacy values.
+_LEGACY_CLEANUP_RESUME_KEYS = frozenset(
+    {"cleanup_budget_resume", "cleanup_budget_resume_claim"}
+)
 _slot_state_lock = threading.Lock()
 
 
@@ -149,8 +150,7 @@ def _persist_slot_claimed(task: str, slot: str) -> bool:
             for key in sorted(state):
                 if key in {
                     _TRIPLE_NEXT_RUN,
-                    _CLEANUP_BUDGET_RESUME,
-                    _CLEANUP_BUDGET_RESUME_CLAIM,
+                    *_LEGACY_CLEANUP_RESUME_KEYS,
                 }:
                     continue
                 del state[key]
@@ -171,138 +171,6 @@ def _reset_slot_state_for_tests() -> None:
             path.unlink()
         except OSError:
             pass
-
-
-def _mutate_slot_state(mutator: Callable[[dict[str, str]], None]) -> None:
-    """在已有 Profile-local slot 文件上做一次原子状态变更。"""
-    path = _slot_state_path()
-    with _slot_state_lock:
-        state = _read_slot_state(path)
-        mutator(state)
-        try:
-            _write_slot_state_atomic(path, state)
-        except OSError as exc:
-            raise SlotStateError(f"调度槽位状态写入失败：{exc}") from exc
-
-
-def _read_cleanup_budget_resume() -> dict[str, Any] | None:
-    """读取预算暂停状态；损坏状态按 fail-closed 处理。"""
-    import json
-
-    state = _read_slot_state(_slot_state_path())
-    raw = state.get(_CLEANUP_BUDGET_RESUME)
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        raise SlotStateError("清理预算续跑状态损坏，已停止自动续跑") from exc
-    if not isinstance(payload, dict):
-        raise SlotStateError("清理预算续跑状态结构非法，已停止自动续跑")
-    profile_id = payload.get("profile_id")
-    window_id = payload.get("window_id")
-    available_at = payload.get("available_at")
-    if (
-        not isinstance(profile_id, str)
-        or not profile_id
-        or not isinstance(window_id, str)
-        or not window_id
-        or isinstance(available_at, bool)
-        or not isinstance(available_at, int)
-        or available_at <= 0
-    ):
-        raise SlotStateError("清理预算续跑状态字段非法，已停止自动续跑")
-    from src.data_paths import get_runtime_profile_id
-
-    if profile_id != get_runtime_profile_id():
-        raise SlotStateError("清理预算续跑状态 Profile 不匹配，已停止自动续跑")
-    return payload
-
-
-def _save_cleanup_budget_resume(budget_result: dict[str, Any]) -> bool:
-    """仅由明确的 RequestBudgetExhausted 结果建立待续跑状态。"""
-    import json
-
-    available_at = budget_result.get("resume_after") or budget_result.get("window_expires_at")
-    window_started = budget_result.get("window_started_at")
-    window_expires = budget_result.get("window_expires_at")
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in (available_at, window_started, window_expires)):
-        return False
-    if int(available_at) <= 0 or int(window_expires) <= 0 or int(window_started) <= 0:
-        return False
-    from src.data_paths import get_runtime_profile_id
-
-    payload = {
-        "profile_id": get_runtime_profile_id(),
-        "flow": "cleanup_maintenance_cycle",
-        "window_id": f"{int(window_started)}:{int(window_expires)}",
-        "window_started_at": int(window_started),
-        "window_expires_at": int(window_expires),
-        "available_at": int(available_at),
-        "saved_at": int(time.time()),
-    }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-
-    def mutate(state: dict[str, str]) -> None:
-        state[_CLEANUP_BUDGET_RESUME] = encoded
-        # A new budget window must be eligible for one new claim.
-        if state.get(_CLEANUP_BUDGET_RESUME_CLAIM) != payload["window_id"]:
-            state.pop(_CLEANUP_BUDGET_RESUME_CLAIM, None)
-
-    _mutate_slot_state(mutate)
-    return True
-
-
-def _clear_cleanup_budget_resume() -> None:
-    def mutate(state: dict[str, str]) -> None:
-        state.pop(_CLEANUP_BUDGET_RESUME, None)
-        state.pop(_CLEANUP_BUDGET_RESUME_CLAIM, None)
-
-    _mutate_slot_state(mutate)
-
-
-def _claim_cleanup_budget_resume(window_id: str) -> bool:
-    """原子领取某一预算窗口的唯一续跑机会。"""
-    path = _slot_state_path()
-    with _slot_state_lock:
-        state = _read_slot_state(path)
-        if state.get(_CLEANUP_BUDGET_RESUME_CLAIM) == window_id:
-            return False
-        state[_CLEANUP_BUDGET_RESUME_CLAIM] = window_id
-        try:
-            _write_slot_state_atomic(path, state)
-        except OSError as exc:
-            raise SlotStateError(f"清理预算续跑 claim 写入失败：{exc}") from exc
-    return True
-
-
-def _release_cleanup_budget_resume_claim(window_id: str) -> None:
-    def mutate(state: dict[str, str]) -> None:
-        if state.get(_CLEANUP_BUDGET_RESUME_CLAIM) == window_id:
-            state.pop(_CLEANUP_BUDGET_RESUME_CLAIM, None)
-
-    _mutate_slot_state(mutate)
-
-
-def _cleanup_budget_result_from_outcome(outcome: object) -> dict[str, Any] | None:
-    """从现有 Job 终态中提取明确的预算耗尽阶段结果。"""
-    if not isinstance(outcome, dict):
-        return None
-    job = outcome.get("job") if isinstance(outcome.get("job"), dict) else outcome
-    payload = job.get("result") if isinstance(job, dict) else None
-    cycle = payload.get("result") if isinstance(payload, dict) else None
-    if isinstance(payload, dict) and isinstance(payload.get("phases"), list):
-        cycle = payload
-    phases = cycle.get("phases") if isinstance(cycle, dict) else None
-    if not isinstance(phases, list):
-        phases = outcome.get("phases") if isinstance(outcome.get("phases"), list) else []
-    for phase in phases:
-        if not isinstance(phase, dict):
-            continue
-        result = phase.get("result")
-        if isinstance(result, dict) and result.get("budget_exhausted") is True:
-            return result
-    return None
 
 
 def _log_slot_skip(scheduler: "AutoScheduler", task: str, slot: str) -> None:
@@ -433,7 +301,6 @@ class AutoScheduler:
                 for key, label in {
                     "refresh": "刷新批次",
                     "winner": "中奖深探",
-                    "cleanup": "清理维护",
                     "following": "关注补漏",
                     "participate": "自动参与",
                 }.items()
@@ -441,7 +308,6 @@ class AutoScheduler:
         )
         self._done_refresh: set[str] = set()
         self._done_triple: set[str] = set()
-        self._done_cleanup: set[str] = set()
         self._done_winner: set[str] = set()
         self._done_following: set[str] = set()
         self._snapshot_timer: threading.Timer | None = None
@@ -526,7 +392,7 @@ class AutoScheduler:
                     daemon=True,
                 )
                 self._thread.start()
-        self._log("info", "调度器已启动（按计划投递自动任务：刷新 / 参与 / 清理维护 / 关注补漏 / 中奖深探）")
+        self._log("info", "调度器已启动（按计划投递自动任务：刷新 / 参与 / 关注补漏 / 中奖深探）")
         self._schedule_auto_snapshot(force=True)
         return self.get_status()
 
@@ -876,8 +742,6 @@ class AutoScheduler:
                         self._run_refresh_batch(key)
                         continue
 
-                # 清理维护调度随 Scheduler 启动；其中自动 DELETE 仍由 per-Profile
-                # auto_delete_enabled 独立授权，默认关闭，维护调度绝不隐式开启它。
                 # V38: 中奖深检每天 23:55；仍仅当前分钟触发，错过不补跑。
                 if now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS:
                     key = f"winner-{now:%Y-%m-%d-%H}"
@@ -885,16 +749,6 @@ class AutoScheduler:
                         self._run_winner_scan(key)
                         continue
 
-                # 预算窗口恢复检查完全本地；只有到期且成功 claim 后才进入现有清理入口。
-                if self._maybe_run_cleanup_budget_resume(now):
-                    continue
-
-                # V59: 每天只启动一次完整清理（04:05）；V58 预算续跑独立处理。
-                if now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS:
-                    key = f"cleanup-{now:%Y-%m-%d-%H}"
-                    if key not in self._done_cleanup:
-                        self._run_cleanup_cycle(key)
-                        continue
                 if (
                     now.minute == FOLLOWING_FEED_SCAN_MINUTE
                     and now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL
@@ -1206,139 +1060,6 @@ class AutoScheduler:
             self._done_winner.add(key)
             self._set_phase("等待下一刻度", f"中奖深检已跳过：{exc}")
 
-    def _maybe_run_cleanup_budget_resume(self, now: datetime) -> bool:
-        try:
-            resume = _read_cleanup_budget_resume()
-        except SlotStateError as exc:
-            self._log("error", f"清理预算续跑状态不可用，已跳过：{exc}")
-            return False
-        if resume is None or int(now.timestamp()) < int(resume["available_at"]):
-            return False
-
-        from src.repost_cleanup import (
-            auto_clear_expired_maintenance_risk,
-            auto_maintenance_paused_state,
-            cleanup_has_pending_local_work,
-        )
-
-        paused, pause_reason = auto_maintenance_paused_state()
-        if paused and not auto_clear_expired_maintenance_risk(
-            cooldown_seconds=AUTO_REMOTE_RISK_COOLDOWN_SECONDS
-        ):
-            self._set_task_status("cleanup", "risk_paused", pause_reason or "风控暂停")
-            return False
-
-        try:
-            pending = cleanup_has_pending_local_work()
-        except Exception as exc:
-            # 本地状态不可读时宁可等待下一次检查，也不以猜测结果发起远程任务。
-            self._log("warn", f"清理预算续跑本地待办检查失败，暂不启动：{exc}")
-            return False
-        if not pending:
-            _clear_cleanup_budget_resume()
-            self._log("info", "预算已恢复，但本地没有待处理清理工作；已清除续跑状态")
-            if now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS:
-                self._done_cleanup.add(f"cleanup-{now:%Y-%m-%d-%H}")
-            return True
-
-        gate = self._remote_gate()
-        if not gate.allowed:
-            self._set_task_status("cleanup", "risk_paused", gate.message)
-            return False
-        window_id = str(resume["window_id"])
-        try:
-            if not _claim_cleanup_budget_resume(window_id):
-                return False
-        except SlotStateError as exc:
-            self._log("error", f"清理预算续跑 claim 失败，已跳过：{exc}")
-            return False
-
-        self._log("info", f"清理预算窗口已恢复，开始一次续跑（{window_id}）")
-        self._run_cleanup_cycle(f"cleanup-resume-{window_id}", is_resume=True)
-        # 同分钟的固定 slot 不应再为同一待办启动第二个 cleanup。
-        if now.minute == CLEANUP_MINUTE and now.hour in CLEANUP_HOURS:
-            self._done_cleanup.add(f"cleanup-{now:%Y-%m-%d-%H}")
-        return True
-
-    def _run_cleanup_cycle(self, key: str, *, is_resume: bool = False) -> None:
-        resume_window_id = key.removeprefix("cleanup-resume-") if is_resume else ""
-        if not _stale_or_slot_guard(self, "cleanup_cycle", key):
-            if resume_window_id:
-                _release_cleanup_budget_resume_claim(resume_window_id)
-            self._done_cleanup.add(key)
-            return
-        gate = self._remote_gate()
-        if not gate.allowed:
-            if resume_window_id:
-                _release_cleanup_budget_resume_claim(resume_window_id)
-            self._skip_remote_slot("cleanup_cycle", gate, done=self._done_cleanup, key=key)
-            return
-        self._set_pipeline(active=False)
-        self._set_phase("自动维护周期", f"自动维护周期刻度 {key}")
-        self._set_task_status("cleanup", "running", "清理维护开始")
-        from src.repost_cleanup import auto_clear_expired_maintenance_risk, auto_maintenance_paused_state
-
-        paused, pause_reason = auto_maintenance_paused_state()
-        if paused:
-            cleared = auto_clear_expired_maintenance_risk(
-                cooldown_seconds=AUTO_REMOTE_RISK_COOLDOWN_SECONDS
-            )
-            if not cleared:
-                self._log("warn", f"自动维护风控冷却中，本轮跳过且不联网：{pause_reason}")
-                self._set_task_status("cleanup", "risk_paused", pause_reason or "风控暂停")
-                if resume_window_id:
-                    _release_cleanup_budget_resume_claim(resume_window_id)
-                self._done_cleanup.add(key)
-                return
-        self._log("info", "清理维护开始")
-        try:
-            outcome = self._click_and_wait("cleanup_maintenance_cycle")
-            self._done_cleanup.add(key)
-            if self._is_stale():
-                return
-            with self._lock:
-                self._status.message = "自动维护周期完成"
-            self._mark_remote_stage_finished()
-            final_message = str((outcome or {}).get("message") or "清理维护完成")
-            self._set_task_status("cleanup", "completed", final_message)
-            self._log("info", final_message)
-            self._set_phase("等待下一刻度", "自动维护周期完成")
-            budget_result = _cleanup_budget_result_from_outcome(outcome)
-            if budget_result is not None:
-                if _save_cleanup_budget_resume(budget_result):
-                    self._log(
-                        "info",
-                        "清理维护因请求预算耗尽已暂停，等待真实预算窗口恢复后续跑",
-                    )
-            else:
-                _clear_cleanup_budget_resume()
-            newly_paused, new_reason = auto_maintenance_paused_state()
-            if newly_paused:
-                self._pause_all_auto_remote("cleanup_maintenance_cycle", new_reason or "cleanup 风控暂停")
-        except CollisionError:
-            self._log("warn", "自动维护周期发现已有任务在运行，本轮跳过。")
-            self._set_task_status("cleanup", "skipped_busy", "本轮跳过（任务占用）")
-            if resume_window_id:
-                _release_cleanup_budget_resume_claim(resume_window_id)
-            self._done_cleanup.add(key)
-        except Exception as exc:
-            if matches_platform_risk(exc):
-                self._pause_all_auto_remote("cleanup_maintenance_cycle", exc)
-                self._set_task_status("cleanup", "risk_paused", str(exc))
-            else:
-                # V24：普通业务失败只结束当前 Job，Scheduler 继续运行。
-                self._log(
-                    "error",
-                    f"自动维护周期当前任务失败：{exc}；"
-                    "Scheduler 继续运行，将在下一正常调度时重试。",
-                )
-                self._set_task_status("cleanup", "error", str(exc))
-            if is_resume:
-                # 普通异常不建立预算续跑；下一固定 slot 按原有机制处理。
-                _clear_cleanup_budget_resume()
-            self._done_cleanup.add(key)
-            self._set_phase("等待下一刻度", f"自动维护周期已跳过：{exc}")
-
     def _click_and_wait(self, action: str, *, pipeline_index: int | None = None) -> dict[str, Any]:
         if action not in ALLOWED_CLICK_ACTIONS:
             raise ValueError(f"禁止的操作：{action}")
@@ -1486,7 +1207,6 @@ def _dedicated_minute(now: datetime) -> bool:
     return (
         (now.hour in REFRESH_HOURS and now.minute == 0)
         or (now.hour in WINNER_SCAN_HOURS and now.minute == WINNER_SCAN_MINUTE)
-        or (now.hour in CLEANUP_HOURS and now.minute == CLEANUP_MINUTE)
         or (now.hour % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
             and now.minute == FOLLOWING_FEED_SCAN_MINUTE)
     )
@@ -1503,8 +1223,6 @@ def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]
             candidates.append(("refresh", "刷新批次", candidate))
         if m == WINNER_SCAN_MINUTE and h in WINNER_SCAN_HOURS:
             candidates.append(("winner", "中奖深探", candidate))
-        if m == CLEANUP_MINUTE and h in CLEANUP_HOURS:
-            candidates.append(("cleanup", "清理维护", candidate))
         if (
             m == FOLLOWING_FEED_SCAN_MINUTE
             and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
@@ -1528,7 +1246,7 @@ def next_auto_task(now: datetime | None = None) -> dict[str, Any]:
     candidates = _next_occurrence_candidates(current)
     if not candidates:
         return {"label": "", "action": "", "minutes": None, "at_unix": None}
-    # 按到期时间排序；同分保持循环判定顺序（刷新→清理→关注→参与）。
+    # 按到期时间排序；同分保持循环判定顺序（刷新→中奖→关注→参与）。
     candidates.sort(key=lambda item: (item[2], _AUTO_TASK_ORDER.get(item[0], 99)))
     action, label, due = candidates[0]
     seconds = max(0, int((due - current).total_seconds()))
@@ -1544,9 +1262,8 @@ def next_auto_task(now: datetime | None = None) -> dict[str, Any]:
 _AUTO_TASK_ORDER = {
     "refresh": 0,
     "winner": 1,
-    "cleanup": 2,
-    "following": 3,
-    "participate": 4,
+    "following": 2,
+    "participate": 3,
 }
 
 
@@ -1568,7 +1285,6 @@ def _next_slot(now: datetime) -> dict[str, Any]:
         action_by_kind = {
             "refresh": "refresh_all",
             "winner": "winner_deep_scan",
-            "cleanup": "cleanup_maintenance_cycle",
             "following": "following_feed_scan",
             "participate": "participate_triple",
         }

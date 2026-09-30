@@ -604,7 +604,7 @@ def _log_budget_paused(scope: object, stage: str) -> None:
     snapshot = scope.snapshot()  # type: ignore[attr-defined]
     logging.getLogger("repost_cleanup").warning(
         "本轮 Bilibili 安全请求预算已用完：已使用 %s / %s 次（%s）；"
-        "已安全暂停连续评估，剩余记录将在下一预算窗口自动继续；预计可继续时间：%s",
+        "已安全暂停连续评估；额度恢复后请手动再次执行，预计恢复时间：%s",
         snapshot.used_requests,
         snapshot.budget_limit,
         stage,
@@ -629,7 +629,7 @@ def _log_budget_recovered(scope: object, stage: str) -> None:
 
     if bool(getattr(scope, "rolled", False)):
         logging.getLogger("repost_cleanup").info(
-            "Bilibili 请求安全预算已恢复，继续处理未完成评估（%s）", stage
+            "Bilibili 请求安全预算已恢复，可手动继续处理未完成评估（%s）", stage
         )
 
 
@@ -637,8 +637,8 @@ def _budget_paused_message(snapshot: object) -> str:
     return (
         f"本轮 Bilibili 安全请求预算已用完：已使用 "
         f"{getattr(snapshot, 'used_requests', 0)} / {getattr(snapshot, 'budget_limit', 0)} 次；"
-        "已安全暂停连续评估，剩余记录将在下一预算窗口自动继续；"
-        f"预计可继续时间：{_format_budget_resume(getattr(snapshot, 'window_expires_at', 0))}"
+        "已安全暂停连续评估；额度恢复后请手动再次执行，"
+        f"预计恢复时间：{_format_budget_resume(getattr(snapshot, 'window_expires_at', 0))}"
     )
 
 
@@ -1618,7 +1618,7 @@ def auto_maintain(
                 breaker.stop_message = "自动维护因平台限制已暂停，请稍后手动恢复。"
             else:
                 breaker.stop_message = (
-                    f"自动增量同步失败，保持待同步，等待下一维护周期：{exc}"
+                    f"增量同步失败，保持待同步，请下次手动同步：{exc}"
                 )
                 breaker.stopped = True
             return {
@@ -2112,7 +2112,7 @@ def cleanup_health_check(
                     "tone": "info",
                     "text": (
                         "检测到最近参与的转发可能尚未被同步覆盖，"
-                        "下一维护周期会保守地补同步一次。"
+                        "下一次手动同步会保守地补同步一次。"
                     ),
                 }
             )
@@ -2141,7 +2141,7 @@ def cleanup_health_check(
                 "tone": "info",
                 "text": (
                     f"还有 {pending_evaluation} 条转发待评估；"
-                    f"自动评估每轮最多 {AUTO_ASSESSMENT_BUDGET} 条，人工评估最多 "
+                    f"单次智能评估最多 {AUTO_ASSESSMENT_BUDGET} 条，人工评估最多 "
                     f"{MAX_ASSESSMENTS_PER_JOB} 条。"
                 ),
             }
@@ -2163,9 +2163,9 @@ def cleanup_health_check(
                 "key": "maintenance_risk_paused",
                 "tone": "warn",
                 "text": (
-                    f"自动维护因平台限制已暂停：{reason}"
+                    f"转发清理因平台限制已暂停：{reason}"
                     f"（暂停于 {_health_dt(paused_at)}）。"
-                    "需要人工在「自动维护」面板点击恢复；恢复后不会立即联网。"
+                    "请人工恢复后再次手动执行；恢复操作不会立即联网。"
                 ),
             }
         )
@@ -3098,7 +3098,7 @@ def cleanup_maintenance_cycle(
                 reason = "request_budget_exhausted"
                 skip_message = (
                     "Bilibili 请求预算已用完，本轮 0 assessment、0 DELETE；"
-                    "剩余记录将在下一预算窗口自动继续。"
+                    "额度恢复后请手动再次执行，系统会从已有进度继续。"
                 )
             else:
                 reason = "pre_maintenance_blocked"

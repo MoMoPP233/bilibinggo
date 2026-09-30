@@ -194,23 +194,6 @@ def test_scheduler_following_scan_runs_without_toggle(state_path: Path, monkeypa
     assert "following-2026-07-17-06" in scheduler._done_following
 
 
-def test_scheduler_cleanup_runs_without_toggle(state_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "src.repost_cleanup.auto_maintenance_paused_state",
-        lambda: (False, ""),
-    )
-    calls: list[str] = []
-
-    def fake(action, *, pipeline_index=None):
-        calls.append(action)
-        return {"skipped": False}
-
-    scheduler = AutoScheduler(job_runner=MagicMock())
-    scheduler._click_and_wait = fake
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-06")
-    assert calls == ["cleanup_maintenance_cycle"]
-
-
 def test_next_scan_follows_cadence() -> None:
     now = int(time.time())
     result = ff.next_following_scan_at(now)
@@ -251,7 +234,7 @@ def test_next_scan_crosses_day() -> None:
     assert (dt.hour, dt.minute) == (1, 3)
 
 
-def test_cadence_does_not_overlap_refresh_cleanup_triple() -> None:
+def test_cadence_does_not_overlap_refresh_following_triple() -> None:
     from datetime import datetime, timedelta, timezone
 
     from web.auto_config import REFRESH_HOURS

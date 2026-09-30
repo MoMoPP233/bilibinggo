@@ -159,6 +159,7 @@ interface RepostHealthResponse {
   maintenance?: {
     enabled?: boolean;
     interval_hours?: number;
+    mode?: string;
     risk_paused?: boolean;
     risk_paused_at?: string | number | null;
     risk_reason?: string | null;
@@ -459,7 +460,7 @@ export function renderCandidates(): void {
       repostCandidateSummary.textContent = `已删除 tombstone ${deletedCandidates.length} 条；仅供查看，不提供再次删除。`;
     } else {
       repostCandidateSummary.textContent = pendingEvaluation > 0
-        ? `还有 ${pendingEvaluation} 条原动态待评估（下次评估任务将自动继续处理）。`
+        ? `还有 ${pendingEvaluation} 条原动态待评估（额度恢复后可再次手动评估，程序会从已有进度继续）。`
         : candidates.length
           ? `当前待处理 ${candidates.length} 条；候选默认不勾选，删除前服务端还会再次校验。`
           : "当前没有可展示的清理候选；请先同步并评估历史抽奖。";
@@ -739,8 +740,8 @@ export function renderHealth(data: RepostHealthResponse): void {
   if (repostHealthStatus) repostHealthStatus.textContent = sanitizeUserText(data?.status_text || "正常");
   if (repostRiskPause) repostRiskPause.textContent = data?.maintenance?.risk_paused ? "是" : "否";
   if (repostHealthLines) {
-    const scheduleLine = "自动维护：由调度器管理（每日 04:05；预算恢复后按需续跑）";
-    if (repostMaintenance) repostMaintenance.textContent = "每日 04:05 · 预算续跑独立";
+    const scheduleLine = "转发清理：仅手动运行；不会后台自动同步、评估或删除";
+    if (repostMaintenance) repostMaintenance.textContent = "手动运行";
     const checks = Array.isArray(data?.checks) ? data.checks : [];
     const lines = [
       { tone: "info", text: scheduleLine },

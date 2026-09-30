@@ -1,4 +1,4 @@
-"""M8 scheduler orchestration（离线）：cleanup cycle / winner slot / persistent guard。"""
+"""Scheduler orchestration（离线）：winner slot / persistent guard。"""
 
 from __future__ import annotations
 
@@ -26,19 +26,10 @@ def _scheduler(fake):
     return scheduler
 
 
-def test_cleanup_cycle_slot_runs_once_per_slot_key(tmp_path: Path, monkeypatch) -> None:
-    calls: list[str] = []
-    fake = lambda action, *, pipeline_index=None: calls.append(action) or {"skipped": False}
-    monkeypatch.setattr(sch, "_persist_slot_claimed", sch._persist_slot_claimed)
-
-    scheduler = _scheduler(fake)
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")  # 同一 slot 不重复
-    assert calls == ["cleanup_maintenance_cycle"]
-    # “重启”：新实例同 slot → 0 重复
-    scheduler2 = _scheduler(fake)
-    scheduler2._run_cleanup_cycle("cleanup-2026-07-17-08")
-    assert calls == ["cleanup_maintenance_cycle"]
+def test_cleanup_is_absent_from_scheduler_authority() -> None:
+    now = sch.datetime(2026, 7, 17, 4, 5, tzinfo=sch.CN_TZ)
+    assert all(kind != "cleanup" for kind, _label, _due in sch._next_occurrence_candidates(now))
+    assert sch.next_auto_task(now)["action"] != "cleanup_maintenance_cycle"
 
 
 def test_winner_slot_runs_once_per_slot_key(tmp_path: Path, monkeypatch) -> None:
@@ -60,21 +51,7 @@ def test_different_slots_are_distinct(tmp_path: Path, monkeypatch) -> None:
     scheduler._last_remote_stage_finished_mono = 0.0
     scheduler._run_winner_scan("winner-2026-07-17-11")
     scheduler._last_remote_stage_finished_mono = 0.0
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
-    assert calls == ["winner_deep_scan", "winner_deep_scan", "cleanup_maintenance_cycle"]
-
-
-def test_cooldown_blocks_new_cleanup_cycle(tmp_path: Path, monkeypatch) -> None:
-    from web import auto_remote_state as state_mod
-
-    target = tmp_path / "auto_remote_state.json"
-    monkeypatch.setattr(state_mod, "_state_path", lambda: target)
-    state_mod.record_auto_remote_risk(trigger_stage="refresh:refresh_all", reason="429")
-    calls: list[str] = []
-    fake = lambda action, *, pipeline_index=None: calls.append(action) or {"skipped": False}
-    scheduler = _scheduler(fake)
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
-    assert calls == []  # cooldown 内 0 remote Job
+    assert calls == ["winner_deep_scan", "winner_deep_scan"]
 
 
 def test_collision_skip_no_requeue(tmp_path: Path, monkeypatch) -> None:
@@ -90,19 +67,6 @@ def test_collision_skip_no_requeue(tmp_path: Path, monkeypatch) -> None:
     assert scheduler._status.state != "fatal"
 
 
-def test_stale_generation_blocks_cleanup(tmp_path: Path, monkeypatch) -> None:
-    calls: list[str] = []
-    fake = lambda action, *, pipeline_index=None: calls.append(action) or {"skipped": False}
-    scheduler = _scheduler(fake)
-    # 旧代失效场景由 _stale_or_slot_guard 的 slot claim + 运行期 is_stale 双重约束；
-    # 此处模拟已完成的旧 slot（slot file 已 claim），新代同 slot 不得再次投递。
-    scheduler._run_cleanup_cycle("cleanup-2026-07-17-08")
-    calls.clear()
-    scheduler2 = _scheduler(fake)
-    scheduler2._run_cleanup_cycle("cleanup-2026-07-17-08")
-    assert calls == []
-
-
 def test_ds9_uses_same_refresh_path() -> None:
     import web.actions as actions
 
@@ -116,8 +80,6 @@ def test_ds9_uses_same_refresh_path() -> None:
 
 def _intended_actions(now):
     from web.auto_config import (
-        CLEANUP_HOURS,
-        CLEANUP_MINUTE,
         FOLLOWING_FEED_SCAN_HOUR_INTERVAL,
         FOLLOWING_FEED_SCAN_HOUR_OFFSET,
         FOLLOWING_FEED_SCAN_MINUTE,
@@ -130,8 +92,6 @@ def _intended_actions(now):
     h, m = now.hour, now.minute
     if h in REFRESH_HOURS and m == 0:
         actions.append("refresh_all")
-    if m == CLEANUP_MINUTE and h in CLEANUP_HOURS:
-        actions.append("cleanup_maintenance_cycle")
     if (
         m == FOLLOWING_FEED_SCAN_MINUTE
         and h % FOLLOWING_FEED_SCAN_HOUR_INTERVAL == FOLLOWING_FEED_SCAN_HOUR_OFFSET
@@ -162,12 +122,8 @@ def _dt(hour, minute):
     return datetime(2026, 7, 17, hour, minute)
 
 
-def test_cleanup_minutes_exclude_participation() -> None:
-    from web.auto_config import CLEANUP_HOURS, CLEANUP_MINUTE
-
-    for hour in sorted(CLEANUP_HOURS):
-        acts = _intended_actions(_dt(hour, CLEANUP_MINUTE))
-        assert acts == ["cleanup_maintenance_cycle"], (hour, acts)
+def test_cleanup_minutes_have_no_scheduler_intent() -> None:
+    assert _intended_actions(_dt(4, 5)) == []
 
 
 def test_winner_following_minutes_have_single_intent() -> None:

@@ -329,7 +329,7 @@ def test_case21_llm429_not_fatal_no_bilibili_cooldown(monkeypatch) -> None:
         MagicMock(side_effect=RuntimeError("LLM 服务当前限流，请稍后重试")),
     )
 
-    scheduler._run_cleanup_cycle("v24-llm429")
+    scheduler._run_winner_scan("v24-llm429")
 
     _assert_alive(scheduler, fatal_spy)
     assert _risk_paused() is False

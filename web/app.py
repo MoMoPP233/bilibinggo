@@ -993,7 +993,6 @@ def api_repost_cleanup_health() -> dict[str, Any]:
     """
 
     from src.repost_cleanup import cleanup_health_check
-    from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, cleanup_maintain_enabled
 
     uid = _require_local_account("请先扫码登录后再查看维护状态")
     job = runner.get_status().to_dict()
@@ -1003,8 +1002,7 @@ def api_repost_cleanup_health() -> dict[str, Any]:
     payload = cleanup_health_check(
         uid, delete_job_in_progress=delete_job_in_progress
     )
-    payload["maintenance"]["enabled"] = cleanup_maintain_enabled()
-    payload["maintenance"]["interval_hours"] = CLEANUP_MAINTAIN_INTERVAL_HOURS
+    payload.setdefault("maintenance", {})["mode"] = "manual"
     return {"ok": True, "uid": uid, **payload}
 
 
@@ -1257,6 +1255,7 @@ def api_auto_following_feed_status() -> dict[str, Any]:
 
 @app.get("/api/auto/cleanup-maintain", tags=["stable"])
 def api_auto_cleanup_maintain_status() -> dict[str, Any]:
+    """Legacy local status endpoint; cleanup maintenance is manual-only in V67."""
     from src.repost_cleanup import maintenance_risk_state
     from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, cleanup_maintain_enabled
 
@@ -1264,6 +1263,7 @@ def api_auto_cleanup_maintain_status() -> dict[str, Any]:
     return {
         "ok": True,
         "enabled": cleanup_maintain_enabled(),
+        "mode": "manual",
         "interval_hours": CLEANUP_MAINTAIN_INTERVAL_HOURS,
         **maintenance_risk_state(uid),
     }
@@ -1271,7 +1271,7 @@ def api_auto_cleanup_maintain_status() -> dict[str, Any]:
 
 @app.post("/api/auto/cleanup-maintain", tags=["stable"])
 async def api_auto_cleanup_maintain_toggle(request: Request) -> dict[str, Any]:
-    """Legacy compatibility endpoint; it does not enable/disable scheduler runs."""
+    """Legacy compatibility endpoint; it never enables scheduler cleanup runs."""
     from web.auto_config import CLEANUP_MAINTAIN_INTERVAL_HOURS, set_cleanup_maintain_enabled
 
     body = await request.json() or {}
@@ -1279,16 +1279,17 @@ async def api_auto_cleanup_maintain_toggle(request: Request) -> dict[str, Any]:
     return {
         "ok": True,
         "enabled": set_cleanup_maintain_enabled(enabled),
+        "mode": "manual",
         "interval_hours": CLEANUP_MAINTAIN_INTERVAL_HOURS,
     }
 
 
 @app.post("/api/auto/cleanup-maintain/recover", tags=["stable"])
 def api_auto_cleanup_maintain_recover() -> dict[str, Any]:
-    """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
+    """Legacy local recovery: clear the Profile-local risk pause without remote work."""
     from src.repost_cleanup import maintenance_risk_state, recover_auto_maintenance
 
-    uid = _require_local_account("请先扫码登录后再恢复自动维护")
+    uid = _require_local_account("请先扫码登录后再继续转发清理")
     recover_auto_maintenance(uid)
     return {"ok": True, "uid": uid, **maintenance_risk_state(uid)}
 
