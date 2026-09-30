@@ -1,8 +1,8 @@
-"""关注动态补漏 V1（following feed）。
+"""关注动态补漏（following feed）。
 
 设计约束（V1 收敛版）：
-- 只扫“当前登录账号可见的关注动态 Feed”最近一页，绝不逐个访问关注 UP 主页。
-- 每轮最多 1 页、约 30 条（以单页实际返回为上限，超出截断）。
+- 只扫“当前登录账号可见的关注动态 Feed”，绝不逐个访问关注 UP 主页。
+- 每轮从 page=1 开始，在同一轮内按 endpoint 契约继续读取，最多 20 页。
 - 使用动态 ID 做 checkpoint；只有“正常完成一轮”才推进 last_seen_dynamic_id。
 - 风控（-352/-509/429/rate-limit/risk-control/风控/限流）向上抛，由 AutoScheduler 走全局 6h 冷却；
   不把风控当成“空 Feed / 0 条”。
@@ -36,8 +36,13 @@ from src.sources.common import opus_link
 FOLLOW_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
 FOLLOW_FEED_REFERER = "https://t.bilibili.com/"
 
-# 第一版保守上限：单页最多处理 30 条（少于单页则按实际返回）。
+# 同轮分页最多读取 20 页。旧 payload（没有分页字段）保留历史 30 条兼容上限。
+FOLLOW_FEED_MAX_PAGES = 20
+# Compatibility cap for legacy callers/fixtures that predate the pagination
+# fields.  Real pagination responses carry ``has_more``/``offset`` and are
+# collected across the full page window.
 FOLLOW_FEED_MAX_ITEMS = 30
+ANCHOR_LIMIT = 50
 
 _VALID_DYNAMIC_ID = re.compile(r"^\d{18,19}$")
 
@@ -72,6 +77,38 @@ def _read_state() -> dict[str, Any]:
     return raw
 
 
+def _read_state_checked() -> tuple[dict[str, Any], bool, str]:
+    """Return state, whether it is valid, and a safe diagnostic reason.
+
+    A missing file is a legal first run.  Existing malformed JSON/schema is
+    fail-closed: callers must not issue a feed request or overwrite it.
+    """
+    path = _state_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, True, ""
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}, False, "following_feed_state_corrupt"
+    if not isinstance(raw, dict):
+        return {}, False, "following_feed_state_corrupt"
+    checkpoint = raw.get("last_seen_dynamic_id")
+    if checkpoint is not None and (
+        not isinstance(checkpoint, str) or not _VALID_DYNAMIC_ID.fullmatch(checkpoint)
+    ):
+        return {}, False, "following_feed_state_corrupt"
+    anchors = raw.get("anchors")
+    if anchors is not None:
+        if not isinstance(anchors, list):
+            return {}, False, "following_feed_state_corrupt"
+        if any(
+            not isinstance(value, str) or not _VALID_DYNAMIC_ID.fullmatch(value)
+            for value in anchors
+        ):
+            return {}, False, "following_feed_state_corrupt"
+    return raw, True, ""
+
+
 def _write_state(state: dict[str, Any]) -> None:
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +128,20 @@ def _write_state(state: dict[str, Any]) -> None:
 
 
 def following_feed_info() -> dict[str, Any]:
-    state = _read_state()
+    state, valid, reason = _read_state_checked()
+    if not valid:
+        return {
+            "last_scan_at": None,
+            "last_seen_dynamic_id": None,
+            "last_found": 0,
+            "last_added": 0,
+            "accepted": 0,
+            "inserted": 0,
+            "last_status": "failed",
+            "last_error": reason,
+            "state_corrupt": True,
+            "anchors": [],
+        }
     return {
         "last_scan_at": state.get("last_scan_at"),
         "last_seen_dynamic_id": state.get("last_seen_dynamic_id"),
@@ -109,6 +159,16 @@ def following_feed_info() -> dict[str, Any]:
         "canonical_duplicate_skipped": int(
             state.get("canonical_duplicate_skipped") or 0
         ),
+        "anchors": list(state.get("anchors") or []),
+        "last_scan_status": state.get("last_scan_status"),
+        "last_scan_at": state.get("last_scan_at"),
+        "last_pages_fetched": int(state.get("last_pages_fetched") or 0),
+        "last_stop_reason": state.get("last_stop_reason"),
+        "last_items_seen": int(state.get("last_items_seen") or 0),
+        "last_unique_items": int(state.get("last_unique_items") or 0),
+        "last_new_items": int(state.get("last_new_items") or 0),
+        "last_anchor_hits": int(state.get("last_anchor_hits") or 0),
+        "last_catch_up_complete": state.get("last_catch_up_complete"),
     }
 
 
@@ -135,8 +195,6 @@ def _feed_items(payload: object) -> list[tuple[str, dict[str, Any] | None]]:
 
 def _item_ids(payload: object) -> list[str]:
     """保守解析 feed/all：优先 data.items[] 的 id_str；非合法动态 ID 一律忽略。
-
-    本轮不假定一定需要翻页参数/offset；V1 只处理第一页。
     """
     return [dynamic_id for dynamic_id, _ in _feed_items(payload)]
 
@@ -210,78 +268,209 @@ def scan_following_feed(
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
-    """执行一轮关注动态补漏（V1：仅最近一页）。
+    """执行一轮同轮分页的关注动态增量扫描。
 
-    返回统计 dict；风险异常向上抛（不写 checkpoint）。
+    Feed 的 offset 只存在本次调用的局部变量中；只有收集窗口完整且公共
+    pipeline 完成后，才会一次性推进 checkpoint/anchors。
     """
-    state = _read_state()
-    if on_progress is not None:
-        on_progress(0, 1, "正在读取关注动态 Feed…")
-
-    with client_factory() as client:
-        payload = client.get_json(
-            FOLLOW_FEED_URL,
-            {"type": "all"},
-            referer=FOLLOW_FEED_REFERER,
-            retries=0,
-        )
-
-    # 平台风控只会以「结构化返回码」或「客户端异常信封」出现，正文绝不参与判定。
-    if not isinstance(payload, dict):
-        raise RuntimeError("关注动态 Feed 响应格式异常")
-    code = payload.get("code")
-    if code is not None and code != 0:
-        message = str(payload.get("message") or payload.get("msg") or "")
-        if code in (-352, -509):
-            raise RuntimeError(f"API error {code}: {message}")
-        raise RuntimeError(f"关注动态 Feed 响应异常（code={code}：{message}）")
-
-    def fail(message: str) -> dict[str, Any]:
-        now = int(time.time())
-        state["last_status"] = "failed"
-        state["last_error"] = message
-        state["last_scan_at"] = now
-        state["last_found"] = 0
-        state["last_added"] = 0
-        state["accepted"] = 0
-        state["inserted"] = 0
-        for key in (
-            "self_skipped",
-            "forward_unresolved_skipped",
-            "forward_skipped",
-            "canonical_duplicate_skipped",
-        ):
-            state[key] = 0
-        for key in (
-            "unfollowed_original_skipped",
-            "relationship_unavailable_skipped",
-            "relationship_snapshot_status",
-        ):
-            state.pop(key, None)
-        _write_state(state)
-        if on_progress is not None:
-            on_progress(1, 1, message)
+    state, state_valid, state_reason = _read_state_checked()
+    if not state_valid:
+        # 损坏文件必须保持原字节不变，且绝不发起远程请求。
         return {
             "skipped": False,
             "status": "failed",
             "scanned_items": 0,
             "found": 0,
             "added": 0,
+            "message": state_reason,
+            "state_corrupt": True,
+        }
+
+    checkpoint = str(state.get("last_seen_dynamic_id") or "") or None
+    old_anchors = [
+        str(value)
+        for value in (state.get("anchors") or [])
+        if _VALID_DYNAMIC_ID.fullmatch(str(value))
+    ]
+    if checkpoint and checkpoint not in old_anchors:
+        old_anchors.insert(0, checkpoint)
+    old_anchors = old_anchors[:ANCHOR_LIMIT]
+    # An empty state (or a missing file) establishes a baseline from page 1;
+    # a previously incomplete run must continue paging on its next run.
+    first_run = not checkpoint and not old_anchors and not state.get("last_scan_status")
+
+    def record_diagnostic(
+        *,
+        status: str,
+        message: str,
+        stop_reason: str,
+        pages_fetched: int,
+        items_seen: int,
+        unique_items: int,
+        anchor_hits: int,
+        catch_up_complete: bool,
+    ) -> dict[str, Any]:
+        diagnostic = dict(state)
+        diagnostic.update(
+            {
+                "last_scan_status": status,
+                "last_status": "failed" if status == "failed" else "incomplete",
+                "last_error": message,
+                "last_scan_at": int(time.time()),
+                "last_pages_fetched": pages_fetched,
+                "last_stop_reason": stop_reason,
+                "last_items_seen": items_seen,
+                "last_unique_items": unique_items,
+                "last_new_items": 0,
+                "last_anchor_hits": anchor_hits,
+                "last_catch_up_complete": catch_up_complete,
+            }
+        )
+        _write_state(diagnostic)
+        if on_progress is not None:
+            on_progress(1, 1, message)
+        return {
+            "skipped": False,
+            "status": "failed" if status == "failed" else "incomplete",
+            "scanned_items": unique_items,
+            "found": 0,
+            "added": 0,
+            "pages_fetched": pages_fetched,
+            "catch_up_complete": catch_up_complete,
+            "stop_reason": stop_reason,
             "message": message,
         }
 
-    data = payload.get("data")
-    items = data.get("items") if isinstance(data, dict) else payload.get("items")
-    if not isinstance(data, dict) or not isinstance(items, list):
-        return fail("关注动态 Feed 响应缺少有效 data.items 列表，无法解析")
-    if items and not _item_ids(payload):
-        return fail("关注动态 Feed 返回非空列表但无法解析出任何有效动态 ID")
+    def validate_page(payload: object, page_no: int) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any] | None]], str, bool]:
+        # 风控/业务错误只依据结构化 code；正文内容不参与风险判定。
+        if not isinstance(payload, dict):
+            raise RuntimeError("关注动态 Feed 响应格式异常")
+        code = payload.get("code")
+        if code is not None and code != 0:
+            message = str(payload.get("message") or payload.get("msg") or "")
+            if code in (-352, -509):
+                raise RuntimeError(f"API error {code}: {message}")
+            raise RuntimeError(f"关注动态 Feed 响应异常（code={code}：{message}）")
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise ValueError("关注动态 Feed 响应缺少有效 data.items 列表，无法解析")
+        page_items = _feed_items(payload)
+        if data.get("items") and not page_items:
+            raise ValueError("关注动态 Feed 返回非空列表但无法解析出任何有效动态 ID")
+        has_more_value = data.get("has_more", False)
+        if not isinstance(has_more_value, bool):
+            raise ValueError(f"第 {page_no} 页 has_more 不是 bool")
+        offset_value = data.get("offset", "")
+        if offset_value is None:
+            offset_value = ""
+        if not isinstance(offset_value, str):
+            raise ValueError(f"第 {page_no} 页 offset 不是 string")
+        return data, page_items, offset_value.strip(), has_more_value
 
-    page_items = _feed_items(payload)[:FOLLOW_FEED_MAX_ITEMS]
-    page_ids = [dynamic_id for dynamic_id, _ in page_items]
-    checkpoint = state.get("last_seen_dynamic_id")
-    processed = _slice_before_checkpoint(page_ids, str(checkpoint) if checkpoint else None)
-    item_by_id = {dynamic_id: item for dynamic_id, item in page_items}
+    if on_progress is not None:
+        on_progress(0, 1, "正在读取关注动态 Feed…")
+
+    all_ids: list[str] = []
+    item_by_id: dict[str, dict[str, Any] | None] = {}
+    page_by_id: dict[str, int] = {}
+    seen_dynamic_ids: set[str] = set()
+    seen_offsets: set[str] = set()
+    pages_fetched = 0
+    items_seen = 0
+    anchor_hits = 0
+    boundary_index: int | None = None
+    stop_reason = ""
+    catch_up_complete = False
+    next_offset: str | None = None
+
+    with client_factory() as client:
+        for page_no in range(1, FOLLOW_FEED_MAX_PAGES + 1):
+            params: dict[str, object] = {"type": "all", "page": page_no}
+            if page_no > 1:
+                params["offset"] = next_offset or ""
+            payload = client.get_json(
+                FOLLOW_FEED_URL,
+                params,
+                referer=FOLLOW_FEED_REFERER,
+                retries=0,
+            )
+            pages_fetched = page_no
+            try:
+                data, page_items, offset, has_more = validate_page(payload, page_no)
+            except ValueError as exc:
+                return record_diagnostic(
+                    status="failed" if page_no == 1 else "incomplete",
+                    message=str(exc),
+                    stop_reason="response_invalid",
+                    pages_fetched=pages_fetched,
+                    items_seen=items_seen,
+                    unique_items=len(all_ids),
+                    anchor_hits=anchor_hits,
+                    catch_up_complete=False,
+                )
+            items_seen += len(data.get("items") or [])
+            if page_no == 1 and "has_more" not in data and "offset" not in data:
+                page_items = page_items[:FOLLOW_FEED_MAX_ITEMS]
+            page_new_ids: list[str] = []
+            page_anchor_positions: list[int] = []
+            for dynamic_id, item in page_items:
+                if dynamic_id in seen_dynamic_ids:
+                    continue
+                seen_dynamic_ids.add(dynamic_id)
+                all_ids.append(dynamic_id)
+                item_by_id[dynamic_id] = item
+                page_by_id[dynamic_id] = page_no
+                page_new_ids.append(dynamic_id)
+                if dynamic_id in old_anchors:
+                    anchor_hits += 1
+                    page_anchor_positions.append(len(all_ids) - 1)
+            exact_checkpoint_hit = checkpoint in page_new_ids if checkpoint else False
+            required_anchor_hits = min(3, len(set(old_anchors))) if old_anchors else 0
+            if exact_checkpoint_hit:
+                boundary_index = all_ids.index(checkpoint)  # exclude checkpoint itself
+                stop_reason = "checkpoint_reached"
+                catch_up_complete = True
+            elif required_anchor_hits and anchor_hits >= required_anchor_hits:
+                boundary_index = min(page_anchor_positions) if page_anchor_positions else len(all_ids)
+                stop_reason = "anchor_reached"
+                catch_up_complete = True
+            elif not has_more:
+                stop_reason = "has_more_false"
+                catch_up_complete = True
+            elif first_run and page_no == 1:
+                stop_reason = "first_run_baseline"
+                catch_up_complete = True
+            elif not offset:
+                stop_reason = "missing_next_offset"
+                break
+            elif offset in seen_offsets:
+                stop_reason = "repeated_offset"
+                break
+            elif page_no >= FOLLOW_FEED_MAX_PAGES:
+                stop_reason = "hard_cap_reached"
+                break
+            else:
+                seen_offsets.add(offset)
+                next_offset = offset
+                continue
+            break
+
+    if not catch_up_complete:
+        return record_diagnostic(
+            status="incomplete",
+            message=f"关注动态分页未完整结束：{stop_reason}",
+            stop_reason=stop_reason,
+            pages_fetched=pages_fetched,
+            items_seen=items_seen,
+            unique_items=len(all_ids),
+            anchor_hits=anchor_hits,
+            catch_up_complete=False,
+        )
+
+    if boundary_index is None:
+        processed = list(all_ids)
+    else:
+        processed = all_ids[:boundary_index]
 
     # Following Feed is already scoped by the platform to the current account's
     # followed-feed.  V33 deliberately does not inspect relationship fields or
@@ -296,7 +485,16 @@ def scan_following_feed(
         identity = resolve_dynamic_identity(item, dynamic_id)
         identity_by_raw[dynamic_id] = identity
     if identity_by_raw and current_uid is None:
-        return fail("无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint")
+        return record_diagnostic(
+            status="failed",
+            message="无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint",
+            stop_reason="missing_login_uid",
+            pages_fetched=pages_fetched,
+            items_seen=items_seen,
+            unique_items=len(all_ids),
+            anchor_hits=anchor_hits,
+            catch_up_complete=catch_up_complete,
+        )
 
     self_skipped = 0
     forward_unresolved_skipped = 0
@@ -345,7 +543,11 @@ def scan_following_feed(
     }
     if _pipeline_accepts_source_observations():
         pipeline_kwargs["source_observations"] = [
-            {"source_id": "following_feed", "dynamic_id": dynamic_id, "page_index": None}
+            {
+                "source_id": "following_feed",
+                "dynamic_id": dynamic_id,
+                "page_index": page_by_id.get(dynamic_id),
+            }
             for dynamic_id in accepted_ids
         ]
     if accepted_identities and _pipeline_accepts_identity_map():
@@ -381,7 +583,20 @@ def scan_following_feed(
         new_checkpoint = checkpoint or None
     else:
         new_checkpoint = processed[0] if processed else (checkpoint or None)
+
+    # Keep newest stable IDs plus old anchors so a single disappearing anchor
+    # cannot make the next run walk indefinitely into an old window.
+    new_anchors: list[str] = []
+    if blocking_count:
+        new_anchors = list(old_anchors)
+    else:
+        for dynamic_id in processed + old_anchors:
+            if _VALID_DYNAMIC_ID.fullmatch(str(dynamic_id)) and dynamic_id not in new_anchors:
+                new_anchors.append(dynamic_id)
+            if len(new_anchors) >= ANCHOR_LIMIT:
+                break
     state["last_seen_dynamic_id"] = new_checkpoint
+    state["anchors"] = new_anchors
     state["last_scan_at"] = now
     state["last_found"] = found
     state["last_added"] = added
@@ -398,7 +613,15 @@ def scan_following_feed(
     ):
         state.pop(key, None)
     state["last_status"] = "success"
+    state["last_scan_status"] = "success" if blocking_count == 0 else "incomplete"
     state["last_error"] = ""
+    state["last_pages_fetched"] = pages_fetched
+    state["last_stop_reason"] = "pipeline_partial" if blocking_count else stop_reason
+    state["last_items_seen"] = items_seen
+    state["last_unique_items"] = len(all_ids)
+    state["last_new_items"] = len(processed)
+    state["last_anchor_hits"] = anchor_hits
+    state["last_catch_up_complete"] = catch_up_complete
     _write_state(state)
 
     if on_progress is not None:
@@ -407,7 +630,7 @@ def scan_following_feed(
     return {
         "skipped": False,
         "status": "success",
-        "scanned_items": len(page_ids),
+        "scanned_items": len(all_ids),
         "found": found,
         "accepted": len(accepted_ids),
         "added": added,
@@ -417,5 +640,8 @@ def scan_following_feed(
         "forward_unresolved_skipped": forward_unresolved_skipped,
         "forward_skipped": forward_skipped,
         "canonical_duplicate_skipped": canonical_duplicate_skipped,
+        "pages_fetched": pages_fetched,
+        "catch_up_complete": catch_up_complete,
+        "stop_reason": "pipeline_partial" if blocking_count else stop_reason,
         "message": f"关注动态补漏完成：发现 {found} 条，新增 {added} 条",
     }
