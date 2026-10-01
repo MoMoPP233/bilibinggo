@@ -113,6 +113,7 @@ function renderUnique(records) {
   if (!panel) return;
   const rows = Array.isArray(records) ? records : [];
   panel.querySelector("[data-ds9-unique-count]").textContent = String(rows.length);
+  panel.querySelector("[data-ds9-unique-title-count]").textContent = String(rows.length);
   panel.querySelector("[data-ds9-unique-rows]").innerHTML = rows.length
     ? rows.map(uniqueRecordHtml).join("")
     : '<li class="ds9-audit-empty">暂无 DS9 独有有效抽奖记录</li>';
@@ -201,6 +202,14 @@ function handleAddTopic(event) {
 }
 
 function handleAuditAction(event) {
+  const uniqueToggle = event.target.closest("[data-ds9-unique-toggle]");
+  if (uniqueToggle) {
+    const section = uniqueToggle.closest("[data-ds9-unique]");
+    const collapsed = section?.classList.toggle("is-collapsed");
+    uniqueToggle.textContent = collapsed ? "展开" : "收起";
+    uniqueToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    return;
+  }
   const toggle = event.target.closest("[data-ds9-audit-toggle]");
   if (toggle) {
     const section = toggle.closest("[data-ds9-audit]");
@@ -265,10 +274,10 @@ function ensurePanel() {
       <button type="submit" class="btn btn-secondary btn-compact btn-pill">添加话题</button>
     </form>
     <ul class="ds9-topic-rows" data-ds9-rows></ul>
-    <section class="ds9-audit-section ds9-unique-section" data-ds9-unique>
+    <section class="ds9-audit-section ds9-unique-section is-collapsed" data-ds9-unique>
       <div class="ds9-audit-section-head">
-        <div><h3>DS9 独有有效抽奖记录</h3><p class="section-desc">其他正式数据源尚未发现的有效抽奖。</p></div>
-        <div class="action-row"><span class="caption">共 <b data-ds9-unique-count>0</b> 条</span><button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-contribution-export>导出统计 CSV</button></div>
+        <div><h3>DS9 独有有效抽奖记录（<span data-ds9-unique-title-count>0</span>）</h3><p class="section-desc">其他正式数据源尚未发现的有效抽奖。</p></div>
+        <div class="action-row"><button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-unique-toggle aria-expanded="false">展开</button><span class="caption">共 <b data-ds9-unique-count>0</b> 条</span><button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-contribution-export>导出统计 CSV</button></div>
       </div>
       <ul class="ds9-audit-rows" data-ds9-unique-rows></ul>
     </section>
@@ -309,6 +318,7 @@ export function bindDs9Panel() {
   });
   panel.querySelector("[data-ds9-add]")?.addEventListener("submit", handleAddTopic);
   panel.querySelector("[data-ds9-rows]")?.addEventListener("click", handleTopicAction);
+  panel.querySelector("[data-ds9-unique]")?.addEventListener("click", handleAuditAction);
   panel.querySelector("[data-ds9-audit]")?.addEventListener("click", handleAuditAction);
   panel.querySelector("[data-ds9-audit]")?.addEventListener("change", handleAuditAction);
   panel.querySelector("[data-ds9-contribution-export]")?.addEventListener("click", () => {

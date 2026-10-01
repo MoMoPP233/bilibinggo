@@ -128,4 +128,38 @@ describe("DS9 topic cards", () => {
     expect(clicked).toEqual([expect.stringContaining("/api/ds9/rejection-audit.csv?topic_id=47801")]);
     click.mockRestore();
   });
+
+  it("keeps DS9 unique records collapsed by default and toggles without changing export", async () => {
+    fetchJSONMock
+      .mockResolvedValueOnce({
+        topics: [{ topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true }],
+        summary: { builtin_count: 1, custom_count: 0 },
+      })
+      .mockResolvedValueOnce({ samples: [] })
+      .mockResolvedValueOnce({ records: [{ topic_id: "47801", topic_name: "抽奖号的日常", dynamic_id: "123" }] });
+    const clicked: string[] = [];
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      clicked.push(this.href);
+    });
+    const module = await import("./ds9-panel");
+    module.bindDs9Panel();
+    await vi.waitFor(() => expect(document.querySelector("[data-ds9-unique-title-count]")?.textContent).toBe("1"));
+    const section = document.querySelector("[data-ds9-unique]")!;
+    const rows = section.querySelector("[data-ds9-unique-rows]")!;
+    const toggle = section.querySelector("[data-ds9-unique-toggle]") as HTMLButtonElement;
+    expect(section.classList.contains("is-collapsed")).toBe(true);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(rows.textContent).toContain("DS9 独有");
+    toggle.click();
+    expect(section.classList.contains("is-collapsed")).toBe(false);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle.textContent).toBe("收起");
+    toggle.click();
+    expect(section.classList.contains("is-collapsed")).toBe(true);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.textContent).toBe("展开");
+    (section.querySelector("[data-ds9-contribution-export]") as HTMLButtonElement).click();
+    expect(clicked).toEqual([expect.stringContaining("/api/ds9/contribution.csv")]);
+    click.mockRestore();
+  });
 });
