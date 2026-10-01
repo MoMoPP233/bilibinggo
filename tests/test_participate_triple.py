@@ -475,6 +475,60 @@ def test_triple_partial_failure_summary_and_following_workers(monkeypatch: pytes
     assert payload["result"]["items"][0]["result_class"] == "failed_local"
 
 
+def test_triple_preserves_invalid_result_and_counts_mixed_outcomes() -> None:
+    targets = [_row(_id(i), can_participate=True) for i in (611, 612, 613)]
+
+    def fake_execute(dynamic_id: str, on_step, **_kwargs) -> dict:
+        if dynamic_id == _id(611):
+            return {
+                "dynamic_id": dynamic_id,
+                "status": "joined",
+                "message": "完成",
+                "actions": _interact_actions(),
+                "lottery_type": "互动抽奖",
+            }
+        if dynamic_id == _id(612):
+            return {
+                "dynamic_id": dynamic_id,
+                "status": "failed",
+                "message": "无法打开活动链接，活动已删除",
+                "actions": [],
+                "lottery_type": "互动抽奖",
+                "result_class": "invalid_activity",
+                "context_snapshot": {
+                    "result_class": "invalid_activity",
+                    "invalid_reason": "dynamic_invisible_4101152",
+                },
+            }
+        return {
+            "dynamic_id": dynamic_id,
+            "status": "failed",
+            "message": "模拟本地失败",
+            "actions": [],
+            "lottery_type": "互动抽奖",
+            "result_class": "failed_local",
+            "context_snapshot": {"result_class": "failed_local"},
+        }
+
+    with (
+        patch("web.actions.pick_triple_participate_targets", return_value=targets),
+        patch("web.actions.resolve_participate_lottery_type", return_value="互动抽奖"),
+        patch("web.actions._execute_participate", side_effect=fake_execute),
+        patch("web.actions._persist_triple_failure") as persist_failure,
+        patch("web.actions.invalidate_activity_cache"),
+        patch("web.actions.refresh_local_activity_statuses"),
+    ):
+        payload = run_action("participate_triple", {}, on_progress=lambda **_kwargs: None)
+
+    assert payload["result"]["joined"] == 1
+    assert payload["result"]["deleted"] == 1
+    assert payload["result"]["failed"] == 1
+    by_id = {item["dynamic_id"]: item for item in payload["result"]["items"]}
+    assert by_id[_id(612)]["result_class"] == "invalid_activity"
+    persist_failure.assert_called_once()
+    assert persist_failure.call_args.args[0]["dynamic_id"] == _id(613)
+
+
 def test_triple_local_failure_backoff_and_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
     from web import activity_service
 

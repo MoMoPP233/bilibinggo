@@ -24,12 +24,18 @@ DrawTag = str  # "" | "即将开奖"
 LOCAL_STATUSES = frozenset({"已参加", "未参加"})
 
 
-def _is_refresh_candidate(item: dict) -> bool:
+def _is_managed_activity(item: dict) -> bool:
     if not isinstance(item, dict) or item.get("skipped"):
         return False
     if is_charging_lottery_activity(item):
         return False
     if item.get("lottery_type") not in PARTICIPATABLE_TYPES:
+        return False
+    return True
+
+
+def _is_refresh_candidate(item: dict) -> bool:
+    if not _is_managed_activity(item):
         return False
     if str(item.get("draw_status") or "") == "ended":
         return False
@@ -44,11 +50,11 @@ def _classify_activity(
     *,
     now: int,
 ) -> tuple[str, DrawTag, DrawStatus] | None:
-    effective_ts = reliable_lottery_time_unix(item)
-    if not effective_ts:
+    if not _is_managed_activity(item):
         return None
 
-    draw_status: DrawStatus = "ended" if effective_ts <= now else "active"
+    effective_ts = reliable_lottery_time_unix(item)
+    draw_status: DrawStatus = "ended" if effective_ts and effective_ts <= now else "active"
     base_status, _ = resolve_activity_status(
         draw_status="active",
         lottery_type=item.get("lottery_type"),
@@ -65,7 +71,7 @@ def _classify_activity(
 
     activity_status = base_status
     draw_tag: DrawTag = ""
-    if activity_status == "已参加":
+    if effective_ts and activity_status == "已参加":
         phase = classify_participated_draw(item, participation, now=now)
         if phase == "soon":
             draw_tag = "即将开奖"

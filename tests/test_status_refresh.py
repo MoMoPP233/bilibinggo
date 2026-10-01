@@ -68,13 +68,54 @@ def test_local_refresh_marks_past_activity_ended(isolated_home: Path, monkeypatc
     assert items[0]["draw_status"] == "ended"
 
 
-def test_local_refresh_skips_missing_lottery_time(isolated_home: Path, monkeypatch) -> None:
+def test_local_refresh_manages_missing_lottery_time_without_inventing_date(
+    isolated_home: Path, monkeypatch
+) -> None:
     now = 1_700_000_000
     monkeypatch.setattr("src.status_refresh.time.time", lambda: now)
     replace_all_activities([_activity("no-time")])
     result = refresh_local_activity_statuses()
-    assert result["scanned"] == 0
-    assert result["skipped"] is True
+    assert result["scanned"] == 1
+    assert result["skipped"] is False
+    item = load_activities()[0]
+    assert item.get("lottery_time") is None
+    assert item["draw_status"] == "active"
+    assert item["activity_status"] == "未参加"
+    assert item["status_classified"] is True
+
+
+@pytest.mark.parametrize(
+    "conditions",
+    [
+        {},
+        {"lottery_time_inferred": True},
+        {"lottery_time_inferred": True, "lottery_time_text": "2027-03-13 23:29"},
+    ],
+)
+def test_persist_unknown_time_real_shapes_remain_managed(
+    isolated_home: Path,
+    conditions: dict,
+) -> None:
+    item = _activity("unknown-time")
+    item["lottery_time"] = None
+    item["conditions"] = conditions
+    replace_all_activities([item])
+
+    persisted = persist_activity_record(dict(item), now=1_700_000_000)
+
+    assert persisted.get("lottery_time") is None
+    assert persisted["draw_status"] == "active"
+    assert persisted["activity_status"] == "未参加"
+    assert load_activities()[0].get("lottery_time") is None
+
+
+def test_persist_unknown_time_does_not_admit_unmanaged_type(isolated_home: Path) -> None:
+    managed = _activity("managed")
+    replace_all_activities([managed])
+    unsupported = _activity("unsupported", lottery_type="未知类型")
+
+    with pytest.raises(RuntimeError, match="不参与状态管理"):
+        persist_activity_record(unsupported, now=1_700_000_000)
 
 
 def test_local_refresh_sets_draw_tag_for_participated(isolated_home: Path, monkeypatch) -> None:

@@ -28,6 +28,7 @@ import pytest
 
 from src.sources import ds9_topics as ds9
 from src.sources.common import CheckResult, commit_source_checkpoint
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 TOPIC_A = "1261901"
 TOPIC_B = "1055656"
@@ -678,7 +679,7 @@ def test_scheduler_refresh_batch_uses_unified_refresh_all(isolated_home: Path, m
             calls.append(action)
             return {"skipped": False}
 
-        scheduler = AutoScheduler(job_runner=MagicMock())
+        scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
         scheduler._click_and_wait = fake
         scheduler._run_refresh_batch("2026-07-17-6")
     finally:

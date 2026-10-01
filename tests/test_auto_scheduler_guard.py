@@ -18,6 +18,7 @@ def _isolate_scheduler_slots(tmp_path, monkeypatch):
 from web import auto_remote_state as state_mod
 from web.auto_config import AUTO_REMOTE_RISK_COOLDOWN_SECONDS
 from web.auto_scheduler import AutoScheduler
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def state_path(tmp_path: Path, monkeypatch) -> Path:
 
 
 def _scheduler_with_fake_click(fake):
-    scheduler = AutoScheduler(job_runner=MagicMock())
+    scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
     scheduler._click_and_wait = fake
     return scheduler
 
@@ -128,7 +129,7 @@ def test_cooldown_survives_new_instance(state_path: Path) -> None:
     state_mod.record_auto_remote_risk(trigger_stage="participate_triple", reason="429")
     assert state_mod.is_risk_paused() is True
     # “重启”：新 scheduler 读同一 per-Profile 文件，冷却仍生效。
-    assert AutoScheduler(job_runner=MagicMock())._remote_stage_allowed() is False
+    assert AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)._remote_stage_allowed() is False
 
 
 def test_profile_a_risk_does_not_affect_profile_b(tmp_path: Path, monkeypatch) -> None:
@@ -194,7 +195,7 @@ def test_rerisk_extends_cooldown(state_path: Path) -> None:
 
 
 def test_cleanup_risk_state_does_not_add_scheduler_work(state_path: Path) -> None:
-    scheduler = AutoScheduler(job_runner=MagicMock())
+    scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
     assert "cleanup" not in scheduler.get_status()["tasks"]
 
 
@@ -231,7 +232,7 @@ def test_refresh_batch_internal_steps_have_no_gap(state_path: Path) -> None:
 def test_collision_skips_batch_without_fatal(state_path: Path) -> None:
     runner = MagicMock()
     runner.is_running.return_value = True
-    scheduler = AutoScheduler(job_runner=runner)
+    scheduler = AutoScheduler(job_runner=runner, clock=daytime_cn_clock)
     scheduler._run_refresh_batch("2026-07-17-9")
     assert "2026-07-17-9" in scheduler._done_refresh
     runner.try_start.assert_not_called()

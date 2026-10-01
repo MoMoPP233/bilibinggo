@@ -18,6 +18,7 @@ def _isolate_scheduler_slots(tmp_path, monkeypatch):
 
 from web.auto_scheduler import AutoScheduler
 from src import following_feed as ff
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 _IDS = [f"20000000000000000{n:02d}" for n in range(1, 41)]
 
@@ -187,7 +188,7 @@ def test_scheduler_following_scan_runs_without_toggle(state_path: Path, monkeypa
         calls.append(action)
         return {}
 
-    scheduler = AutoScheduler(job_runner=MagicMock())
+    scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
     scheduler._click_and_wait = fake
     scheduler._run_following_scan("following-2026-07-17-06")
     assert calls == ["following_feed_scan"]

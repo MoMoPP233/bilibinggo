@@ -2020,10 +2020,11 @@ def _run_action_impl(
                     or (payload.get("context_snapshot") or {}).get("result_class")
                     or "failed_local"
                 )
-                if result_class not in {"unknown", "failed_local"}:
+                if result_class not in {"invalid_activity", "unknown", "failed_local"}:
                     result_class = "failed_local"
                 payload["result_class"] = result_class
-                _persist_triple_failure(payload)
+                if result_class != "invalid_activity":
+                    _persist_triple_failure(payload)
             except Exception as exc:
                 global_stop = _triple_global_stop_reason(exc, cancel_event)
                 if global_stop is not None:

@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 CN_TZ = timezone(timedelta(hours=8))
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +41,7 @@ def _scheduler() -> tuple[object, MagicMock]:
     from web.auto_scheduler import AutoScheduler
 
     runner = MagicMock()
-    scheduler = AutoScheduler(job_runner=runner)
+    scheduler = AutoScheduler(job_runner=runner, clock=daytime_cn_clock)
     scheduler._status.state = "running"
     return scheduler, runner
 

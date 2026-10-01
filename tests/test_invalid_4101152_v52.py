@@ -8,6 +8,7 @@ from src.activity_store import activity_exists, replace_all_activities
 from src.invalid_activities import invalid_activity_ids
 from src.lottery_api import DYNAMIC_DETAIL_URL, OPUS_DETAIL_URL
 from src.participation_errors import ParticipationReadError
+from src.participation_log import load_action_entries_for_uid
 
 
 DID = "1000000000000000201"
@@ -81,6 +82,7 @@ def test_confirmed_4101152_reuses_invalid_activity_tombstone(monkeypatch, isolat
     assert DID in invalid_activity_ids()
     assert WRAPPER in invalid_activity_ids()
     assert client.posts == []
+    assert len(load_action_entries_for_uid(UID)) == 1
 
 
 @pytest.mark.parametrize(

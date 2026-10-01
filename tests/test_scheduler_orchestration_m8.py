@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import web.auto_scheduler as sch
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +22,7 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _scheduler(fake):
-    scheduler = sch.AutoScheduler(job_runner=MagicMock())
+    scheduler = sch.AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
     scheduler._click_and_wait = fake
     return scheduler
 

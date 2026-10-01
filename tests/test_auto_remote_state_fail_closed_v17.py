@@ -29,6 +29,7 @@ import pytest
 from web import auto_remote_state as state_mod
 from web.auto_config import AUTO_REMOTE_RISK_COOLDOWN_SECONDS
 from web.auto_scheduler import AutoScheduler
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +48,7 @@ def state_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _scheduler_with_fake_click(fake):
-    scheduler = AutoScheduler(job_runner=MagicMock())
+    scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
     scheduler._click_and_wait = fake
     return scheduler
 

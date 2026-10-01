@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 import web.auto_scheduler as scheduler_mod
 from web.auto_scheduler import AutoScheduler
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 
 @pytest.fixture
@@ -30,7 +31,7 @@ def _slot_file(root: Path) -> Path:
 
 
 def _scheduler_with_count(count: list[int], slot_root: Path):
-    scheduler = AutoScheduler(job_runner=None)
+    scheduler = AutoScheduler(job_runner=None, clock=daytime_cn_clock)
     scheduler._click_and_wait = lambda action, pipeline_index=None: count.append(action)
     return scheduler
 
@@ -82,7 +83,7 @@ def test_profile_a_consumed_does_not_block_profile_b(tmp_path: Path, monkeypatch
 
     def make(root):
         monkeypatch.setattr(_data_paths, "get_profile_dir", lambda profile_id=None: root)
-        scheduler = AutoScheduler(job_runner=None)
+        scheduler = AutoScheduler(job_runner=None, clock=daytime_cn_clock)
         scheduler._click_and_wait = lambda action, pipeline_index=None: clicks.append(action)
         return scheduler
 
@@ -103,7 +104,7 @@ def test_persist_happens_before_any_remote_click(slot_root: Path) -> None:
         assert data.get("refresh") == "2026-09-06-03"
         clicks.append(action)
 
-    scheduler = AutoScheduler(job_runner=None)
+    scheduler = AutoScheduler(job_runner=None, clock=daytime_cn_clock)
     scheduler._click_and_wait = fake_click
     scheduler._run_refresh_batch("2026-09-06-03")
     assert _count(clicks) == 3
@@ -184,7 +185,7 @@ def test_collision_keeps_slot_consumed_across_restart(slot_root: Path) -> None:
         def get_status(self):
             return type("S", (), {"to_dict": lambda self: {"state": "running", "action": "x"}})()
 
-    scheduler_a = AutoScheduler(job_runner=RunnerBusy())
+    scheduler_a = AutoScheduler(job_runner=RunnerBusy(), clock=daytime_cn_clock)
     scheduler_a._run_refresh_batch("2026-09-06-12")
 
     clicks: list[str] = []
@@ -195,7 +196,7 @@ def test_collision_keeps_slot_consumed_across_restart(slot_root: Path) -> None:
 
 def test_stale_generation_cannot_claim(slot_root: Path) -> None:
     clicks: list[str] = []
-    scheduler = AutoScheduler(job_runner=None)
+    scheduler = AutoScheduler(job_runner=None, clock=daytime_cn_clock)
     scheduler._generation = 2
     errors: list[BaseException] = []
 

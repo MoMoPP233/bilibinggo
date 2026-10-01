@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from tests.scheduler_test_helpers import daytime_cn_clock
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +41,7 @@ def _scheduler() -> tuple[object, MagicMock, MagicMock]:
     from web.auto_scheduler import AutoScheduler
 
     runner = MagicMock()
-    scheduler = AutoScheduler(job_runner=runner)
+    scheduler = AutoScheduler(job_runner=runner, clock=daytime_cn_clock)
     scheduler._status.state = "running"
     fatal_spy = MagicMock()
     scheduler._fatal = fatal_spy
@@ -359,7 +360,7 @@ def test_case22_minus_799_unchanged(monkeypatch) -> None:
 def test_scheduler_internal_fatal_still_works() -> None:
     from web.auto_scheduler import AutoScheduler
 
-    scheduler = AutoScheduler(job_runner=MagicMock())
+    scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
     scheduler._fatal("调度器内部不可恢复错误")
 
     assert scheduler._status.state == "fatal"
