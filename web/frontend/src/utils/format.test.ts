@@ -128,6 +128,7 @@ describe("format equivalence (baseline snapshot)", () => {
     expect(formatJobProgressDisplay({"action": "participate", "progress_step": 0, "progress_total": 0})).toEqual(EXP.formatJobProgressDisplay[2]);
     expect(formatJobProgressDisplay({"action": "participate_triple", "progress_step": 0, "progress_total": 0})).toEqual(EXP.formatJobProgressDisplay[3]);
     expect(formatJobProgressDisplay({})).toEqual(EXP.formatJobProgressDisplay[4]);
+    expect(formatJobProgressDisplay({ action: "following_feed_scan", progress_total: 4, progress_step: 2, progress_stage: "分类中", progress_current: 120, progress_stage_total: 335 })).toEqual({ percent: 54, value: "120/335", suffix: "", showPercentSuffix: false });
   });
   it("formatProgressTitle", () => {
     expect(formatProgressTitle({"action": "participate"})).toEqual(EXP.formatProgressTitle[0]);
@@ -146,6 +147,7 @@ describe("format equivalence (baseline snapshot)", () => {
     expect(formatProgressDetail({"action": "watch_users", "progress_message": null, "message": null})).toEqual(EXP.formatProgressDetail[5]);
     expect(formatProgressDetail({"action": "watch_users", "progress_message": "进行中…", "message": "备用"})).toEqual(EXP.formatProgressDetail[6]);
     expect(formatProgressDetail({})).toEqual(EXP.formatProgressDetail[7]);
+    expect(formatProgressDetail({ action: "following_feed_scan", progress_stage: "分类中", progress_current: 120, progress_stage_total: 335 })).toBe("分类中：120/335");
   });
   it("formatAccountStat", () => {
     expect(formatAccountStat(null, true, false)).toEqual(EXP.formatAccountStat[0]);

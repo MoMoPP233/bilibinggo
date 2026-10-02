@@ -43,6 +43,9 @@ def test_insert_progress_finish_roundtrip(isolated_home: Path) -> None:
         total=1,
         message="进行中",
         log_summary="line1",
+        stage="分类中",
+        current=3,
+        stage_total=10,
         result={"a": 1},
     )
     assert finish_job(
@@ -59,6 +62,9 @@ def test_insert_progress_finish_roundtrip(isolated_home: Path) -> None:
     assert row["source"] == "ui"
     assert row["params"]["x"] == 1
     assert row["result"]["ok"] is True
+    assert row["progress_stage"] == "分类中"
+    assert row["progress_current"] == 3
+    assert row["progress_stage_total"] == 10
     assert get_latest_job()["id"] == job_id
 
 

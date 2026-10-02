@@ -61,6 +61,9 @@ def test_winner_malformed_scan_counts_and_bounds(tmp_path: Path, monkeypatch) ->
 def test_winner_state_view_exposes_skipped_without_message_body(tmp_path: Path, monkeypatch) -> None:
     import src.winner_scan.service as win
 
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr(win, "get_profile_dir", lambda: profile_dir)
     state = {"mention": {}, "reply": {}, "dm": {}}
     state["mention"]["malformed_skipped"] = [
         {

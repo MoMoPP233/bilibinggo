@@ -1479,23 +1479,56 @@ def _run_action_impl(
             raise ValueError("关注动态补漏不接受额外参数")
         from src.following_feed import scan_following_feed
 
+        last_logged_stage = ""
+        last_logged_classified = -1
+
+        def _stage_for_feed_message(message: str, done: int, total: int) -> tuple[str, int, int, int]:
+            text = str(message or "")
+            if "读取关注动态 Feed" in text:
+                return "获取 Feed", 0, 0, 1
+            if "候选" in text and "流水线" in text:
+                return "准备候选", 1, max(0, done), max(1, total)
+            if "写入活动库" in text or "入库完成" in text:
+                return "保存", 3, max(0, done), max(1, total)
+            if "详情" in text or "分类" in text or "LLM" in text:
+                return "分类中", 2, max(0, done), max(1, total)
+            return "分类中", 2, max(0, done), max(1, total)
+
         def on_feed_progress(done: int, total: int, message: str) -> None:
+            nonlocal last_logged_stage, last_logged_classified
             _raise_if_cancelled(cancel_event)
+            stage, step, current, stage_total = _stage_for_feed_message(message, done, total)
+            display = str(message or "关注动态扫描中…")
+            if stage == "分类中":
+                display = f"分类动态 {current}/{stage_total}"
+            log_append: str | None = None
+            should_log = stage != last_logged_stage
+            if stage == "分类中":
+                stride = max(10, stage_total // 20)
+                should_log = should_log or current in {0, stage_total} or current - last_logged_classified >= stride
+            if should_log:
+                log_append = display
+                last_logged_stage = stage
+                if stage == "分类中":
+                    last_logged_classified = current
             progress(
-                step=1,
-                total=1,
-                message=str(message or "关注动态扫描中…"),
-                log_append=str(message or "关注动态扫描中…"),
+                step=step,
+                total=4,
+                message=display,
+                stage=stage,
+                current=current,
+                stage_total=stage_total,
+                log_append=log_append,
             )
 
-        progress(step=0, total=1, message="开始关注动态补漏扫描…")
+        progress(step=0, total=4, message="开始关注动态补漏扫描…", stage="获取 Feed", current=0, stage_total=1)
         result = scan_following_feed(on_progress=on_feed_progress)
         # 结构解析失败（普通失败，非风控）：必须体现为 Job 失败，不能 success。
         # 明确风控以异常向上抛：由 JobRunner（auto）统一记录 global cooldown。
         if str(result.get("status") or "") == "failed":
             raise RuntimeError(str(result.get("message") or "关注动态补漏扫描失败"))
         message = str(result.get("message") or "关注动态补漏完成")
-        progress(step=1, total=1, message=message, log_append=message)
+        progress(step=4, total=4, message=message, stage="完成", current=1, stage_total=1, log_append=message)
         return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
 
     if action == "refresh_watch":

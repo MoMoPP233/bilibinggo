@@ -21,6 +21,12 @@ from src.job_store import (
 )
 from src.log_context import job_log_context
 from src.log_span import log_event
+from src.observability import (
+    JobMetrics,
+    format_performance_summary,
+    metrics_context,
+    performance_metrics,
+)
 from src.platform_risk import risk_code_of as _risk_code_of
 from src.restart_control import RestartPendingError, restart_control
 from web.actions import run_action
@@ -60,6 +66,9 @@ class JobStatus:
     progress_step: int = 0
     progress_total: int = 0
     progress_message: str = ""
+    progress_stage: str = ""
+    progress_current: int = 0
+    progress_stage_total: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +85,12 @@ class JobStatus:
             "progress_step": self.progress_step,
             "progress_total": self.progress_total,
             "progress_message": self.progress_message,
+            "stage": self.progress_stage,
+            "current": self.progress_current,
+            "total": self.progress_stage_total,
+            "progress_stage": self.progress_stage,
+            "progress_current": self.progress_current,
+            "progress_stage_total": self.progress_stage_total,
         }
 
 
@@ -123,6 +138,9 @@ def _status_from_row(row: dict[str, Any]) -> JobStatus:
         progress_step=int(row.get("progress_step") or 0),
         progress_total=int(row.get("progress_total") or 0),
         progress_message=str(row.get("message") or ""),
+        progress_stage=str(row.get("progress_stage") or ""),
+        progress_current=int(row.get("progress_current") or 0),
+        progress_stage_total=int(row.get("progress_stage_total") or 0),
     )
 
 
@@ -141,6 +159,9 @@ def _copy_status(status: JobStatus) -> JobStatus:
         progress_step=status.progress_step,
         progress_total=status.progress_total,
         progress_message=status.progress_message,
+        progress_stage=status.progress_stage,
+        progress_current=status.progress_current,
+        progress_stage_total=status.progress_stage_total,
     )
 
 
@@ -290,6 +311,9 @@ class JobRunner:
                 "message": "任务已启动",
                 "progress_step": 0,
                 "progress_total": 0,
+                "stage": "",
+                "current": 0,
+                "total": 0,
                 "result": {},
             },
         )
@@ -362,6 +386,9 @@ class JobRunner:
             total: int,
             message: str,
             log_append: str | None = None,
+            stage: str | None = None,
+            current: int | None = None,
+            stage_total: int | None = None,
             qrcode_refreshed_at: int | None = None,
             login_phase: str | None = None,
             result_patch: dict[str, Any] | None = None,
@@ -376,10 +403,19 @@ class JobRunner:
                     return
                 prev_step = self._status.progress_step
                 prev_message = self._status.message
+                prev_stage = self._status.progress_stage
+                prev_current = self._status.progress_current
+                prev_stage_total = self._status.progress_stage_total
                 self._status.progress_step = step
                 self._status.progress_total = total
                 self._status.progress_message = message
                 self._status.message = message
+                if stage is not None:
+                    self._status.progress_stage = str(stage or "")
+                if current is not None:
+                    self._status.progress_current = max(0, int(current))
+                if stage_total is not None:
+                    self._status.progress_stage_total = max(0, int(stage_total))
                 cleaned_chunk = ""
                 if log_append:
                     cleaned_chunk = sanitize_log(log_append) or ""
@@ -416,6 +452,9 @@ class JobRunner:
                     or message != prev_message
                     or result_touch
                     or bool(cleaned_chunk)
+                    or self._status.progress_stage != prev_stage
+                    or self._status.progress_current != prev_current
+                    or self._status.progress_stage_total != prev_stage_total
                 )
                 if changed:
                     publish_progress = True
@@ -424,15 +463,29 @@ class JobRunner:
                         "step": self._status.progress_step,
                         "total": self._status.progress_total,
                         "message": self._status.message,
+                        "stage": self._status.progress_stage,
+                        "current": self._status.progress_current,
+                        "stage_total": self._status.progress_stage_total,
                     }
                     if result_delta:
                         progress_event["result"] = result_delta
-                if step != prev_step or result_touch or login_touch or due:
+                if (
+                    step != prev_step
+                    or result_touch
+                    or login_touch
+                    or self._status.progress_stage != prev_stage
+                    or self._status.progress_current != prev_current
+                    or self._status.progress_stage_total != prev_stage_total
+                    or due
+                ):
                     should_flush = True
                     flush_payload = {
                         "step": self._status.progress_step,
                         "total": self._status.progress_total,
                         "message": self._status.message,
+                        "stage": self._status.progress_stage,
+                        "current": self._status.progress_current,
+                        "stage_total": self._status.progress_stage_total,
                         "log": self._status.log,
                         "result": dict(self._status.result) if self._status.result else None,
                     }
@@ -448,6 +501,9 @@ class JobRunner:
                         total=int(flush_payload["total"]),
                         message=str(flush_payload["message"]),
                         log_summary=str(flush_payload["log"]),
+                        stage=str(flush_payload["stage"]),
+                        current=int(flush_payload["current"]),
+                        stage_total=int(flush_payload["stage_total"]),
                         result=flush_payload["result"],
                     )
                     with self._lock:
@@ -475,6 +531,9 @@ class JobRunner:
                 return
             progress_step = self._status.progress_step
             progress_total = self._status.progress_total
+            progress_stage = self._status.progress_stage
+            progress_current = self._status.progress_current
+            progress_stage_total = self._status.progress_stage_total
             action_name = self._status.action
             if progress_total and state == "success":
                 # M4：只有真正完成全 scope 的 success 才补齐 total/total；
@@ -493,6 +552,9 @@ class JobRunner:
                     error_kind=error_kind,
                     progress_step=progress_step,
                     progress_total=progress_total,
+                    progress_stage=progress_stage,
+                    progress_current=progress_current,
+                    progress_stage_total=progress_stage_total,
                     finished_at=finished_at,
                 )
             )
@@ -513,6 +575,9 @@ class JobRunner:
                         error_kind=error_kind,
                         progress_step=progress_step,
                         progress_total=progress_total,
+                        progress_stage=progress_stage,
+                        progress_current=progress_current,
+                        progress_stage_total=progress_stage_total,
                         finished_at=finished_at,
                     )
                     db_ok = True
@@ -542,6 +607,9 @@ class JobRunner:
                 self._status.result = result
                 self._status.progress_step = progress_step
                 self._status.progress_total = progress_total
+                self._status.progress_stage = progress_stage
+                self._status.progress_current = progress_current
+                self._status.progress_stage_total = progress_stage_total
                 publish_terminal = True
         if publish_terminal:
             _publish_job_event(
@@ -551,6 +619,9 @@ class JobRunner:
                     "state": state,
                     "action": action_name,
                     "message": message,
+                    "stage": progress_stage,
+                    "current": progress_current,
+                    "total": progress_stage_total,
                     "log": log,
                     "result": result,
                 },
@@ -577,7 +648,8 @@ class JobRunner:
             job_source = str(self._status.source or "ui")
             started_mono = time.perf_counter()
             self._run_started_mono = started_mono
-        with job_log_context(job_id=job_id, action=action, job_source=job_source):
+        metrics = JobMetrics()
+        with job_log_context(job_id=job_id, action=action, job_source=job_source), metrics_context(metrics):
             log_event(
                 logger,
                 f"任务启动 action={action} source={job_source}",
@@ -631,6 +703,15 @@ class JobRunner:
                     result = current.result
                 else:
                     result = None
+                metric_snapshot = metrics.snapshot()
+                if metric_snapshot and state == "success":
+                    public_metrics = performance_metrics(metric_snapshot)
+                    if any(public_metrics.values()):
+                        result = dict(result or {})
+                        result.setdefault("observability", metric_snapshot)
+                        result["performance_metrics"] = public_metrics
+                        metric_line = format_performance_summary(public_metrics)
+                        log = f"{log}\n{metric_line}".strip()
                 self._apply_terminal(
                     job_id,
                     state=state,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+import time
 from typing import Any, Callable, Literal, Mapping
 
 from src.activity_store import append_activities, known_activity_ids
@@ -31,6 +32,7 @@ from src.pipeline.status_step import apply_initial_status
 from src.sources.common import CheckResult, normalize_activity_id
 from src.dead_links import is_http_not_found
 from src.invalid_activities import invalid_activity_ids
+from src.observability import bind_metrics, current_metrics
 
 logger = get_logger("pipeline")
 
@@ -384,6 +386,15 @@ def run_new_links_pipeline(
     scan_started_at 不为 None 时，会在入库前过滤「可可靠证明在扫描开始前已结束」的官方活动。
     0 额外 Bilibili 请求：只复用本流水线已抓取的 official lottery_notice 结构化时间。
     """
+    pipeline_started = time.perf_counter()
+
+    def _record_pipeline_duration() -> None:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.record_stage_duration(
+                "Pipeline总耗时", (time.perf_counter() - pipeline_started) * 1000
+            )
+
     source_observations = list(source_observations or [])
     source_page_stats = list(source_page_stats or [])
     status_by_raw: dict[str, str] = {}
@@ -427,6 +438,7 @@ def run_new_links_pipeline(
             canonical_by_raw=canonical_by_raw,
             persisted_ids=set(),
         )
+        _record_pipeline_duration()
         return PipelineResult(
             ok=True,
             pipeline_skipped=True,
@@ -475,6 +487,8 @@ def run_new_links_pipeline(
     provider_failed_count = 0
     completed_count = 0
     partial_reason = ""
+    task_metrics = current_metrics()
+    classification_started = time.perf_counter()
 
     if on_progress:
         on_progress(0, total, f"正在分类 {total} 条新链接…")
@@ -604,6 +618,10 @@ def run_new_links_pipeline(
                     on_progress(done, total, "分类进度")
     finally:
         reset_llm_provider_breaker(classify_token)
+        if task_metrics is not None:
+            task_metrics.record_stage_duration(
+                "分类阶段", (time.perf_counter() - classification_started) * 1000
+            )
 
     unprocessed_count = max(0, total - completed_count - provider_failed_count)
     partial = bool(breaker.opened or provider_failed_count)
@@ -694,6 +712,7 @@ def run_new_links_pipeline(
             canonical_by_raw=canonical_by_raw,
             persisted_ids=set(),
         )
+        _record_pipeline_duration()
         return PipelineResult(
             ok=True,
             pipeline_skipped=False,
@@ -736,17 +755,18 @@ def run_new_links_pipeline(
         # 已成功分类的结果必须继续保留；需要 LLM 的路径由 forward_parser 自行拦截。
         worker_token = bind_llm_provider_breaker(breaker)
         try:
-            return enrich_activity(
-                client,
-                dynamic_id=dynamic_id,
-                lottery_type=lottery_type,
-                participation=participations.get(dynamic_id),
-                classify_content=outcome.classify_content or None,
-                classify_detail=outcome.detail_item,
-                classify_notice=outcome.lottery_notice,
-                classify_notice_business_type=outcome.notice_business_type,
-                classify_notice_business_id=outcome.notice_business_id,
-            )
+            with bind_metrics(task_metrics):
+                return enrich_activity(
+                    client,
+                    dynamic_id=dynamic_id,
+                    lottery_type=lottery_type,
+                    participation=participations.get(dynamic_id),
+                    classify_content=outcome.classify_content or None,
+                    classify_detail=outcome.detail_item,
+                    classify_notice=outcome.lottery_notice,
+                    classify_notice_business_type=outcome.notice_business_type,
+                    classify_notice_business_id=outcome.notice_business_id,
+                )
         finally:
             reset_llm_provider_breaker(worker_token)
 
@@ -891,7 +911,11 @@ def run_new_links_pipeline(
             continue
         rows_to_persist.append(row)
 
+    persist_started = time.perf_counter()
     persisted = append_activities(rows_to_persist)
+    metrics = current_metrics()
+    if metrics is not None:
+        metrics.record_stage_duration("数据库保存", (time.perf_counter() - persist_started) * 1000)
     persisted_ids = {
         str(row.get("dynamic_id") or "")
         for row in rows_to_persist[: max(0, int(persisted or 0))]
@@ -927,6 +951,7 @@ def run_new_links_pipeline(
         persisted_ids=persisted_ids,
     )
 
+    _record_pipeline_duration()
     return PipelineResult(
         ok=True,
         pipeline_skipped=False,

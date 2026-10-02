@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
+import re
+import threading
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,9 @@ _BINGGO_FIELDS_KEY = "binggo_fields"
 
 _LOGGER_NAME = "binggo"
 _CONFIGURED = False
-_LOG_FILENAME = "binggo.log"
+_LEGACY_LOG_FILENAME = "binggo.log"
+_DAILY_LOG_RE = re.compile(r"^binggo-(\d{4}-\d{2}-\d{2})\.log$")
+_LOG_RETENTION_DAYS = 7
 
 DEFAULT_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -30,7 +33,8 @@ def log_dir() -> Path:
 
 
 def log_file() -> Path:
-    return log_dir() / _LOG_FILENAME
+    today = datetime.now().astimezone().date().isoformat()
+    return log_dir() / f"binggo-{today}.log"
 
 
 # 兼容旧 `from src.app_logging import LOG_DIR, LOG_FILE`；setup 后会刷新
@@ -137,14 +141,92 @@ class ConsoleFormatter(logging.Formatter):
         return redact_text(text)
 
 
+class DailyFileHandler(logging.Handler):
+    """按本地日期写入 Profile-local 文件，并保留最近七天。"""
+
+    def __init__(self, directory: Path, *, encoding: str = "utf-8") -> None:
+        super().__init__()
+        self.directory = Path(directory)
+        self.encoding = encoding
+        self._stream = None
+        self._path: Path | None = None
+        self._lock = threading.RLock()
+
+    def _path_for_record(self, record: logging.LogRecord) -> Path:
+        local_date = datetime.fromtimestamp(record.created).astimezone().date().isoformat()
+        return self.directory / f"binggo-{local_date}.log"
+
+    def _open_for(self, path: Path) -> None:
+        if self._path == path and self._stream is not None:
+            return
+        if self._stream is not None:
+            self._stream.close()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = path.open("a", encoding=self.encoding, newline="")
+        self._path = path
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            with self._lock:
+                path = self._path_for_record(record)
+                self._open_for(path)
+                text = self.format(record)
+                self._stream.write(text + "\n")
+                self._stream.flush()
+                _cleanup_daily_logs(self.directory)
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+            self._path = None
+        super().close()
+
+
+def _cleanup_daily_logs(directory: Path, *, today: date | None = None) -> None:
+    current = today or datetime.now().astimezone().date()
+    cutoff = current - timedelta(days=_LOG_RETENTION_DAYS - 1)
+    for path in directory.glob("binggo-????-??-??.log"):
+        match = _DAILY_LOG_RE.match(path.name)
+        if not match:
+            continue
+        try:
+            file_date = date.fromisoformat(match.group(1))
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                path.unlink()
+            except OSError:
+                # 日志清理失败不应阻断应用启动或业务任务。
+                pass
+
+
+def _migrate_legacy_log(directory: Path, current: Path) -> None:
+    """首次升级时把旧单文件日志带入当天文件，避免继续无限增长。"""
+    legacy = directory / _LEGACY_LOG_FILENAME
+    if legacy == current or not legacy.is_file() or current.exists():
+        return
+    try:
+        legacy.replace(current)
+    except OSError:
+        # 旧文件可能被另一进程占用；新 handler 仍可独立写当天文件。
+        pass
+
+
 def setup_logging(*, level: int = logging.INFO, console: bool = True) -> Path:
-    """初始化应用日志：写入 data/logs/binggo.log（JSONL），可选同步输出到控制台。"""
+    """初始化应用日志：按本地日期写入 Profile-local JSONL 文件。"""
     global _CONFIGURED, LOG_DIR, LOG_FILE
     directory = log_dir()
     path = log_file()
     LOG_DIR = directory
     LOG_FILE = path
     directory.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_log(directory, path)
+    _cleanup_daily_logs(directory)
 
     root = logging.getLogger(_LOGGER_NAME)
     root.setLevel(level)
@@ -154,12 +236,7 @@ def setup_logging(*, level: int = logging.INFO, console: bool = True) -> Path:
     # Filter 只挂 handler，避免 logger+handler 双跑
     context_filter = ContextFieldsFilter()
 
-    file_handler = RotatingFileHandler(
-        path,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
+    file_handler = DailyFileHandler(directory, encoding="utf-8")
     file_handler.setFormatter(JsonLineFormatter())
     file_handler.addFilter(context_filter)
     root.addHandler(file_handler)

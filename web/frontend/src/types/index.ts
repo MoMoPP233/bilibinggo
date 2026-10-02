@@ -10,6 +10,12 @@ export interface JobStatus {
   progress_step?: number;
   progress_total?: number;
   progress_message?: string;
+  stage?: string;
+  current?: number;
+  total?: number;
+  progress_stage?: string;
+  progress_current?: number;
+  progress_stage_total?: number;
   log?: string;
   result?: Record<string, unknown> | null;
   finished_at?: string | null;

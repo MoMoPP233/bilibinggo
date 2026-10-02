@@ -12,6 +12,12 @@ interface FormatJobLike {
   progress_step?: unknown;
   progress_total?: unknown;
   progress_message?: unknown;
+  stage?: unknown;
+  current?: unknown;
+  total?: unknown;
+  progress_stage?: unknown;
+  progress_current?: unknown;
+  progress_stage_total?: unknown;
   message?: unknown;
   label?: unknown;
   result?: { targets?: unknown[] | null } | null;
@@ -137,6 +143,13 @@ export function formatJobProgressDisplay(job: FormatJobLike): {
   suffix: string;
   showPercentSuffix: boolean;
 } {
+  if (job.action === "following_feed_scan" && job.progress_stage) {
+    const current = Math.max(0, Number(job.progress_current ?? job.current) || 0);
+    const total = Math.max(1, Number(job.progress_stage_total ?? job.total) || 1);
+    if (total > 1) {
+      return { percent: calcJobProgressPercent(job), value: `${current}/${total}`, suffix: "", showPercentSuffix: false };
+    }
+  }
   const step = Number(job.progress_step) || 0;
   const total = Number(job.progress_total) || 0;
   const percent = calcJobProgressPercent(job);
@@ -160,6 +173,13 @@ export function formatProgressTitle(job: FormatJobLike): string {
 }
 
 export function formatProgressDetail(job: FormatJobLike): string {
+  if (job.action === "following_feed_scan" && job.progress_stage) {
+    const stage = sanitizeUserText(job.progress_stage) || "处理中";
+    const current = Math.max(0, Number(job.progress_current ?? job.current) || 0);
+    const total = Math.max(1, Number(job.progress_stage_total ?? job.total) || 1);
+    if (total > 1 || stage === "分类中") return `${stage}：${current}/${total}`;
+    return stage;
+  }
   if (job.action === "participate") {
     const message = sanitizeUserText(job.progress_message || job.message || "");
     if (message && !message.includes("|")) return message;

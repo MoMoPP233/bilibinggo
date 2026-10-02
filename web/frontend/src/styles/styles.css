@@ -3057,6 +3057,13 @@ html.sidebar-init-collapsed .system-btn {
   max-width: 52ch;
 }
 
+.watch-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .watch-sync-btn {
   flex-shrink: 0;
   align-self: flex-start;
@@ -7860,8 +7867,12 @@ body.job-running .main-shell .topbar {
     align-items: stretch;
   }
 
-  .watch-sync-btn {
+  .watch-panel-actions {
     width: 100%;
+  }
+
+  .watch-sync-btn {
+    flex: 1 1 220px;
   }
 
   .watch-layout {

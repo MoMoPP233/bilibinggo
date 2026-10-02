@@ -126,7 +126,7 @@ def test_missing_offset_is_incomplete_and_does_not_call_pipeline(state_path, mon
     assert ff.following_feed_info()["last_seen_dynamic_id"] == IDS[-1]
 
 
-def test_hard_cap_never_requests_page_21_or_runs_pipeline(state_path, monkeypatch):
+def test_hard_cap_never_requests_page_21_and_processes_safe_window(state_path, monkeypatch):
     ff._write_state({"last_seen_dynamic_id": IDS[-1]})
     calls = pipeline_spy(monkeypatch)
     pages = [payload([IDS[index]], offset=f"o{index + 1}", has_more=True) for index in range(ff.FOLLOW_FEED_MAX_PAGES)]
@@ -136,7 +136,11 @@ def test_hard_cap_never_requests_page_21_or_runs_pipeline(state_path, monkeypatc
     assert result["stop_reason"] == "hard_cap_reached"
     assert len(client.calls) == ff.FOLLOW_FEED_MAX_PAGES
     assert client.calls[-1]["page"] == ff.FOLLOW_FEED_MAX_PAGES
-    assert calls == []
+    assert len(calls) == 1
+    assert len(calls[0][0]) == ff.FOLLOW_FEED_MAX_PAGES
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["history_status"] == "pending"
+    assert state["history_next_page"] == ff.FOLLOW_FEED_MAX_PAGES + 1
 
 
 def test_partial_pipeline_preserves_checkpoint_and_anchors(state_path, monkeypatch):

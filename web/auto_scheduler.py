@@ -971,16 +971,17 @@ class AutoScheduler:
         self._set_task_status("following", "running", "关注动态补漏开始")
         self._log("info", f"关注动态补漏刻度 {key}")
         try:
-            self._click_and_wait("following_feed_scan")
+            outcome = self._click_and_wait("following_feed_scan") or {}
             self._done_following.add(key)
             if self._is_stale():
                 # 停止/换代：Job 自行自然结束，旧代不再推进阶段状态。
                 return
+            detail = str(outcome.get("message") or "关注动态补漏完成")
             with self._lock:
-                self._status.message = "关注动态补漏完成"
+                self._status.message = detail
             self._mark_remote_stage_finished()
-            self._set_task_status("following", "completed", "关注动态补漏完成")
-            self._set_phase("等待下一刻度", "关注动态补漏完成")
+            self._set_task_status("following", "completed", detail)
+            self._set_phase("等待下一刻度", detail)
         except CollisionError:
             self._log("warn", "关注动态补漏发现已有任务在运行，本轮跳过。")
             self._set_task_status("following", "skipped_busy", "本轮跳过（任务占用）")

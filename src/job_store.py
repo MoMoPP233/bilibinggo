@@ -81,7 +81,15 @@ def dumps_result_json(result: dict[str, Any] | None) -> str | None:
     raw = text.encode("utf-8")
     if len(raw) <= RESULT_JSON_MAX_BYTES:
         return text
-    keep_keys = ("login_phase", "skipped", "joined", "failed", "from_auto", "qrcode_refreshed_at")
+    keep_keys = (
+        "login_phase",
+        "skipped",
+        "joined",
+        "failed",
+        "from_auto",
+        "qrcode_refreshed_at",
+        "performance_metrics",
+    )
     slim: dict[str, Any] = {"_truncated": True, "keys": sorted(str(k) for k in result.keys())}
     for key in keep_keys:
         if key in result:
@@ -99,6 +107,9 @@ def row_to_dict(row: JobRow) -> dict[str, Any]:
         "params": loads_json(row.params_json, default={}) or {},
         "progress_step": int(row.progress_step or 0),
         "progress_total": int(row.progress_total or 0),
+        "progress_stage": row.progress_stage or "",
+        "progress_current": int(row.progress_current or 0),
+        "progress_stage_total": int(row.progress_stage_total or 0),
         "message": row.message or "",
         "log_summary": row.log_summary or "",
         "result": loads_json(row.result_json, default=None),
@@ -150,6 +161,9 @@ def update_job_progress(
     total: int,
     message: str,
     log_summary: str,
+    stage: str = "",
+    current: int | None = None,
+    stage_total: int | None = None,
     result: dict[str, Any] | None = None,
 ) -> None:
     with session_scope() as session:
@@ -158,6 +172,9 @@ def update_job_progress(
             return
         row.progress_step = int(step)
         row.progress_total = int(total)
+        row.progress_stage = str(stage or "")
+        row.progress_current = max(0, int(current if current is not None else step))
+        row.progress_stage_total = max(0, int(stage_total if stage_total is not None else total))
         row.message = message or ""
         row.log_summary = truncate_log_summary(log_summary)
         if result is not None:
@@ -175,6 +192,9 @@ def finish_job(
     error_kind: str | None = None,
     progress_step: int | None = None,
     progress_total: int | None = None,
+    progress_stage: str | None = None,
+    progress_current: int | None = None,
+    progress_stage_total: int | None = None,
     finished_at: int | None = None,
 ) -> bool:
     if state not in _TERMINAL_STATES:
@@ -197,6 +217,12 @@ def finish_job(
             row.progress_step = int(progress_step)
         if progress_total is not None:
             row.progress_total = int(progress_total)
+        if progress_stage is not None:
+            row.progress_stage = str(progress_stage or "")
+        if progress_current is not None:
+            row.progress_current = max(0, int(progress_current))
+        if progress_stage_total is not None:
+            row.progress_stage_total = max(0, int(progress_stage_total))
         session.add(row)
         return True
 

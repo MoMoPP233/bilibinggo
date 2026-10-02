@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any
 
 import httpx
 
 from src.llm_config import LlmConfig, load_llm_config
 from src.retry_utils import is_transient_http_error, retry_call
+from src.observability import current_metrics
 
 import threading
 
@@ -209,10 +211,16 @@ def _post_chat_completion(
     无论 success/timeout/429/5xx/invalid 都直接返回第一次结果。
     """
     def _call() -> dict[str, Any]:
-        with httpx.Client(timeout=_LLM_TIMEOUT) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        started = time.perf_counter()
+        try:
+            with httpx.Client(timeout=_LLM_TIMEOUT) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        finally:
+            metrics = current_metrics()
+            if metrics is not None:
+                metrics.record_llm_call((time.perf_counter() - started) * 1000)
 
     return retry_call(_call, attempts=attempts, retry_on=_llm_retryable)
 

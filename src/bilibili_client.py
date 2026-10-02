@@ -17,6 +17,7 @@ from src.bilibili_request_budget import (
     RequestBudgetExhausted,
     reserve_bilibili_http_attempt,
 )
+from src.observability import current_metrics, request_kind
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -123,7 +124,17 @@ class BilibiliClient:
         reserve_bilibili_http_attempt(url)
         acquire_bilibili_request_slot()
         with self._http_lock:
-            return self._client.get(url, params=params or {}, headers=headers)
+            started = time.perf_counter()
+            try:
+                return self._client.get(url, params=params or {}, headers=headers)
+            finally:
+                metrics = current_metrics()
+                if metrics is not None:
+                    metrics.record_bilibili_request(
+                        url,
+                        (time.perf_counter() - started) * 1000,
+                        kind=request_kind(url),
+                    )
 
     def _http_post(
         self,
@@ -137,13 +148,23 @@ class BilibiliClient:
         reserve_bilibili_http_attempt(url)
         acquire_bilibili_request_slot()
         with self._http_lock:
-            return self._client.post(
-                url,
-                params=params or {},
-                data=data,
-                json=json,
-                headers=headers,
-            )
+            started = time.perf_counter()
+            try:
+                return self._client.post(
+                    url,
+                    params=params or {},
+                    data=data,
+                    json=json,
+                    headers=headers,
+                )
+            finally:
+                metrics = current_metrics()
+                if metrics is not None:
+                    metrics.record_bilibili_request(
+                        url,
+                        (time.perf_counter() - started) * 1000,
+                        kind=request_kind(url),
+                    )
 
     def close(self) -> None:
         self._client.close()

@@ -445,6 +445,9 @@ class JobRow(SQLModel, table=True):
     params_json: str = Field(default="{}", sa_column=Column(Text, nullable=False))
     progress_step: int = 0
     progress_total: int = 0
+    progress_stage: str = ""
+    progress_current: int = 0
+    progress_stage_total: int = 0
     message: str = ""
     log_summary: str = Field(default="", sa_column=Column(Text, nullable=False))
     result_json: Optional[str] = Field(default=None, sa_column=Column(Text))

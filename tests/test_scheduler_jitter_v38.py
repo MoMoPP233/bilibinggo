@@ -6,6 +6,7 @@ import random
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -26,6 +27,20 @@ class Clock:
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr("src.data_paths.get_profile_dir", lambda profile_id=None: tmp_path)
     monkeypatch.setattr(sch.AutoScheduler, "_schedule_auto_snapshot", lambda *a, **kw: None)
+    # Windows 上临时文件刚关闭时，杀毒/索引器可能短暂持有目标文件句柄。
+    # 只在本测试适配这一过渡窗口；生产写入逻辑和失败语义保持不变。
+    original_write = sch._write_slot_state_atomic
+
+    def write_with_windows_retry(path, state):
+        for attempt in range(4):
+            try:
+                return original_write(path, state)
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.02)
+
+    monkeypatch.setattr(sch, "_write_slot_state_atomic", write_with_windows_retry)
 
 
 def make(clock, delay=240):

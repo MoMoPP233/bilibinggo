@@ -21,6 +21,12 @@ _JOB_V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("error_kind", "TEXT"),
 )
 
+_JOB_PROGRESS_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("progress_stage", "TEXT NOT NULL DEFAULT ''"),
+    ("progress_current", "INTEGER NOT NULL DEFAULT 0"),
+    ("progress_stage_total", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 def migrate_v1_to_v2(session: Session) -> None:
     """为已有 jobs 表补齐 v2 列与索引；列已存在则跳过（幂等）。"""
@@ -41,6 +47,31 @@ def migrate_v1_to_v2(session: Session) -> None:
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_state ON jobs(state)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_finished_at ON jobs(finished_at)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_created_at ON jobs(created_at)"))
+
+
+def migrate_v11_to_v12(session: Session) -> None:
+    """为任务增加通用阶段进度字段；不改变旧 step/total 语义。"""
+    conn = session.connection()
+    existing = {
+        str(row[1])
+        for row in conn.execute(text("PRAGMA table_info(jobs)")).fetchall()
+    }
+    for name, decl in _JOB_PROGRESS_COLUMNS:
+        if name not in existing:
+            conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {decl}"))
+
+
+def _ensure_job_progress_columns(session: Session) -> None:
+    """Add observability columns without changing the public schema version."""
+    conn = session.connection()
+    if conn.execute(
+        text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'")
+    ).fetchone() is None:
+        return
+    existing = {str(row[1]) for row in conn.execute(text("PRAGMA table_info(jobs)"))}
+    for name, decl in _JOB_PROGRESS_COLUMNS:
+        if name not in existing:
+            conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {decl}"))
 
 
 def _validate_participation_guard_table(session: Session) -> None:
@@ -622,7 +653,7 @@ def _jobs_table_has_v2_columns(session: Session) -> bool:
         str(row[1])
         for row in conn.execute(text("PRAGMA table_info(jobs)")).fetchall()
     }
-    return all(name in existing for name, _ in _JOB_V2_COLUMNS)
+    return all(name in existing for name, _ in (*_JOB_V2_COLUMNS, *_JOB_PROGRESS_COLUMNS))
 
 
 def _schema_newer_than_code_error(recorded: int) -> RuntimeError:
@@ -684,6 +715,7 @@ def init_db() -> None:
                     migrate(session)
                     current += 1
                     meta.version = current
+                _ensure_job_progress_columns(session)
                 if not _jobs_table_has_v2_columns(session):
                     raise RuntimeError("jobs 表结构不完整，无法安全启动")
                 _validate_participation_guard_table(session)

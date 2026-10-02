@@ -272,4 +272,49 @@ describe("task log dock: original circular launcher + expanded blue card", () =>
     jobs.updateJobUI({ state: "running", action: "login", message: "等待扫码", log: "" });
     expect(document.getElementById("log-dock-progress-value")?.textContent).toBe("运行中");
   });
+
+  it("renders structured performance metrics when the terminal log omitted them", async () => {
+    const jobs = await import("./index");
+    jobs.updateJobUI({
+      state: "success",
+      action: "following_feed_scan",
+      message: "完成",
+      log: "关注动态补漏完成",
+      result: {
+        performance_metrics: {
+          pipeline_duration_ms: 1_300_000,
+          feed_fetch_duration_ms: 40_000,
+          classify_duration_ms: 1_260_000,
+          detail_requests: 160,
+          detail_duration_ms: 300_000,
+          notice_requests: 80,
+          notice_duration_ms: 120_000,
+          body_requests: 12,
+          body_duration_ms: 20_000,
+          llm_calls: 60,
+          llm_cache_hits: 7,
+          llm_duration_ms: 900_000,
+          db_save_duration_ms: 20,
+        },
+      },
+    });
+    const text = document.getElementById("job-log")?.textContent || "";
+    expect(text).toContain("性能：Pipeline 21m40s");
+    expect(text).toContain("Detail 160次/5m00s");
+    expect(text).toContain("LLM 60次/15m00s（缓存命中 7）");
+  });
+
+  it("does not duplicate the performance summary already supplied by the backend", async () => {
+    const jobs = await import("./index");
+    const line = "性能：Pipeline 1m05s；Feed获取 1s";
+    jobs.updateJobUI({
+      state: "success",
+      action: "following_feed_scan",
+      message: "完成",
+      log: `完成\n${line}`,
+      result: { performance_metrics: { pipeline_duration_ms: 65_000 } },
+    });
+    const text = document.getElementById("job-log")?.textContent || "";
+    expect(text.match(/性能：/g)).toHaveLength(1);
+  });
 });

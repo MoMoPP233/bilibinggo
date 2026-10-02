@@ -1131,6 +1131,18 @@ export function calcJobProgressPercent(job) {
   const total = Number(job.progress_total) || 0;
   const step = Number(job.progress_step) || 0;
   if (total <= 0) return 8;
+  if (job.action === "following_feed_scan") {
+    if (step >= total || job.state === "success") return 100;
+    const stage = String(job.progress_stage || job.stage || "");
+    const current = Math.max(0, Number(job.progress_current ?? job.current) || 0);
+    const stageTotal = Math.max(1, Number(job.progress_stage_total ?? job.total) || 1);
+    const ratio = Math.min(1, current / stageTotal);
+    if (stage === "获取 Feed") return Math.min(20, Math.round(ratio * 12));
+    if (stage === "准备候选") return Math.min(40, 20 + Math.round(ratio * 20));
+    if (stage === "分类中") return Math.min(80, 40 + Math.round(ratio * 40));
+    if (stage === "保存") return Math.min(96, 80 + Math.round(ratio * 16));
+    return Math.min(96, Math.round((step / total) * 100));
+  }
   if (isRefreshPipelineAction(job.action)) {
     const dsCount = refreshAllDataSourceCount(job);
     const detail = String(job.progress_message || job.message || "");
@@ -1315,7 +1327,11 @@ export function updateProgressUI(job) {
 
 export function updateJobUI(job) {
   jobMessage.textContent = sanitizeUserText(job.message) || "暂无任务";
-  jobLog.textContent = sanitizeUserText(job.log) || "";
+  const safeLog = sanitizeUserText(job.log) || "";
+  const performanceLine = formatPerformanceMetrics(job?.result?.performance_metrics);
+  jobLog.textContent = performanceLine && !safeLog.includes("性能：")
+    ? [safeLog, performanceLine].filter(Boolean).join("\n")
+    : safeLog;
   syncLogDockTone(job);
   const jobState = String(job?.state || "idle");
   lastLogDockJobState = jobState;
@@ -1324,6 +1340,48 @@ export function updateJobUI(job) {
   }
   setButtonsDisabled(job.state === "running");
   updateProgressUI(job);
+}
+
+export function formatPerformanceMetrics(raw) {
+  if (!raw || typeof raw !== "object") return "";
+  const count = (key) => Math.max(0, Number(raw[key]) || 0);
+  const duration = (milliseconds) => {
+    const value = Math.max(0, Math.floor(Number(milliseconds) || 0));
+    if (value < 1000) return `${value}ms`;
+    const seconds = Math.floor(value / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    if (minutes < 60) return `${minutes}m${String(remainingSeconds).padStart(2, "0")}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
+  };
+  const values = [
+    "pipeline_duration_ms",
+    "feed_fetch_duration_ms",
+    "classify_duration_ms",
+    "detail_requests",
+    "detail_duration_ms",
+    "notice_requests",
+    "notice_duration_ms",
+    "body_requests",
+    "body_duration_ms",
+    "llm_calls",
+    "llm_cache_hits",
+    "llm_duration_ms",
+    "db_save_duration_ms",
+  ];
+  if (!values.some((key) => count(key) > 0)) return "";
+  return [
+    `性能：Pipeline ${duration(count("pipeline_duration_ms"))}`,
+    `Feed获取 ${duration(count("feed_fetch_duration_ms"))}`,
+    `分类 ${duration(count("classify_duration_ms"))}`,
+    `Detail ${count("detail_requests")}次/${duration(count("detail_duration_ms"))}`,
+    `Notice ${count("notice_requests")}次/${duration(count("notice_duration_ms"))}`,
+    `正文 ${count("body_requests")}次/${duration(count("body_duration_ms"))}`,
+    `LLM ${count("llm_calls")}次/${duration(count("llm_duration_ms"))}（缓存命中 ${count("llm_cache_hits")}）`,
+    `DB ${duration(count("db_save_duration_ms"))}`,
+  ].join("；");
 }
 
 export async function startJob(action, params = {}) {
@@ -1443,6 +1501,22 @@ function beginPostJobBackgroundRefresh(job) {
   });
 }
 
+export function formatFollowingFeedResult(job) {
+  const result = job?.result || {};
+  const count = (value) => Math.max(0, Number(value) || 0);
+  const stopReason = sanitizeUserText(result.stop_reason || "unknown");
+  const historyStatus = sanitizeUserText(result.history_status || "unknown");
+  const catchUp = result.catch_up_complete === true ? "已完成" : "未完成";
+  return [
+    `抓取 ${count(result.scanned_items)} 条`,
+    `处理 ${count(result.processed)} 条`,
+    `新增 ${count(result.added)} 条`,
+    `停止原因：${stopReason}`,
+    `追赶覆盖：${catchUp}`,
+    `历史状态：${historyStatus}`,
+  ].join(" · ");
+}
+
 export async function handleJobCompletion(job) {
   dismissRunningToasts();
 
@@ -1466,7 +1540,9 @@ export async function handleJobCompletion(job) {
       showParticipationResult(job);
     }
   } else if (job.state === "success") {
-    if (SYNC_TOAST_ACTIONS.has(job.action)) {
+    if (job.action === "following_feed_scan") {
+      showToast("关注动态扫描完成", "success", formatFollowingFeedResult(job));
+    } else if (SYNC_TOAST_ACTIONS.has(job.action)) {
       const detail = formatToastDetail(job);
       showToast(sanitizeUserText(job.message) || "任务完成", "success", detail);
     }
@@ -1531,6 +1607,9 @@ export function bindActionButtons() {
       if (action === "refresh_source") {
         setButtonLoading(button, true, { label: "更新中…" });
         setSourceRowUpdating(params.source_id, true);
+      }
+      if (action === "following_feed_scan") {
+        setButtonLoading(button, true, { label: "扫描中…" });
       }
       try {
         if (action === "refresh_all") {
@@ -1624,6 +1703,12 @@ export function mergeJobProgress(payload) {
     source: base.source || "ui",
     progress_step: payload.step ?? base.progress_step ?? 0,
     progress_total: payload.total ?? base.progress_total ?? 0,
+    progress_stage: payload.stage ?? base.progress_stage ?? base.stage ?? "",
+    progress_current: payload.current ?? base.progress_current ?? base.current ?? 0,
+    progress_stage_total: payload.stage_total ?? base.progress_stage_total ?? base.total ?? 0,
+    stage: payload.stage ?? base.stage ?? base.progress_stage ?? "",
+    current: payload.current ?? base.current ?? base.progress_current ?? 0,
+    total: payload.stage_total ?? base.total ?? base.progress_stage_total ?? 0,
     message: payload.message || base.message || "",
     progress_message: payload.message || base.progress_message || "",
     log: base.log || "",

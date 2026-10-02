@@ -1,8 +1,10 @@
-"""从 binggo.log（JSONL）有界读取并按 job_id 过滤。"""
+"""从最近七天的按日 JSONL 日志有界读取并按 job_id 过滤。"""
 
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from src.log_redact import redact_obj
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 500
 _MAX_READ_BYTES = 2 * 1024 * 1024  # 单文件最多读尾部 2MB，防爆内存
+_DAILY_LOG_RE = re.compile(r"^binggo-\d{4}-\d{2}-\d{2}\.log$")
 
 
 def clamp_limit(limit: int | None) -> int:
@@ -24,15 +27,26 @@ def clamp_limit(limit: int | None) -> int:
 
 
 def iter_log_paths() -> list[Path]:
-    """当前文件 + 最近一份备份（若存在）。"""
-    current = log_file()
-    paths: list[Path] = []
-    if current.is_file():
-        paths.append(current)
-    backup = Path(str(current) + ".1")
-    if backup.is_file():
-        paths.append(backup)
-    return paths
+    """返回最近七天日志，旧单文件名仅作为升级兼容回退。"""
+    directory = log_dir()
+    today = datetime.now().astimezone().date()
+    cutoff = today - timedelta(days=6)
+    paths = []
+    for path in directory.glob("binggo-????-??-??.log"):
+        match = _DAILY_LOG_RE.match(path.name)
+        if not match:
+            continue
+        try:
+            file_date = datetime.strptime(path.stem.removeprefix("binggo-"), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if cutoff <= file_date <= today:
+            paths.append(path)
+    paths.sort()
+    if paths:
+        return paths
+    legacy = directory / "binggo.log"
+    return [legacy] if legacy.is_file() else []
 
 
 def _read_tail_text(path: Path, *, max_bytes: int = _MAX_READ_BYTES) -> str:

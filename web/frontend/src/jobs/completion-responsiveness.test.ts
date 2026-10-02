@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import indexHtml from "../../index.html?raw";
 
 const mocks = vi.hoisted(() => ({
   fetchJSON: vi.fn(),
@@ -105,6 +106,12 @@ function setupDom(): void {
       <button id="job-result-close" type="button"></button>
     </div>
     <div id="toast-stack"></div>
+    <div id="watch-panel">
+      <div class="watch-panel-actions">
+        <button type="button" data-action="refresh_watch">更新监控用户动态</button>
+        <button type="button" data-action="following_feed_scan">立即扫描关注动态</button>
+      </div>
+    </div>
     <button type="button" class="btn btn-primary" data-action="participate">参与</button>
     <button type="button" data-action="participate_triple" id="triple-participate-btn">三连参与</button>
     <button type="button" data-job-control="1">独立任务控件</button>`;
@@ -159,6 +166,79 @@ describe("job completion responsiveness", () => {
     mocks.isLlmConfigured.mockReturnValue(true);
     mocks.syncProfilesAfterLoginJob.mockResolvedValue(false);
     mocks.prefersReducedMotion.mockReturnValue(false);
+  });
+
+  it("keeps the manual Following Feed action beside the watch refresh action", () => {
+    const template = document.createElement("template");
+    template.innerHTML = indexHtml;
+    const actions = template.content.querySelector("#watch-panel .watch-panel-actions");
+    expect(actions?.querySelector('[data-action="refresh_watch"]')).not.toBeNull();
+    expect(actions?.querySelector('[data-action="following_feed_scan"]')?.textContent).toContain(
+      "立即扫描关注动态",
+    );
+  });
+
+  it("starts the manual Following Feed job once and restores the button with result details", async () => {
+    const running = job({ id: 74, action: "following_feed_scan", state: "running", message: "扫描中" });
+    mocks.fetchJSON
+      .mockResolvedValueOnce({ ok: true, job: running })
+      .mockResolvedValue(running);
+
+    const jobs = await loadJobsModule();
+    jobs.bindActionButtons();
+    const button = document.querySelector<HTMLButtonElement>('[data-action="following_feed_scan"]');
+    button?.click();
+    await flush();
+
+    expect(mocks.fetchJSON).toHaveBeenCalledWith("/api/jobs", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ action: "following_feed_scan", params: {} }),
+    }));
+    expect(mocks.setButtonLoading).toHaveBeenCalledWith(button, true, { label: "扫描中…" });
+    expect(button?.disabled).toBe(true);
+
+    await jobs.finishJobOnce(job({
+      id: 74,
+      action: "following_feed_scan",
+      state: "success",
+      message: "关注动态本轮已处理 403 条，新增 7 条；历史追赶尚未完成",
+      result: {
+        scanned_items: 411,
+        processed: 403,
+        added: 7,
+        stop_reason: "hard_cap_reached",
+        catch_up_complete: false,
+        history_status: "pending",
+      },
+    }));
+
+    expect(button?.disabled).toBe(false);
+    expect(mocks.clearActionButtonLoading).toHaveBeenCalledTimes(1);
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      "关注动态扫描完成",
+      "success",
+      expect.stringMatching(/抓取 411 条.*处理 403 条.*新增 7 条.*hard_cap_reached.*未完成.*pending/),
+    );
+  });
+
+  it("restores the manual Following Feed button and explains a busy job", async () => {
+    const busy = Object.assign(new Error("已有任务正在运行"), { code: "JOB_BUSY" });
+    mocks.fetchJSON.mockRejectedValueOnce(busy);
+
+    const jobs = await loadJobsModule();
+    jobs.bindActionButtons();
+    const button = document.querySelector<HTMLButtonElement>('[data-action="following_feed_scan"]');
+    button?.click();
+    await flush();
+
+    expect(mocks.setButtonLoading).toHaveBeenCalledWith(button, true, { label: "扫描中…" });
+    expect(mocks.setButtonLoading).toHaveBeenLastCalledWith(button, false);
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      "已有任务正在运行",
+      "error",
+      "请等待当前任务结束后再试。",
+      [],
+    );
   });
 
   it("shows success toast and restores buttons before background refreshes finish", async () => {

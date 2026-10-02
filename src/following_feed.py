@@ -24,29 +24,84 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from src.bilibili_client import BilibiliClient
 from src.bilibili_auth import get_login_uid
 from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
+from src.observability import current_metrics
 from src.pipeline.refresh_all_pipeline import run_new_links_pipeline
 from src.sources.common import opus_link
+from src.watch_feed import extract_feed_pub_ts
 
 FOLLOW_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
 FOLLOW_FEED_REFERER = "https://t.bilibili.com/"
 
 # 同轮分页最多读取 20 页。旧 payload（没有分页字段）保留历史 30 条兼容上限。
 FOLLOW_FEED_MAX_PAGES = 20
+FOLLOW_FEED_HISTORY_PAGES_PER_RUN = 5
+FOLLOW_FEED_HISTORY_DAYS = 15
 # Compatibility cap for legacy callers/fixtures that predate the pagination
 # fields.  Real pagination responses carry ``has_more``/``offset`` and are
 # collected across the full page window.
 FOLLOW_FEED_MAX_ITEMS = 30
 ANCHOR_LIMIT = 50
+STATE_VERSION = 2
+CN_TZ = timezone(timedelta(hours=8))
 
 _VALID_DYNAMIC_ID = re.compile(r"^\d{18,19}$")
 
 _FILE_NAME = "following_feed_state.json"
+
+
+def _cn_now_ts() -> int:
+    """Return an integer timestamp derived from an explicit UTC+8 clock."""
+    return int(datetime.now(CN_TZ).replace(microsecond=0).timestamp())
+
+
+def _history_cutoff_at(baseline_at: int) -> int:
+    baseline = datetime.fromtimestamp(int(baseline_at), CN_TZ)
+    return int((baseline - timedelta(days=FOLLOW_FEED_HISTORY_DAYS)).timestamp())
+
+
+def _initialize_v74_state(state: dict[str, Any], now: int) -> bool:
+    """Migrate a legal legacy state without discarding its checkpoint."""
+    changed = False
+    if int(state.get("state_version") or 0) < STATE_VERSION:
+        state["state_version"] = STATE_VERSION
+        changed = True
+    if not isinstance(state.get("baseline_at"), int) or int(state["baseline_at"]) <= 0:
+        state["baseline_at"] = int(now)
+        changed = True
+    if not isinstance(state.get("history_cutoff_at"), int) or int(state["history_cutoff_at"]) <= 0:
+        state["history_cutoff_at"] = _history_cutoff_at(int(state["baseline_at"]))
+        changed = True
+    if state.get("history_status") not in {"pending", "complete"}:
+        state["history_status"] = "pending"
+        changed = True
+    if state.get("history_mode") not in {"initial_15d", "gap", "idle"}:
+        state["history_mode"] = "initial_15d"
+        changed = True
+    defaults: dict[str, Any] = {
+        "history_completed_at": None,
+        "gap_cutoff_at": None,
+        "history_offset": None,
+        "history_next_page": None,
+        "history_pages_fetched": 0,
+        "history_items_seen": 0,
+        "history_oldest_seen_at": None,
+        "history_stop_reason": "awaiting_first_scan",
+        "history_target_checkpoint": None,
+        "history_target_anchors": [],
+        "history_seen_anchors": [],
+    }
+    for key, value in defaults.items():
+        if key not in state:
+            state[key] = value
+            changed = True
+    return changed
 
 # 仍需以后重试的失败：动态仍可能存在，只是本轮未能成功处理完毕。
 # checkpoint 不得越过这类候选。其余 pipeline skip 均属终态安全项，不阻塞推进。
@@ -104,6 +159,49 @@ def _read_state_checked() -> tuple[dict[str, Any], bool, str]:
         if any(
             not isinstance(value, str) or not _VALID_DYNAMIC_ID.fullmatch(value)
             for value in anchors
+        ):
+            return {}, False, "following_feed_state_corrupt"
+    for key in (
+        "baseline_at",
+        "history_cutoff_at",
+        "history_completed_at",
+        "history_next_page",
+        "history_pages_fetched",
+        "history_items_seen",
+        "history_oldest_seen_at",
+        "gap_cutoff_at",
+    ):
+        value = raw.get(key)
+        if value is not None and (not isinstance(value, int) or value < 0):
+            return {}, False, "following_feed_state_corrupt"
+    if raw.get("history_status") is not None and raw.get("history_status") not in {
+        "pending",
+        "complete",
+    }:
+        return {}, False, "following_feed_state_corrupt"
+    if raw.get("history_mode") is not None and raw.get("history_mode") not in {
+        "initial_15d",
+        "gap",
+        "idle",
+    }:
+        return {}, False, "following_feed_state_corrupt"
+    history_offset = raw.get("history_offset")
+    if history_offset is not None and not isinstance(history_offset, str):
+        return {}, False, "following_feed_state_corrupt"
+    history_target_checkpoint = raw.get("history_target_checkpoint")
+    if history_target_checkpoint is not None and (
+        not isinstance(history_target_checkpoint, str)
+        or not _VALID_DYNAMIC_ID.fullmatch(history_target_checkpoint)
+    ):
+        return {}, False, "following_feed_state_corrupt"
+    for key in ("history_target_anchors", "history_seen_anchors"):
+        values = raw.get(key)
+        if values is not None and (
+            not isinstance(values, list)
+            or any(
+                not isinstance(value, str) or not _VALID_DYNAMIC_ID.fullmatch(value)
+                for value in values
+            )
         ):
             return {}, False, "following_feed_state_corrupt"
     return raw, True, ""
@@ -169,6 +267,18 @@ def following_feed_info() -> dict[str, Any]:
         "last_new_items": int(state.get("last_new_items") or 0),
         "last_anchor_hits": int(state.get("last_anchor_hits") or 0),
         "last_catch_up_complete": state.get("last_catch_up_complete"),
+        "baseline_at": state.get("baseline_at"),
+        "history_cutoff_at": state.get("history_cutoff_at"),
+        "gap_cutoff_at": state.get("gap_cutoff_at"),
+        "history_status": state.get("history_status"),
+        "history_mode": state.get("history_mode"),
+        "history_completed_at": state.get("history_completed_at"),
+        "history_pages_fetched": int(state.get("history_pages_fetched") or 0),
+        "history_items_seen": int(state.get("history_items_seen") or 0),
+        "history_oldest_seen_at": state.get("history_oldest_seen_at"),
+        "history_stop_reason": state.get("history_stop_reason"),
+        "coverage_gap": bool(state.get("coverage_gap")),
+        "last_processed": int(state.get("last_processed") or 0),
     }
 
 
@@ -270,6 +380,99 @@ def following_feed_summary(now_ts: int | None = None) -> dict[str, Any]:
     return info
 
 
+def _run_candidate_batch(
+    ids: list[str],
+    *,
+    item_by_id: dict[str, dict[str, Any] | None],
+    page_by_id: dict[str, int],
+    on_progress: Callable[[int, int, str], None] | None,
+) -> dict[str, Any]:
+    """Filter one fetched batch and run the existing shared pipeline."""
+    current_uid = get_login_uid()
+    identity_by_raw: dict[str, CanonicalIdentity] = {}
+    for dynamic_id in ids:
+        item = item_by_id.get(dynamic_id)
+        if not isinstance(item, dict) or not ("type" in item or "modules" in item):
+            continue
+        identity_by_raw[dynamic_id] = resolve_dynamic_identity(item, dynamic_id)
+    if identity_by_raw and current_uid is None:
+        raise RuntimeError("无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint")
+
+    counters = {
+        "self_skipped": 0,
+        "forward_unresolved_skipped": 0,
+        "forward_skipped": 0,
+        "canonical_duplicate_skipped": 0,
+    }
+    accepted_ids: list[str] = []
+    accepted_identities: dict[str, CanonicalIdentity] = {}
+    canonical_seen: set[str] = set()
+    for dynamic_id in ids:
+        identity = identity_by_raw.get(dynamic_id)
+        if identity is None:
+            accepted_ids.append(dynamic_id)
+            continue
+        if current_uid is not None and identity.wrapper_author_uid == str(current_uid):
+            counters["self_skipped"] += 1
+            if identity.is_forward:
+                counters["forward_skipped"] += 1
+            continue
+        if identity.is_forward:
+            counters["forward_skipped"] += 1
+            if identity.unresolved_reason:
+                counters["forward_unresolved_skipped"] += 1
+            continue
+        canonical_id = identity.canonical_dynamic_id
+        if canonical_id and canonical_id in canonical_seen:
+            counters["canonical_duplicate_skipped"] += 1
+            continue
+        if canonical_id:
+            canonical_seen.add(canonical_id)
+        accepted_ids.append(dynamic_id)
+        accepted_identities[dynamic_id] = identity
+
+    urls = [opus_link(dynamic_id) for dynamic_id in accepted_ids]
+    if on_progress is not None:
+        on_progress(0, max(1, len(urls)), f"关注动态共 {len(urls)} 条候选，正在复用公共流水线…")
+    pipeline_kwargs: dict[str, Any] = {
+        "workers": 1,
+        "scan_started_at": int(time.time()),
+        "on_progress": on_progress,
+    }
+    if _pipeline_accepts_source_observations():
+        pipeline_kwargs["source_observations"] = [
+            {
+                "source_id": "following_feed",
+                "dynamic_id": dynamic_id,
+                "page_index": page_by_id.get(dynamic_id),
+            }
+            for dynamic_id in accepted_ids
+        ]
+    if accepted_identities and _pipeline_accepts_identity_map():
+        pipeline_kwargs["identity_by_raw"] = accepted_identities
+    pipeline_started = time.perf_counter()
+    pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
+    metrics = current_metrics()
+    if metrics is not None:
+        metrics.record_stage_duration("分类中", (time.perf_counter() - pipeline_started) * 1000)
+    blocking_count = 0
+    skip_reasons = getattr(pipeline, "skip_reasons", None)
+    if isinstance(skip_reasons, dict):
+        blocking_count = sum(
+            int(skip_reasons.get(reason, 0) or 0)
+            for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
+        )
+    if bool(getattr(pipeline, "partial", False)):
+        blocking_count += 1
+    return {
+        "accepted": len(accepted_ids),
+        "added": int(getattr(pipeline, "persisted_count", 0) or 0),
+        "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0),
+        "blocking_count": blocking_count,
+        **counters,
+    }
+
+
 def scan_following_feed(
     *,
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
@@ -292,6 +495,18 @@ def scan_following_feed(
             "message": state_reason,
             "state_corrupt": True,
         }
+
+    scan_now = _cn_now_ts()
+    if _initialize_v74_state(state, scan_now):
+        # Persist the baseline before remote I/O so a restart cannot silently
+        # move the 15-day window forward.
+        _write_state(state)
+    history_ready_before_live = bool(
+        state.get("history_status") == "pending"
+        and state.get("history_offset")
+        and state.get("history_next_page")
+    )
+    history_was_complete = state.get("history_status") == "complete"
 
     checkpoint = str(state.get("last_seen_dynamic_id") or "") or None
     old_anchors = [
@@ -329,8 +544,17 @@ def scan_following_feed(
                 "last_items_seen": items_seen,
                 "last_unique_items": unique_items,
                 "last_new_items": 0,
+                "last_processed": 0,
                 "last_anchor_hits": anchor_hits,
                 "last_catch_up_complete": catch_up_complete,
+                "last_found": 0,
+                "last_added": 0,
+                "accepted": 0,
+                "inserted": 0,
+                "self_skipped": 0,
+                "forward_unresolved_skipped": 0,
+                "forward_skipped": 0,
+                "canonical_duplicate_skipped": 0,
             }
         )
         _write_state(diagnostic)
@@ -390,6 +614,7 @@ def scan_following_feed(
     catch_up_complete = False
     next_offset: str | None = None
 
+    feed_started = time.perf_counter()
     with client_factory() as client:
         for page_no in range(1, FOLLOW_FEED_MAX_PAGES + 1):
             params: dict[str, object] = {"type": "all", "page": page_no}
@@ -462,7 +687,12 @@ def scan_following_feed(
                 continue
             break
 
-    if not catch_up_complete:
+    metrics = current_metrics()
+    if metrics is not None:
+        metrics.record_stage_duration("Feed获取", (time.perf_counter() - feed_started) * 1000)
+
+    processable_hard_cap = stop_reason == "hard_cap_reached" and bool(all_ids)
+    if not catch_up_complete and not processable_hard_cap:
         return record_diagnostic(
             status="incomplete",
             message=f"关注动态分页未完整结束：{stop_reason}",
@@ -559,7 +789,11 @@ def scan_following_feed(
         ]
     if accepted_identities and _pipeline_accepts_identity_map():
         pipeline_kwargs["identity_by_raw"] = accepted_identities
+    pipeline_started = time.perf_counter()
     pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
+    metrics = current_metrics()
+    if metrics is not None:
+        metrics.record_stage_duration("分类中", (time.perf_counter() - pipeline_started) * 1000)
 
     found = len(processed)
     added = int(getattr(pipeline, "persisted_count", 0) or 0)
@@ -602,6 +836,82 @@ def scan_following_feed(
                 new_anchors.append(dynamic_id)
             if len(new_anchors) >= ANCHOR_LIMIT:
                 break
+
+    # V74 keeps live progress independent from the bounded history cursor.
+    # A successful hard-cap batch advances the live checkpoint, while the
+    # response cursor continues the uncovered range in later runs.
+    last_page_times = [
+        timestamp
+        for _, item in page_items
+        if isinstance(item, dict)
+        for timestamp in [extract_feed_pub_ts(item)]
+        if timestamp is not None
+    ]
+    cutoff_reached = bool(
+        last_page_times
+        and max(last_page_times) <= int(state.get("history_cutoff_at") or 0)
+    )
+    if history_was_complete and not catch_up_complete and not blocking_count:
+        state.update(
+            {
+                "history_status": "pending",
+                "history_mode": "gap",
+                "history_completed_at": None,
+                "gap_cutoff_at": _history_cutoff_at(scan_now),
+                "history_target_checkpoint": checkpoint,
+                "history_target_anchors": list(old_anchors),
+                "history_seen_anchors": [],
+                "history_pages_fetched": 0,
+                "history_items_seen": 0,
+                "history_oldest_seen_at": None,
+            }
+        )
+    if (
+        state.get("history_status") == "pending"
+        and not catch_up_complete
+        and not blocking_count
+        and offset
+    ):
+        # A new live gap supersedes an older cursor chain.  Restart history at
+        # the end of the newly processed live window so the interval between
+        # that window and the prior backfill cannot be skipped.
+        state["history_offset"] = offset
+        state["history_next_page"] = pages_fetched + 1
+        state["history_stop_reason"] = "history_cursor_reset_for_live_gap"
+        history_ready_before_live = False
+    if state.get("history_status") == "pending" and not blocking_count:
+        if not has_more:
+            state.update(
+                {
+                    "history_status": "complete",
+                    "history_mode": "idle",
+                    "history_completed_at": scan_now,
+                    "history_offset": None,
+                    "history_next_page": None,
+                    "history_stop_reason": "has_more_false",
+                }
+            )
+        elif cutoff_reached:
+            state.update(
+                {
+                    "history_status": "complete",
+                    "history_mode": "idle",
+                    "history_completed_at": scan_now,
+                    "history_offset": None,
+                    "history_next_page": None,
+                    "history_stop_reason": "history_cutoff_reached",
+                }
+            )
+        elif not history_ready_before_live and offset:
+            state["history_offset"] = offset
+            state["history_next_page"] = pages_fetched + 1
+            state["history_stop_reason"] = "history_cursor_seeded"
+    if last_page_times:
+        previous_oldest = state.get("history_oldest_seen_at")
+        oldest = min(last_page_times)
+        state["history_oldest_seen_at"] = (
+            min(int(previous_oldest), oldest) if previous_oldest else oldest
+        )
     state["last_seen_dynamic_id"] = new_checkpoint
     state["anchors"] = new_anchors
     state["last_scan_at"] = now
@@ -619,36 +929,280 @@ def scan_following_feed(
         "relationship_snapshot_status",
     ):
         state.pop(key, None)
-    state["last_status"] = "success"
-    state["last_scan_status"] = "success" if blocking_count == 0 else "incomplete"
+    state["last_status"] = "success" if blocking_count == 0 else "incomplete"
+    state["last_scan_status"] = (
+        "success"
+        if blocking_count == 0 and catch_up_complete and state.get("history_status") == "complete"
+        else "incomplete"
+    )
     state["last_error"] = ""
     state["last_pages_fetched"] = pages_fetched
     state["last_stop_reason"] = "pipeline_partial" if blocking_count else stop_reason
     state["last_items_seen"] = items_seen
     state["last_unique_items"] = len(all_ids)
     state["last_new_items"] = len(processed)
+    state["last_processed"] = len(processed)
     state["last_anchor_hits"] = anchor_hits
     state["last_catch_up_complete"] = catch_up_complete
+    state["coverage_gap"] = bool(
+        not catch_up_complete or state.get("history_status") != "complete"
+    )
     _write_state(state)
 
+    history_pages_this_run = 0
+    history_items_this_run = 0
+    history_processed = 0
+    history_batch: dict[str, Any] | None = None
+    if (
+        history_ready_before_live
+        and state.get("history_status") == "pending"
+        and not blocking_count
+    ):
+        history_ids: list[str] = []
+        history_item_by_id: dict[str, dict[str, Any] | None] = {}
+        history_page_by_id: dict[str, int] = {}
+        history_seen_ids = set(all_ids)
+        history_seen_offsets: set[str] = set()
+        history_boundary_index: int | None = None
+        history_complete = False
+        history_error = ""
+        history_stop_reason = "history_page_budget_reached"
+        history_next_offset = str(state.get("history_offset") or "")
+        history_next_page = int(state.get("history_next_page") or 2)
+        history_next_page_after = history_next_page
+        target_checkpoint = str(state.get("history_target_checkpoint") or "") or None
+        target_anchors = [str(value) for value in (state.get("history_target_anchors") or [])]
+        seen_target_anchors = set(str(value) for value in (state.get("history_seen_anchors") or []))
+        history_times: list[int] = []
+
+        with client_factory() as client:
+            for _ in range(FOLLOW_FEED_HISTORY_PAGES_PER_RUN):
+                payload = client.get_json(
+                    FOLLOW_FEED_URL,
+                    {
+                        "type": "all",
+                        "page": history_next_page,
+                        "offset": history_next_offset,
+                    },
+                    referer=FOLLOW_FEED_REFERER,
+                    retries=0,
+                )
+                history_pages_this_run += 1
+                try:
+                    data, page_items, offset, has_more = validate_page(
+                        payload, history_next_page
+                    )
+                except ValueError as exc:
+                    history_error = str(exc)
+                    history_stop_reason = "history_response_invalid"
+                    break
+                history_items_this_run += len(data.get("items") or [])
+                page_new_ids: list[str] = []
+                page_target_positions: list[int] = []
+                page_times: list[int] = []
+                for dynamic_id, item in page_items:
+                    if dynamic_id in history_seen_ids:
+                        continue
+                    history_seen_ids.add(dynamic_id)
+                    history_ids.append(dynamic_id)
+                    history_item_by_id[dynamic_id] = item
+                    history_page_by_id[dynamic_id] = history_next_page
+                    page_new_ids.append(dynamic_id)
+                    if dynamic_id in target_anchors:
+                        seen_target_anchors.add(dynamic_id)
+                        page_target_positions.append(len(history_ids) - 1)
+                    if isinstance(item, dict):
+                        timestamp = extract_feed_pub_ts(item)
+                        if timestamp is not None:
+                            page_times.append(timestamp)
+                            history_times.append(timestamp)
+
+                mode = str(state.get("history_mode") or "initial_15d")
+                exact_target_hit = bool(
+                    mode == "gap"
+                    and target_checkpoint
+                    and target_checkpoint in page_new_ids
+                )
+                required_target_hits = min(3, len(set(target_anchors))) if target_anchors else 0
+                if exact_target_hit:
+                    history_boundary_index = history_ids.index(target_checkpoint)
+                    history_complete = True
+                    history_stop_reason = "history_checkpoint_reached"
+                elif (
+                    mode == "gap"
+                    and required_target_hits
+                    and len(seen_target_anchors) >= required_target_hits
+                ):
+                    history_boundary_index = (
+                        min(page_target_positions) if page_target_positions else len(history_ids)
+                    )
+                    history_complete = True
+                    history_stop_reason = "history_anchor_reached"
+                elif page_times and max(page_times) <= int(
+                    state.get("gap_cutoff_at")
+                    if mode == "gap" and state.get("gap_cutoff_at")
+                    else state["history_cutoff_at"]
+                ):
+                    history_complete = True
+                    history_stop_reason = "history_cutoff_reached"
+                elif not has_more:
+                    history_complete = True
+                    history_stop_reason = "history_has_more_false"
+                elif not offset:
+                    history_error = "历史追赶响应缺少下一页 offset"
+                    history_stop_reason = "history_missing_next_offset"
+                elif offset == history_next_offset or offset in history_seen_offsets:
+                    history_error = "历史追赶响应返回重复 offset"
+                    history_stop_reason = "history_repeated_offset"
+                else:
+                    history_seen_offsets.add(offset)
+                    history_next_offset = offset
+                    history_next_page += 1
+                    history_next_page_after = history_next_page
+                    continue
+                break
+
+        if history_error:
+            state["history_stop_reason"] = history_stop_reason
+            state["last_scan_status"] = "incomplete"
+            state["last_error"] = history_error
+            state["coverage_gap"] = True
+            _write_state(state)
+        else:
+            history_candidates = (
+                history_ids
+                if history_boundary_index is None
+                else history_ids[:history_boundary_index]
+            )
+            try:
+                history_batch = _run_candidate_batch(
+                    history_candidates,
+                    item_by_id=history_item_by_id,
+                    page_by_id=history_page_by_id,
+                    on_progress=on_progress,
+                )
+            except RuntimeError as exc:
+                state["history_stop_reason"] = "history_missing_login_uid"
+                state["last_scan_status"] = "incomplete"
+                state["last_error"] = str(exc)
+                state["coverage_gap"] = True
+                _write_state(state)
+            else:
+                history_processed = len(history_candidates)
+                history_blocking = int(history_batch["blocking_count"])
+                if history_blocking:
+                    state["history_stop_reason"] = "history_pipeline_partial"
+                else:
+                    state["history_pages_fetched"] = int(
+                        state.get("history_pages_fetched") or 0
+                    ) + history_pages_this_run
+                    state["history_items_seen"] = int(
+                        state.get("history_items_seen") or 0
+                    ) + history_items_this_run
+                    state["history_seen_anchors"] = sorted(seen_target_anchors)
+                    if history_times:
+                        previous_oldest = state.get("history_oldest_seen_at")
+                        oldest = min(history_times)
+                        state["history_oldest_seen_at"] = (
+                            min(int(previous_oldest), oldest) if previous_oldest else oldest
+                        )
+                    if history_complete:
+                        state.update(
+                            {
+                                "history_status": "complete",
+                                "history_mode": "idle",
+                                "history_completed_at": _cn_now_ts(),
+                                "history_offset": None,
+                                "history_next_page": None,
+                                "history_stop_reason": history_stop_reason,
+                            }
+                        )
+                    else:
+                        state["history_offset"] = history_next_offset
+                        state["history_next_page"] = history_next_page_after
+                        state["history_stop_reason"] = history_stop_reason
+
+                added += int(history_batch["added"])
+                found += history_processed
+                state["last_found"] = found
+                state["last_added"] = added
+                state["accepted"] = int(state.get("accepted") or 0) + int(
+                    history_batch["accepted"]
+                )
+                state["inserted"] = added
+                for key in (
+                    "self_skipped",
+                    "forward_unresolved_skipped",
+                    "forward_skipped",
+                    "canonical_duplicate_skipped",
+                ):
+                    state[key] = int(state.get(key) or 0) + int(history_batch[key])
+                state["last_pages_fetched"] = pages_fetched + history_pages_this_run
+                state["last_items_seen"] = items_seen + history_items_this_run
+                state["last_unique_items"] = len(set(all_ids) | set(history_ids))
+                state["last_new_items"] = found
+                state["last_processed"] = found
+                state["last_scan_status"] = (
+                    "success"
+                    if not history_blocking
+                    and catch_up_complete
+                    and state.get("history_status") == "complete"
+                    else "incomplete"
+                )
+                state["last_status"] = (
+                    "success" if not history_blocking else "incomplete"
+                )
+                state["last_error"] = "" if not history_blocking else "历史追赶 pipeline 未完整"
+                state["coverage_gap"] = bool(
+                    not catch_up_complete or state.get("history_status") != "complete"
+                )
+                _write_state(state)
+
+    history_pending = state.get("history_status") != "complete"
+    coverage_complete = bool(catch_up_complete and not history_pending)
+    # Preserve V16's retryable-pipeline result contract: the Job completes and
+    # the message/state explain that candidates remain retryable.  Coverage
+    # incompleteness is surfaced as ``incomplete`` when the pipeline itself did
+    # not request a retry.
+    overall_incomplete = bool(
+        not blocking_count and not coverage_complete
+    )
+    if blocking_count:
+        coverage_message = "部分候选需要后续重试"
+    elif history_pending:
+        coverage_message = f"历史追赶尚未完成（{state.get('history_stop_reason') or stop_reason}）"
+    elif not catch_up_complete:
+        coverage_message = f"最新覆盖存在缺口（{stop_reason}），历史追赶已完成"
+    else:
+        coverage_message = "历史追赶已完成"
+    message = f"关注动态本轮已处理 {found} 条，新增 {added} 条；{coverage_message}"
+
     if on_progress is not None:
-        on_progress(1, 1, f"关注动态补漏完成：发现 {found} 条，新增 {added} 条")
+        on_progress(1, 1, message)
 
     return {
         "skipped": False,
-        "status": "success",
-        "scanned_items": len(all_ids),
+        "status": "incomplete" if overall_incomplete else "success",
+        "scanned_items": int(state.get("last_unique_items") or len(all_ids)),
         "found": found,
-        "accepted": len(accepted_ids),
+        "processed": found,
+        "accepted": int(state.get("accepted") or 0),
         "added": added,
         "inserted": added,
-        "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0),
-        "self_skipped": self_skipped,
-        "forward_unresolved_skipped": forward_unresolved_skipped,
-        "forward_skipped": forward_skipped,
-        "canonical_duplicate_skipped": canonical_duplicate_skipped,
-        "pages_fetched": pages_fetched,
-        "catch_up_complete": catch_up_complete,
+        "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0)
+        + int((history_batch or {}).get("new_link_count") or 0),
+        "self_skipped": int(state.get("self_skipped") or 0),
+        "forward_unresolved_skipped": int(state.get("forward_unresolved_skipped") or 0),
+        "forward_skipped": int(state.get("forward_skipped") or 0),
+        "canonical_duplicate_skipped": int(state.get("canonical_duplicate_skipped") or 0),
+        "pages_fetched": int(state.get("last_pages_fetched") or pages_fetched),
+        "live_pages_fetched": pages_fetched,
+        "history_pages_fetched": history_pages_this_run,
+        "catch_up_complete": coverage_complete,
+        "live_catch_up_complete": catch_up_complete,
+        "history_status": state.get("history_status"),
+        "history_stop_reason": state.get("history_stop_reason"),
+        "coverage_gap": bool(state.get("coverage_gap")),
         "stop_reason": "pipeline_partial" if blocking_count else stop_reason,
-        "message": f"关注动态补漏完成：发现 {found} 条，新增 {added} 条",
+        "message": message,
     }

@@ -11,6 +11,7 @@ from src.bilibili_request_budget import RequestBudgetExhausted
 from src.forward_classify_cache import get_cached_classify, put_cached_classify
 from src.forward_parse_cache import get_cached_parse, put_cached_parse
 from src.llm_client import chat_json
+from src.observability import current_metrics
 from src.sources.common import opus_link
 
 PARSER_VERSION = 7
@@ -635,6 +636,9 @@ def classify_forward_lottery(dynamic_id: str, content_text: str) -> dict[str, An
     """分类阶段：轻量 LLM，仅判断 is_lottery。"""
     cached = get_cached_classify(dynamic_id, content_text)
     if cached and cached.get("classify_parser_version") == CLASSIFY_PARSER_VERSION:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.record_llm_cache_hit()
         parsed = _normalize_classify_parsed(cached)
         parsed["from_cache"] = True
         return parsed
@@ -711,6 +715,9 @@ def _empty_parse(*, error: str | None = None) -> dict[str, Any]:
 def parse_forward_content(dynamic_id: str, content_text: str) -> dict[str, Any]:
     cached = get_cached_parse(dynamic_id, content_text)
     if cached and cached.get("parser_version") == PARSER_VERSION:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.record_llm_cache_hit()
         base = {
             key: value
             for key, value in cached.items()
