@@ -54,6 +54,16 @@ _LLM_TEST_MAX_TOKENS = 64
 _unavailable_config_fingerprint: str | None = None
 
 
+def _acquire_llm_slot() -> None:
+    if _llm_lock.acquire(blocking=False):
+        return
+    started = time.perf_counter()
+    _llm_lock.acquire()
+    metrics = current_metrics()
+    if metrics is not None:
+        metrics.record_llm_wait((time.perf_counter() - started) * 1000)
+
+
 def _llm_config_fingerprint(config: LlmConfig) -> str:
     from src.llm_settings import _config_fingerprint
 
@@ -265,7 +275,8 @@ def chat_json(*, system: str, user: str, config: LlmConfig | None = None) -> dic
     }
     url = f"{cfg.base_url}/chat/completions"
 
-    with _llm_lock:
+    _acquire_llm_slot()
+    try:
         try:
             data = _post_chat_completion(url=url, headers=headers, payload=payload)
         except httpx.HTTPStatusError as exc:
@@ -275,6 +286,8 @@ def chat_json(*, system: str, user: str, config: LlmConfig | None = None) -> dic
             raise mapped from exc
         except httpx.RequestError as exc:
             raise LlmTemporaryError("LLM 服务连接超时或网络不可达") from exc
+    finally:
+        _llm_lock.release()
 
     content = _normalize_chat_response(data)
     # HTTP/协议层已证明当前配置可用：解除 fingerprint 封锁（配置变更也会自然放行）。

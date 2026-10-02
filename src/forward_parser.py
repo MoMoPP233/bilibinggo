@@ -11,7 +11,7 @@ from src.bilibili_request_budget import RequestBudgetExhausted
 from src.forward_classify_cache import get_cached_classify, put_cached_classify
 from src.forward_parse_cache import get_cached_parse, put_cached_parse
 from src.llm_client import chat_json
-from src.observability import current_metrics
+from src.observability import current_metrics, sleep_with_bili_retry_metrics
 from src.sources.common import opus_link
 
 PARSER_VERSION = 7
@@ -396,7 +396,9 @@ def _fetch_html_dynamic_text(client: BilibiliClient, dynamic_id: str) -> str:
         except RuntimeError as exc:
             last_error = exc
         if attempt < HTML_FETCH_ATTEMPTS - 1:
-            time.sleep(HTML_FETCH_BACKOFF_SEC[attempt])
+            sleep_with_bili_retry_metrics(
+                HTML_FETCH_BACKOFF_SEC[attempt], sleeper=time.sleep
+            )
     if last_error:
         raise DynamicContentFetchError(
             f"HTML 正文抓取失败: {last_error}",
@@ -516,7 +518,9 @@ def fetch_dynamic_content_with_retry(
                 retryable=True,
             )
         if attempt < attempts - 1:
-            time.sleep(CLASSIFY_CONTENT_BACKOFF_SEC[attempt])
+            sleep_with_bili_retry_metrics(
+                CLASSIFY_CONTENT_BACKOFF_SEC[attempt], sleeper=time.sleep
+            )
     message = f"无法获取动态正文: {dynamic_id}"
     if last_error:
         raise RuntimeError(message) from last_error

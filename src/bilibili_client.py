@@ -17,7 +17,11 @@ from src.bilibili_request_budget import (
     RequestBudgetExhausted,
     reserve_bilibili_http_attempt,
 )
-from src.observability import current_metrics, request_kind
+from src.observability import (
+    current_metrics,
+    request_kind,
+    sleep_with_bili_retry_metrics,
+)
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -113,6 +117,28 @@ class BilibiliClient:
             # V22：窗口未恢复时构造 client 不应崩溃；首个真实业务请求会结构化暂停。
             pass
 
+    def _acquire_request_slot(self) -> None:
+        acquisition = acquire_bilibili_request_slot()
+        metrics = current_metrics()
+        if metrics is None or acquisition is None:
+            return
+        metrics.record_bilibili_rate_limit_config(
+            acquisition.rps, acquisition.source
+        )
+        if acquisition.waited:
+            metrics.record_bilibili_rate_limit_wait(acquisition.wait_ms)
+
+    def _acquire_http_lock(self) -> None:
+        if self._http_lock.acquire(blocking=False):
+            return
+        started = time.perf_counter()
+        self._http_lock.acquire()
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.record_bilibili_client_lock_wait(
+                (time.perf_counter() - started) * 1000
+            )
+
     def _http_get(
         self,
         url: str,
@@ -122,8 +148,9 @@ class BilibiliClient:
     ) -> httpx.Response:
         # V22：受保护任务内按真实 HTTP attempt 先 reserve 后发送（retry 每次都会重入）。
         reserve_bilibili_http_attempt(url)
-        acquire_bilibili_request_slot()
-        with self._http_lock:
+        self._acquire_request_slot()
+        self._acquire_http_lock()
+        try:
             started = time.perf_counter()
             try:
                 return self._client.get(url, params=params or {}, headers=headers)
@@ -135,6 +162,8 @@ class BilibiliClient:
                         (time.perf_counter() - started) * 1000,
                         kind=request_kind(url),
                     )
+        finally:
+            self._http_lock.release()
 
     def _http_post(
         self,
@@ -146,8 +175,9 @@ class BilibiliClient:
         headers: dict | None = None,
     ) -> httpx.Response:
         reserve_bilibili_http_attempt(url)
-        acquire_bilibili_request_slot()
-        with self._http_lock:
+        self._acquire_request_slot()
+        self._acquire_http_lock()
+        try:
             started = time.perf_counter()
             try:
                 return self._client.post(
@@ -165,6 +195,8 @@ class BilibiliClient:
                         (time.perf_counter() - started) * 1000,
                         kind=request_kind(url),
                     )
+        finally:
+            self._http_lock.release()
 
     def close(self) -> None:
         self._client.close()
@@ -221,7 +253,9 @@ class BilibiliClient:
                     # 明确平台风控（-352/-509）：已真实发送一次，绝不在客户端重试。
                     raise RuntimeError(f"API error {code}: {data.get('message')}")
                 if code == -799 and attempt < retries:
-                    time.sleep(1.2 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        1.2 * (attempt + 1), sleeper=time.sleep
+                    )
                     last_error = RuntimeError(f"API error {code}: {data.get('message')}")
                     continue
                 raise RuntimeError(f"API error {code}: {data.get('message')}")
@@ -231,7 +265,9 @@ class BilibiliClient:
                     isinstance(exc, (httpx.RequestError, json.JSONDecodeError))
                     or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
-                    time.sleep(2.0 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        2.0 * (attempt + 1), sleeper=time.sleep
+                    )
                     continue
                 if isinstance(exc, httpx.RequestError):
                     raise RuntimeError(f"网络请求失败: {exc}") from exc
@@ -255,7 +291,9 @@ class BilibiliClient:
                     isinstance(exc, httpx.RequestError)
                     or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
-                    time.sleep(2.0 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        2.0 * (attempt + 1), sleeper=time.sleep
+                    )
                     continue
                 if isinstance(exc, httpx.RequestError):
                     raise RuntimeError(f"网络请求失败: {exc}") from exc
@@ -263,7 +301,9 @@ class BilibiliClient:
             except json.JSONDecodeError as exc:
                 last_error = exc
                 if attempt < retries:
-                    time.sleep(2.0 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        2.0 * (attempt + 1), sleeper=time.sleep
+                    )
                     continue
                 raise RuntimeError("响应不是有效 JSON") from exc
         if last_error:
@@ -306,7 +346,9 @@ class BilibiliClient:
                     isinstance(exc, (httpx.RequestError, json.JSONDecodeError))
                     or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
-                    time.sleep(2.0 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        2.0 * (attempt + 1), sleeper=time.sleep
+                    )
                     continue
                 if isinstance(exc, httpx.RequestError):
                     raise RuntimeError(f"网络请求失败: {exc}") from exc
@@ -355,7 +397,9 @@ class BilibiliClient:
                     isinstance(exc, (httpx.RequestError, json.JSONDecodeError))
                     or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (408, 412, 500, 502, 503, 504))
                 ):
-                    time.sleep(2.0 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        2.0 * (attempt + 1), sleeper=time.sleep
+                    )
                     continue
                 if isinstance(exc, httpx.RequestError):
                     raise RuntimeError(f"网络请求失败: {exc}") from exc
@@ -377,7 +421,9 @@ class BilibiliClient:
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
                 last_error = exc
                 if attempt < retries:
-                    time.sleep(1.5 * (attempt + 1))
+                    sleep_with_bili_retry_metrics(
+                        1.5 * (attempt + 1), sleeper=time.sleep
+                    )
                     continue
                 if isinstance(exc, httpx.RequestError):
                     raise RuntimeError(f"网络请求失败: {exc}") from exc

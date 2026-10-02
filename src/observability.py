@@ -13,7 +13,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 _CURRENT: contextvars.ContextVar["JobMetrics | None"] = contextvars.ContextVar(
@@ -32,9 +32,21 @@ class JobMetrics:
     _request_ms: int = 0
     _request_by_endpoint: Counter[str] = field(default_factory=Counter, repr=False)
     _request_by_kind: dict[str, list[int]] = field(default_factory=dict, repr=False)
+    _bili_rps_effective: float = 0.0
+    _bili_rps_source: str = ""
+    _bili_rate_limit_wait_count: int = 0
+    _bili_rate_limit_wait_ms: float = 0.0
+    _bili_rate_limit_wait_max_ms: float = 0.0
+    _bili_client_lock_wait_count: int = 0
+    _bili_client_lock_wait_ms: float = 0.0
+    _bili_client_lock_wait_max_ms: float = 0.0
+    _bili_retry_wait_count: int = 0
+    _bili_retry_wait_ms: float = 0.0
     _llm_calls: int = 0
     _llm_ms: int = 0
     _llm_cache_hits: int = 0
+    _llm_wait_count: int = 0
+    _llm_wait_ms: float = 0.0
 
     def stage_start(self, stage: str) -> None:
         name = str(stage or "").strip()
@@ -90,6 +102,41 @@ class JobMetrics:
         with self._lock:
             self._llm_cache_hits += 1
 
+    def record_bilibili_rate_limit_config(self, rps: float, source: str) -> None:
+        with self._lock:
+            self._bili_rps_effective = max(0.0, float(rps))
+            self._bili_rps_source = str(source or "default")
+
+    def record_bilibili_rate_limit_wait(self, duration_ms: int | float) -> None:
+        elapsed = max(0.0, float(duration_ms))
+        with self._lock:
+            self._bili_rate_limit_wait_count += 1
+            self._bili_rate_limit_wait_ms += elapsed
+            self._bili_rate_limit_wait_max_ms = max(
+                self._bili_rate_limit_wait_max_ms, elapsed
+            )
+
+    def record_bilibili_client_lock_wait(self, duration_ms: int | float) -> None:
+        elapsed = max(0.0, float(duration_ms))
+        with self._lock:
+            self._bili_client_lock_wait_count += 1
+            self._bili_client_lock_wait_ms += elapsed
+            self._bili_client_lock_wait_max_ms = max(
+                self._bili_client_lock_wait_max_ms, elapsed
+            )
+
+    def record_bilibili_retry_wait(self, duration_ms: int | float) -> None:
+        elapsed = max(0.0, float(duration_ms))
+        with self._lock:
+            self._bili_retry_wait_count += 1
+            self._bili_retry_wait_ms += elapsed
+
+    def record_llm_wait(self, duration_ms: int | float) -> None:
+        elapsed = max(0.0, float(duration_ms))
+        with self._lock:
+            self._llm_wait_count += 1
+            self._llm_wait_ms += elapsed
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             stage_ms = dict(self._stage_ms)
@@ -111,6 +158,20 @@ class JobMetrics:
                 "bilibili_request_count": self._request_count,
                 "bilibili_request_ms": self._request_ms,
                 "bilibili_request_by_endpoint": endpoints,
+                "bili_rps_effective": self._bili_rps_effective,
+                "bili_rps_source": self._bili_rps_source,
+                "bili_rate_limit_wait_count": self._bili_rate_limit_wait_count,
+                "bili_rate_limit_wait_ms": round(self._bili_rate_limit_wait_ms),
+                "bili_rate_limit_wait_max_ms": round(
+                    self._bili_rate_limit_wait_max_ms
+                ),
+                "bili_client_lock_wait_count": self._bili_client_lock_wait_count,
+                "bili_client_lock_wait_ms": round(self._bili_client_lock_wait_ms),
+                "bili_client_lock_wait_max_ms": round(
+                    self._bili_client_lock_wait_max_ms
+                ),
+                "bili_retry_wait_count": self._bili_retry_wait_count,
+                "bili_retry_wait_ms": round(self._bili_retry_wait_ms),
                 "requests": {"detail": detail, "notice": notice, "body": body},
                 "detail_request_count": int(detail["count"]),
                 "detail_request_ms": int(detail["ms"]),
@@ -122,6 +183,8 @@ class JobMetrics:
                 "llm_call_ms": self._llm_ms,
                 "llm_cache_hits": self._llm_cache_hits,
                 "llm_cache_hit_count": self._llm_cache_hits,
+                "llm_wait_count": self._llm_wait_count,
+                "llm_wait_ms": round(self._llm_wait_ms),
                 "llm": {
                     "calls": self._llm_calls,
                     "cache_hits": self._llm_cache_hits,
@@ -148,7 +211,7 @@ def request_kind(url: str) -> str:
     return "other"
 
 
-def performance_metrics(snapshot: dict[str, object]) -> dict[str, int]:
+def performance_metrics(snapshot: dict[str, object]) -> dict[str, int | float | str]:
     """将内部观测快照转换成稳定、面向 Job 结果的扁平契约。"""
     requests = snapshot.get("requests")
     request_groups = requests if isinstance(requests, dict) else {}
@@ -167,6 +230,12 @@ def performance_metrics(snapshot: dict[str, object]) -> dict[str, int]:
         except (TypeError, ValueError):
             return 0
 
+    def float_value(source: dict, key: str, fallback: object = 0.0) -> float:
+        try:
+            return max(0.0, float(source.get(key, fallback) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
     return {
         "pipeline_duration_ms": value(snapshot, "pipeline_ms"),
         "feed_fetch_duration_ms": value(snapshot, "feed_fetch_ms"),
@@ -175,6 +244,26 @@ def performance_metrics(snapshot: dict[str, object]) -> dict[str, int]:
             "classification_stage_ms",
             snapshot.get("classification_ms", 0),
         ),
+        "bili_request_count": value(snapshot, "bilibili_request_count"),
+        "bili_request_duration_ms": value(snapshot, "bilibili_request_ms"),
+        "bili_rps_effective": float_value(snapshot, "bili_rps_effective"),
+        "bili_rps_source": str(snapshot.get("bili_rps_source") or ""),
+        "bili_rate_limit_wait_count": value(
+            snapshot, "bili_rate_limit_wait_count"
+        ),
+        "bili_rate_limit_wait_ms": value(snapshot, "bili_rate_limit_wait_ms"),
+        "bili_rate_limit_wait_max_ms": value(
+            snapshot, "bili_rate_limit_wait_max_ms"
+        ),
+        "bili_client_lock_wait_count": value(
+            snapshot, "bili_client_lock_wait_count"
+        ),
+        "bili_client_lock_wait_ms": value(snapshot, "bili_client_lock_wait_ms"),
+        "bili_client_lock_wait_max_ms": value(
+            snapshot, "bili_client_lock_wait_max_ms"
+        ),
+        "bili_retry_wait_count": value(snapshot, "bili_retry_wait_count"),
+        "bili_retry_wait_ms": value(snapshot, "bili_retry_wait_ms"),
         "detail_requests": value(
             detail_group, "count", snapshot.get("detail_request_count", 0)
         ),
@@ -202,11 +291,13 @@ def performance_metrics(snapshot: dict[str, object]) -> dict[str, int]:
         "llm_duration_ms": value(
             llm_group, "ms", snapshot.get("llm_call_ms", 0)
         ),
+        "llm_wait_count": value(snapshot, "llm_wait_count"),
+        "llm_wait_ms": value(snapshot, "llm_wait_ms"),
         "db_save_duration_ms": value(snapshot, "database_save_ms"),
     }
 
 
-def format_performance_summary(metrics: dict[str, int]) -> str:
+def format_performance_summary(metrics: dict[str, int | float | str]) -> str:
     """生成单行人类可读摘要；只在任务终态输出一次。"""
 
     def duration(milliseconds: int) -> str:
@@ -227,6 +318,18 @@ def format_performance_summary(metrics: dict[str, int]) -> str:
         f"Pipeline {duration(metrics.get('pipeline_duration_ms', 0))}；"
         f"Feed获取 {duration(metrics.get('feed_fetch_duration_ms', 0))}；"
         f"分类 {duration(metrics.get('classify_duration_ms', 0))}；"
+        f"B站请求 {metrics.get('bili_request_count', 0)}次/"
+        f"{duration(metrics.get('bili_request_duration_ms', 0))}；"
+        f"限流 {float(metrics.get('bili_rps_effective', 0) or 0):g} RPS"
+        f"（{metrics.get('bili_rps_source', '') or 'unknown'}），"
+        f"令牌等待 {metrics.get('bili_rate_limit_wait_count', 0)}次/"
+        f"{duration(metrics.get('bili_rate_limit_wait_ms', 0))}，最长 "
+        f"{duration(metrics.get('bili_rate_limit_wait_max_ms', 0))}；"
+        f"Client Lock {metrics.get('bili_client_lock_wait_count', 0)}次/"
+        f"{duration(metrics.get('bili_client_lock_wait_ms', 0))}，最长 "
+        f"{duration(metrics.get('bili_client_lock_wait_max_ms', 0))}；"
+        f"Retry等待 {metrics.get('bili_retry_wait_count', 0)}次/"
+        f"{duration(metrics.get('bili_retry_wait_ms', 0))}；"
         f"Detail {metrics.get('detail_requests', 0)}次/"
         f"{duration(metrics.get('detail_duration_ms', 0))}；"
         f"Notice {metrics.get('notice_requests', 0)}次/"
@@ -235,9 +338,28 @@ def format_performance_summary(metrics: dict[str, int]) -> str:
         f"{duration(metrics.get('body_duration_ms', 0))}；"
         f"LLM {metrics.get('llm_calls', 0)}次/"
         f"{duration(metrics.get('llm_duration_ms', 0))}"
-        f"（缓存命中 {metrics.get('llm_cache_hits', 0)}）；"
+        f"（缓存命中 {metrics.get('llm_cache_hits', 0)}，等待 "
+        f"{metrics.get('llm_wait_count', 0)}次/"
+        f"{duration(metrics.get('llm_wait_ms', 0))}）；"
         f"DB {duration(metrics.get('db_save_duration_ms', 0))}"
     )
+
+
+def sleep_with_bili_retry_metrics(
+    delay_seconds: float,
+    *,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    """执行既有 B 站退避，并把真实 wall time 聚合到当前 Job。"""
+    started = time.perf_counter()
+    try:
+        sleeper(delay_seconds)
+    finally:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.record_bilibili_retry_wait(
+                (time.perf_counter() - started) * 1000
+            )
 
 
 def current_metrics() -> JobMetrics | None:

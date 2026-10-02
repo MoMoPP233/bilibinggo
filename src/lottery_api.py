@@ -13,6 +13,7 @@ from src.bilibili_request_budget import RequestBudgetExhausted
 from src.lottery_classifier import UPOWER_BUSINESS_TYPE
 from src.participation_errors import ParticipationReadError
 from src.platform_risk import risk_code_of
+from src.observability import sleep_with_bili_retry_metrics
 from src.sources.common import opus_link
 
 try:
@@ -87,7 +88,9 @@ def fetch_lottery_notice(
             notice = data.get("data") or {}
             return notice if notice.get("lottery_id") else None
         if data.get("code") == -9999 and attempt < retries - 1:
-            time.sleep(1.2 * (attempt + 1))
+            sleep_with_bili_retry_metrics(
+                1.2 * (attempt + 1), sleeper=time.sleep
+            )
             continue
         return None
     return None

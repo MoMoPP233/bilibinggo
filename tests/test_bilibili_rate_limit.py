@@ -6,8 +6,10 @@ import time
 import pytest
 
 from src.bilibili_rate_limit import (
+    DEFAULT_BILI_RPS,
     TokenBucketRateLimiter,
     configure_bilibili_rate_limit,
+    get_bilibili_rate_limiter,
     reset_bilibili_rate_limit,
 )
 
@@ -35,6 +37,48 @@ def test_token_bucket_limits_burst() -> None:
     limiter.acquire()
     elapsed = time.monotonic() - start
     assert elapsed >= 0.2
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_effective_rps_and_source_follow_env_or_default(monkeypatch) -> None:
+    monkeypatch.setenv("BILI_RPS", "0.5")
+    reset_bilibili_rate_limit()
+    limiter = get_bilibili_rate_limiter()
+    assert limiter.rps == 0.5
+    assert limiter.source == "env"
+
+    monkeypatch.delenv("BILI_RPS", raising=False)
+    reset_bilibili_rate_limit()
+    limiter = get_bilibili_rate_limiter()
+    assert limiter.rps == DEFAULT_BILI_RPS
+    assert limiter.source == "default"
+
+
+def test_token_wait_uses_fake_clock_and_accumulates(monkeypatch) -> None:
+    import src.bilibili_rate_limit as rate_limit
+
+    clock = _FakeClock()
+    monkeypatch.setattr(rate_limit.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(rate_limit.time, "sleep", clock.sleep)
+    limiter = TokenBucketRateLimiter(0.5, source="env")
+
+    assert limiter.acquire() == (False, 0.0)
+    waited, wait_ms = limiter.acquire()
+    assert waited is True
+    assert wait_ms == pytest.approx(2_000)
+    waited, wait_ms = limiter.acquire()
+    assert waited is True
+    assert wait_ms == pytest.approx(2_000)
 
 
 def test_global_limiter_shared_across_threads() -> None:

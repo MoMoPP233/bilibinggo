@@ -712,6 +712,12 @@ class JobRunner:
                         result["performance_metrics"] = public_metrics
                         metric_line = format_performance_summary(public_metrics)
                         log = f"{log}\n{metric_line}".strip()
+                        log_event(
+                            logger,
+                            metric_line,
+                            event="job.performance",
+                            component="job",
+                        )
                 self._apply_terminal(
                     job_id,
                     state=state,

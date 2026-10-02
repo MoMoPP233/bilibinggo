@@ -6,6 +6,7 @@ import time
 from typing import Literal
 
 from src.bilibili_client import BilibiliClient
+from src.observability import sleep_with_bili_retry_metrics
 from src.sources.common import opus_link
 
 LotteryType = Literal["转发抽奖", "预约抽奖", "互动抽奖", "充电抽奖"]
@@ -235,5 +236,7 @@ def classify_lottery_type_safe(
         except Exception as exc:
             last_error = exc
             if attempt < retries:
-                time.sleep(1.0 * (attempt + 1))
+                sleep_with_bili_retry_metrics(
+                    1.0 * (attempt + 1), sleeper=time.sleep
+                )
     raise RuntimeError(f"分类失败 dynamic_id={dynamic_id}: {last_error}") from last_error
