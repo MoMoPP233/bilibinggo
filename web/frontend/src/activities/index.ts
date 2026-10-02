@@ -65,6 +65,14 @@ function renderFailureDeleteButton(item) {
   return `<button type="button" class="btn btn-secondary btn-compact btn-pill" data-action="delete-activity-failure" data-dynamic-id="${escapeHtml(item.dynamic_id || "")}">删除记录</button>`;
 }
 
+export function renderActivityDeleteButton(item) {
+  return `<button type="button" class="btn btn-secondary btn-compact btn-pill" data-action="delete-activity" data-dynamic-id="${escapeHtml(item.dynamic_id || "")}">删除</button>`;
+}
+
+function buildActivityActions(item) {
+  return `${buildActivityParticipateBtn(item)}${renderActivityDeleteButton(item)}`;
+}
+
 async function deleteActivityFailure(dynamicId) {
   if (!dynamicId) return;
   if (!window.confirm("只删除本地失败记录，不会操作 B 站内容。")) return;
@@ -80,6 +88,24 @@ async function deleteActivityFailure(dynamicId) {
 export function bindFailureButtons() {
   document.querySelectorAll('[data-action="delete-activity-failure"]').forEach((button) => {
     button.addEventListener("click", () => deleteActivityFailure(button.getAttribute("data-dynamic-id") || ""));
+  });
+}
+
+async function deleteActivity(dynamicId) {
+  if (!dynamicId) return;
+  if (!window.confirm("确定删除并忽略该活动吗？\n删除后，后续数据源再次发现该活动也不会重新收录。")) return;
+  try {
+    await fetchJSON(`/api/activities/${encodeURIComponent(dynamicId)}`, { method: "DELETE" });
+    await loadActivities();
+    showToast("已删除并忽略该活动", "success");
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "删除活动失败", "error");
+  }
+}
+
+export function bindActivityDeleteButtons() {
+  document.querySelectorAll('[data-action="delete-activity"]').forEach((button) => {
+    button.addEventListener("click", () => deleteActivity(button.getAttribute("data-dynamic-id") || ""));
   });
 }
 
@@ -111,7 +137,7 @@ export function renderActivityTableRow(item, index = 0) {
       <td class="heat-cell"><span class="heat-pill${item.heat_missing ? " heat-pill-missing" : ""}">${formatHeat(item)}</span></td>
       <td class="chip-cell"><span class="${badgeClass(item.activity_status)}">${escapeHtml(item.activity_status)}</span></td>
       <td class="time-cell"><span class="time-pill${soon ? " is-soon" : ""}">${escapeHtml(formatLotteryTime(item.lottery_time))}</span></td>
-      <td class="chip-cell action-cell">${buildActivityParticipateBtn(item)}</td>
+      <td class="chip-cell action-cell">${buildActivityActions(item)}</td>
     </tr>`;
 }
 
@@ -144,7 +170,7 @@ export function renderActivityCard(item, index = 0) {
       </div>
       <div class="activity-card-actions">
         ${buildActivityLink(item)}
-        ${buildActivityParticipateBtn(item)}
+        ${buildActivityActions(item)}
       </div>
     </article>`;
 }
@@ -227,6 +253,7 @@ export function renderActivities(payload) {
   });
   bindActionButtons();
   bindFailureButtons();
+  bindActivityDeleteButtons();
   const preview = resolveTripleTargets(payload);
   if (preview) applyTripleTargets(preview);
 }

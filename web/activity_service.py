@@ -24,6 +24,7 @@ from src.participation_store import ParticipationRecord, load_participations
 from src.comment_breaker import comment_breaker_snapshot, is_comment_breaker_active
 from src.comment_confirmation import is_comment_confirmed
 from src.invalid_activities import invalid_activity_ids
+from src.manual_ignored_activities import manual_ignore_ids
 from src.participation_guard import load_blocked_guard_ids
 from src.sources.common import is_valid_dynamic_id, normalize_activity_id
 from src.state_store import DATA_DIR, get_last_pipeline_persisted
@@ -244,12 +245,14 @@ def get_summary() -> dict[str, Any]:
     participations = load_participations()
     blocked_ids = _load_blocked_activity_ids()
     invalid_ids = invalid_activity_ids()
+    ignored_ids = manual_ignore_ids()
     activities = [
         item
         for item in (enriched.get("activities") or [])
         if _participatable_stored(item)
         and str(item.get("dynamic_id") or "") not in blocked_ids
         and str(item.get("dynamic_id") or "") not in invalid_ids
+        and str(item.get("dynamic_id") or "") not in ignored_ids
     ]
     status_counts = {"已结束": 0, "已参加": 0, "未参加": 0}
     draw_counts = {"active": 0, "ended": 0}
@@ -347,6 +350,7 @@ def _filtered_activity_rows(
     items = [item for item in (enriched.get("activities") or []) if isinstance(item, dict)]
     blocked_ids = _load_blocked_activity_ids()
     invalid_ids = invalid_activity_ids()
+    ignored_ids = manual_ignore_ids()
 
     normalized: list[dict[str, Any]] = []
     draw_window_value = (draw_window or "").strip().lower()
@@ -354,7 +358,7 @@ def _filtered_activity_rows(
         draw_window_value = ""
     for item in items:
         dynamic_id = str(item.get("dynamic_id") or "")
-        if dynamic_id in blocked_ids or dynamic_id in invalid_ids:
+        if dynamic_id in blocked_ids or dynamic_id in invalid_ids or dynamic_id in ignored_ids:
             # pending/unknown/suspected are protected backend states, not a
             # normal activity status.  Keep them out of every ordinary list
             # query so search, filters, sorting and pagination share one set.

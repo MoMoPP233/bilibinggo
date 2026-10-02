@@ -210,6 +210,8 @@ def format_participation_log(payload: dict[str, Any]) -> str:
             return "网络请求失败，已重新回到队列"
         if result_class == "unknown":
             unknown_action = PARTICIPATE_ACTION_LABELS.get(str(snapshot.get("unknown_action") or ""), "操作")
+            if str(snapshot.get("unknown_action") or "") == "comment":
+                return "评论结果未知，建议手动确认并参与。"
             return f"{unknown_action}结果未知，已停止自动重试"
     lines: list[str] = []
     for item in payload.get("actions") or []:

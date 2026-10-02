@@ -592,7 +592,11 @@ def participate_five_action_lottery(
                 "comment": "评论",
                 "reserve": "预约",
             }.get(str(mutation_action[0] or "操作"), "操作")
-            message = f"{action_label}结果未知，已停止自动重试"
+            message = (
+                "评论结果未知，建议手动确认并参与。"
+                if mutation_action[0] == "comment"
+                else f"{action_label}结果未知，已停止自动重试"
+            )
         result = ParticipateResult(
             dynamic_id=dynamic_id,
             lottery_type=lottery_type,
@@ -676,7 +680,11 @@ def participate_five_action_lottery(
                 "comment": "评论",
                 "reserve": "预约",
             }.get(str(unknown_action), "操作")
-            message = f"{action_label}结果未知，已停止自动重试"
+            message = (
+                "评论结果未知，建议手动确认并参与。"
+                if unknown_action == "comment"
+                else f"{action_label}结果未知，已停止自动重试"
+            )
             snapshot["result_class"] = "unknown"
             snapshot["unknown_action"] = unknown_action
         else:

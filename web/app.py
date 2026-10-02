@@ -883,6 +883,20 @@ def api_delete_activity_failure(dynamic_id: str) -> dict[str, Any]:
     return {"ok": True, "deleted": delete_activity_failure(dynamic_id)}
 
 
+@app.delete("/api/activities/{dynamic_id}", tags=["stable"])
+def api_delete_activity(dynamic_id: str) -> dict[str, Any]:
+    """Locally remove and durably ignore one activity; never calls Bilibili."""
+    if not is_valid_dynamic_id(dynamic_id):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "活动 ID 无效")
+    from src.manual_ignored_activities import ignore_stored_activity
+
+    try:
+        ignored_ids = ignore_stored_activity(dynamic_id)
+    except ValueError as exc:
+        raise AppError(ErrorCode.VALIDATION_ERROR, str(exc)) from exc
+    return {"ok": True, "ignored_ids": sorted(ignored_ids)}
+
+
 @app.get("/api/activities/triple-targets", tags=["stable"])
 def api_triple_participate_targets(
     status: str | None = Query(default=None),

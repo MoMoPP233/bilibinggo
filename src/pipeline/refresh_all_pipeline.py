@@ -32,6 +32,7 @@ from src.pipeline.status_step import apply_initial_status
 from src.sources.common import CheckResult, normalize_activity_id
 from src.dead_links import is_http_not_found
 from src.invalid_activities import invalid_activity_ids
+from src.manual_ignored_activities import manual_ignore_ids
 from src.observability import bind_metrics, current_metrics
 
 logger = get_logger("pipeline")
@@ -422,13 +423,39 @@ def run_new_links_pipeline(
             status_by_raw.setdefault(raw_id, "batch_duplicate")
         seen_raw.add(raw_id)
     invalid_ids = invalid_activity_ids()
+    ignored_ids = manual_ignore_ids()
     skipped_invalid = sum(dynamic_id in invalid_ids for dynamic_id in dynamic_ids)
     if invalid_ids:
         dynamic_ids = [dynamic_id for dynamic_id in dynamic_ids if dynamic_id not in invalid_ids]
         for dynamic_id in invalid_ids:
             if dynamic_id in canonical_by_raw:
                 status_by_raw[dynamic_id] = "invalid"
-    skip_reasons: dict[str, int] = {"invalid_activity": skipped_invalid} if skipped_invalid else {}
+    skipped_manual_ignore = sum(dynamic_id in ignored_ids for dynamic_id in dynamic_ids)
+    if ignored_ids:
+        dynamic_ids = [dynamic_id for dynamic_id in dynamic_ids if dynamic_id not in ignored_ids]
+        for dynamic_id in list(canonical_by_raw):
+            if dynamic_id in ignored_ids:
+                status_by_raw[dynamic_id] = "manual_ignore"
+    skip_reasons: dict[str, int] = {}
+    if skipped_invalid:
+        skip_reasons["invalid_activity"] = skipped_invalid
+    if skipped_manual_ignore:
+        skip_reasons["manual_ignore"] = skipped_manual_ignore
+
+    # A source can provide a canonical identity before classification (for
+    # example Following Feed).  Honor a local ignore by either raw or
+    # canonical identity before opening a Bilibili/LLM classification request.
+    if identity_by_raw and dynamic_ids:
+        preclassified_ignored: set[str] = set()
+        for dynamic_id in dynamic_ids:
+            identity = identity_by_raw.get(dynamic_id)
+            canonical = identity.canonical_dynamic_id if identity is not None else ""
+            if canonical and canonical in ignored_ids:
+                preclassified_ignored.add(dynamic_id)
+                status_by_raw[dynamic_id] = "manual_ignore"
+        if preclassified_ignored:
+            dynamic_ids = [dynamic_id for dynamic_id in dynamic_ids if dynamic_id not in preclassified_ignored]
+            skip_reasons["manual_ignore"] = skip_reasons.get("manual_ignore", 0) + len(preclassified_ignored)
 
     if not dynamic_ids:
         _record_ds9_contribution_audit(
@@ -669,6 +696,10 @@ def run_new_links_pipeline(
             skip_reasons["forward_identity_unresolved"] = (
                 skip_reasons.get("forward_identity_unresolved", 0) + 1
             )
+            continue
+        if raw_dynamic_id in ignored_ids or canonical_id in ignored_ids:
+            skip_reasons["manual_ignore"] = skip_reasons.get("manual_ignore", 0) + 1
+            status_by_raw[raw_dynamic_id] = "manual_ignore"
             continue
         if (
             canonical_id in known_after_classification
