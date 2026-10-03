@@ -70,7 +70,7 @@ export function renderActivityDeleteButton(item) {
 }
 
 function buildActivityActions(item) {
-  return `${buildActivityParticipateBtn(item)}${renderActivityDeleteButton(item)}`;
+  return `<div class="activity-row-actions">${buildActivityParticipateBtn(item)}${renderActivityDeleteButton(item)}</div>`;
 }
 
 async function deleteActivityFailure(dynamicId) {

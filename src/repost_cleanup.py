@@ -1050,7 +1050,20 @@ def _persist_assessment(
     uid: str,
     original_id: str,
     assessment: CandidateAssessment,
+    *,
+    now_ts: int | None = None,
 ) -> None:
+    current = int(now_ts if now_ts is not None else time.time())
+    eligible_after = assessment.eligible_after
+    if assessment.level == "manual_review":
+        # 人工确认只代表本次判断，不把候选永久锁死；沿用现有 eligible_after
+        # 字段作为下一次人工评估资格时间，不引入第二套调度状态。
+        if _strict_positive_int(eligible_after) is None:
+            lottery_time = _strict_positive_int(assessment.lottery_time)
+            if assessment.lottery_time_reliable and lottery_time is not None:
+                eligible_after = lottery_time + MANUAL_REVIEW_DEFER_SECONDS
+            else:
+                eligible_after = current + MANUAL_REVIEW_DEFER_SECONDS
     upsert_repost_assessment(
         uid,
         original_id,
@@ -1060,17 +1073,19 @@ def _persist_assessment(
         reason_code=assessment.reason_code or None,
         lottery_type=assessment.lottery_type or None,
         lottery_time=assessment.lottery_time,
-        eligible_after=assessment.eligible_after,
+        eligible_after=eligible_after,
         reason=assessment.reason,
         classification_source=assessment.classification_source,
         summary=assessment.summary or None,
-        evaluated_at=int(time.time()),
+        evaluated_at=current,
         remote_checked_at=assessment.remote_checked_at,
     )
 
 
 def _assessment_status_for(assessment: CandidateAssessment) -> str:
-    """safe/manual_review/excluded 及永久 blocked 为 final；网络类未完成可重试。"""
+    """人工确认项按既有 eligible_after 重新具备评估资格，不永久 final。"""
+    if assessment.level == "manual_review":
+        return "refreshable"
     if assessment.level == "blocked" and assessment.reason_code in RETRYABLE_ASSESSMENT_REASON_CODES:
         return "retryable_unknown"
     return "final"
@@ -1125,6 +1140,65 @@ def _build_pending_queue(
     )
 
 
+def _manual_review_recheck_at(assessment: object, *, fallback_now: int) -> int:
+    """返回人工确认项下一次可重新评估的时间，兼容 V77 旧 final 记录。"""
+    row = _record_dict(assessment)
+    eligible_after = _strict_positive_int(row.get("eligible_after"))
+    if eligible_after is not None:
+        return eligible_after
+    lottery_time = _strict_positive_int(row.get("lottery_time"))
+    if row.get("lottery_time_reliable") is True and lottery_time is not None:
+        return lottery_time + MANUAL_REVIEW_DEFER_SECONDS
+    evaluated_at = _strict_positive_int(row.get("evaluated_at"))
+    if evaluated_at is not None:
+        return evaluated_at + MANUAL_REVIEW_DEFER_SECONDS
+    return fallback_now + MANUAL_REVIEW_DEFER_SECONDS
+
+
+def _assessment_ready_for_manual_review(assessment: object, *, now_ts: int) -> bool:
+    row = _record_dict(assessment)
+    status = str(row.get("assessment_status") or "final")
+    if status != "refreshable":
+        return False
+    return _manual_review_recheck_at(row, fallback_now=now_ts) <= now_ts
+
+
+def _normalize_manual_review_lifecycle(
+    uid: str,
+    assessments: Mapping[str, Any],
+    *,
+    now_ts: int,
+) -> dict[str, Any]:
+    """将 V77 旧 manual_review/final 记录接入 refreshable 生命周期。"""
+    changed = False
+    for original_id, assessment in assessments.items():
+        row = _record_dict(assessment)
+        if row.get("assessment_level") != "manual_review":
+            continue
+        if str(row.get("assessment_status") or "final") != "final":
+            continue
+        eligible_after = _manual_review_recheck_at(row, fallback_now=now_ts)
+        upsert_repost_assessment(
+            uid,
+            original_id,
+            assessment_level="manual_review",
+            assessment_status="refreshable",
+            lottery_time_reliable=row.get("lottery_time_reliable") is True,
+            reason_code=row.get("reason_code"),
+            lottery_type=row.get("lottery_type"),
+            lottery_time=row.get("lottery_time"),
+            eligible_after=eligible_after,
+            reason=row.get("reason"),
+            classification_source=row.get("classification_source") or "activities",
+            summary=row.get("summary"),
+            evaluated_at=row.get("evaluated_at"),
+            remote_checked_at=row.get("remote_checked_at"),
+            assessed_at=row.get("assessed_at") or now_ts,
+        )
+        changed = True
+    return list_repost_assessments(uid) if changed else dict(assessments)
+
+
 def scan_expired_reposts(
     *,
     on_progress: ProgressCallback | None = None,
@@ -1160,13 +1234,22 @@ def scan_expired_reposts(
         local_uid = str(local_uid_int)
         local_reposts = list_evaluable_reposts(local_uid)
         local_existing = list_repost_assessments(local_uid)
+        local_existing = _normalize_manual_review_lifecycle(
+            local_uid, local_existing, now_ts=current
+        )
     else:
         local_reposts = []
         local_existing = {}
     if not enforce_request_budget and not forced and all(
         (_identity_trusted(record) or not _identity_retryable(record))
         and record.original_dynamic_id in local_existing
-        and getattr(local_existing[record.original_dynamic_id], "assessment_status", "final") != "retryable_unknown"
+        and not (
+            getattr(local_existing[record.original_dynamic_id], "assessment_status", "final")
+            == "retryable_unknown"
+            or _assessment_ready_for_manual_review(
+                local_existing[record.original_dynamic_id], now_ts=current
+            )
+        )
         for record in local_reposts
     ):
         return {
@@ -1277,6 +1360,7 @@ def scan_expired_reposts(
             if isinstance(item, dict) and item.get("dynamic_id")
         }
         existing = list_repost_assessments(uid)
+        existing = _normalize_manual_review_lifecycle(uid, existing, now_ts=current)
         if forced:
             for original_id in forced:
                 remove_repost_assessment(uid, original_id)
@@ -1378,6 +1462,12 @@ def scan_expired_reposts(
                 and (
                     original_id not in existing
                     or _retryable_ready(original_id)
+                    or (
+                        original_id in existing
+                        and _assessment_ready_for_manual_review(
+                            existing[original_id], now_ts=current
+                        )
+                    )
                 )
             ]
             if not pending:
@@ -1432,7 +1522,7 @@ def scan_expired_reposts(
                         "已停止后续评估；已经完成的结果已保存。"
                     )
                     break
-                _persist_assessment(uid, original_id, assessment)
+                _persist_assessment(uid, original_id, assessment, now_ts=current)
                 if budget_scope.total_attempts == attempts_before:
                     # 本地 activities 复用/无远程请求：单独计数 cache hit（0 budget）。
                     local_cache_hits += 1
@@ -1901,7 +1991,7 @@ def _effective_candidate_state(
 
 
 def _defer_state(repost: object, assessment: Any) -> dict[str, Any] | None:
-    """计算 per-repost 暂缓状态：用户暂缓优先，其次系统 30 天暂缓（本地动态计算）。"""
+    """计算 per-repost 暂缓状态：用户暂缓优先，其次人工评估下一次资格时间。"""
     if getattr(repost, "cleanup_defer_reason", None) == "user":
         return {
             "defer_reason": "user",
@@ -1916,7 +2006,9 @@ def _defer_state(repost: object, assessment: Any) -> dict[str, Any] | None:
         and _strict_positive_int(getattr(assessment, "lottery_time", None)) is not None
     ):
         lottery_time = int(getattr(assessment, "lottery_time"))
-        deferred_until = lottery_time + MANUAL_REVIEW_DEFER_SECONDS
+        deferred_until = _strict_positive_int(getattr(assessment, "eligible_after", None))
+        if deferred_until is None:
+            deferred_until = lottery_time + MANUAL_REVIEW_DEFER_SECONDS
         if int(time.time()) < deferred_until:
             return {
                 "defer_reason": "recent_reliable_lottery",
@@ -1924,6 +2016,17 @@ def _defer_state(repost: object, assessment: Any) -> dict[str, Any] | None:
                 "reason": "官方可靠开奖时间距今未满 30 天，暂缓人工清理。",
                 "deferred_until": deferred_until,
             }
+    if getattr(assessment, "assessment_level", "") == "manual_review":
+        status = str(getattr(assessment, "assessment_status", "final") or "final")
+        if status == "refreshable":
+            deferred_until = _manual_review_recheck_at(assessment, fallback_now=int(time.time()))
+            if int(time.time()) < deferred_until:
+                return {
+                    "defer_reason": "manual_review_recheck",
+                    "reason_code": getattr(assessment, "reason_code", None) or "manual_review_recheck",
+                    "reason": "本次人工确认已保留，达到下一次检查条件后可重新评估。",
+                    "deferred_until": deferred_until,
+                }
     return None
 
 
@@ -2028,10 +2131,9 @@ def repost_cleanup_summary(uid: str, *, show_deleted: bool = False) -> dict[str,
         record.original_dynamic_id
         for record in reposts
         if record.original_dynamic_id not in assessments
-        or getattr(
-            assessments[record.original_dynamic_id], "assessment_status", "final"
+        or _assessment_ready_for_manual_review(
+            assessments[record.original_dynamic_id], now_ts=int(time.time())
         )
-        == "retryable_unknown"
     }
     return {
         "uid": scoped_uid,

@@ -4253,6 +4253,14 @@ html.sidebar-init-collapsed .system-btn {
   justify-content: space-between;
 }
 
+.activity-row-actions {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
 .inline-feedback {
   font-size: 13px;
   font-weight: 600;
@@ -4695,6 +4703,23 @@ html.sidebar-init-collapsed .system-btn {
   width: 100%;
   border-collapse: collapse;
   font-size: 14px;
+}
+
+.activity-table {
+  min-width: 1040px;
+  table-layout: fixed;
+}
+
+.activity-table .activity-col-title { width: 28%; }
+.activity-table .activity-col-link { width: 13%; }
+.activity-table .activity-col-type { width: 12%; }
+.activity-table .activity-col-heat { width: 9%; }
+.activity-table .activity-col-status { width: 12%; }
+.activity-table .activity-col-time { width: 14%; }
+.activity-table .activity-col-actions { width: 180px; }
+
+.activity-table .action-cell {
+  white-space: nowrap;
 }
 
 .data-table th,

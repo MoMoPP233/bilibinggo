@@ -36,5 +36,7 @@ describe("guarded activity display", () => {
     expect(html).toContain('data-action="participate"');
     expect(html).toContain('data-action="delete-activity"');
     expect(html).toContain("删除");
+    expect(html).toContain('class="activity-row-actions"');
+    expect(html.indexOf('data-action="participate"')).toBeLessThan(html.indexOf('data-action="delete-activity"'));
   });
 });

@@ -108,7 +108,7 @@ def test_public_classifier_forward_lottery_is_manual_review(isolated_home, monke
     result = scan_expired_reposts(now_ts=NOW_TS, client_factory=lambda: _FakeClient())
 
     candidate = load_persisted_candidates(UID)[0]
-    assert candidate["level"] == "manual_review"
+    assert candidate["level"] == "deferred"
     assert candidate["reason_code"] == "forward_lottery_manual"
     assert result["message"].startswith("智能评估完成")
 

@@ -91,7 +91,7 @@ def test_job_budget_hard_cap_and_continuation(isolated_home, monkeypatch) -> Non
     assert second["pending_originals"] == 0
 
 
-def test_existing_assessment_is_not_reevaluated(isolated_home, monkeypatch) -> None:
+def test_existing_manual_assessment_reopens_after_recheck_window(isolated_home, monkeypatch) -> None:
     monkeypatch.setattr("src.repost_cleanup.MAX_ASSESSMENTS_PER_JOB", 10)
     originals = [f"100000000000000000{n}" for n in range(1, 4)]
     calls = _seed(originals, monkeypatch)
@@ -106,8 +106,8 @@ def test_existing_assessment_is_not_reevaluated(isolated_home, monkeypatch) -> N
 
     result = scan_expired_reposts(now_ts=1_800_000_000, client_factory=lambda: _FakeClient())
 
-    assert result["evaluated_originals"] == 2
-    assert calls["n"] == 2
+    assert result["evaluated_originals"] == 3
+    assert calls["n"] == 3
     assert result["pending_originals"] == 0
 
 
@@ -191,4 +191,4 @@ def test_cancel_preserves_completed_results(isolated_home, monkeypatch) -> None:
 
     persisted = load_persisted_candidates(UID)
     assert len(persisted) == 1
-    assert persisted[0]["level"] == "manual_review"
+    assert persisted[0]["level"] == "deferred"
