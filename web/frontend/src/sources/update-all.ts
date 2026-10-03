@@ -150,7 +150,7 @@ export async function startUpdateAllDatasources() {
   } finally {
     starting = false;
     const current = state.currentJob || null;
-    if (!current || current.state === "idle") {
+    if (!current || (current.id == null && current.action === ACTION)) {
       const { summary } = getElements();
       if (summary) summary.textContent = "全部数据源更新任务已结束";
     }

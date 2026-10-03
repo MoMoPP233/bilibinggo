@@ -65,6 +65,10 @@ export function requireSetup(action) {
   if (action === "login") return true;
   if (!LOGIN_REQUIRED_ACTIONS.has(action)) return true;
   if (!isLoggedIn()) {
+    if (state.account?.network_error && state.account?.cookie_saved) {
+      showToast("暂时无法连接 B 站", "error", "请检查网络或代理，网络恢复后再试。");
+      return false;
+    }
     showToast("请先扫码登录", "info", "登录后才能使用此功能");
     return false;
   }

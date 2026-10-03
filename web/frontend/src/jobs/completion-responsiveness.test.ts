@@ -241,6 +241,47 @@ describe("job completion responsiveness", () => {
     );
   });
 
+  it("classifies structured account network errors as Bilibili network failures", async () => {
+    const jobs = await loadJobsModule();
+    const failure = jobs.classifyFailureText(
+      "暂时无法连接 B 站，请检查网络、代理后重试。",
+      "sync_assess_repost_history",
+    );
+    expect(failure.kind).toBe("network");
+    expect(failure.title).toContain("B 站");
+    expect(failure.hint).not.toContain("LLM");
+  });
+
+  it("uses LLM and login prompts only for their structured error codes", async () => {
+    const jobs = await loadJobsModule();
+    jobs.notifyJobStartError(Object.assign(new Error("401 Unauthorized"), { code: "" }), "sync_assess_repost_history");
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      "401 Unauthorized",
+      "error",
+      expect.any(String),
+      expect.any(Array),
+    );
+
+    mocks.showToast.mockReset();
+    jobs.notifyJobStartError(Object.assign(new Error("配置未完成"), { code: "LLM_NOT_READY" }), "refresh_all");
+    expect(mocks.showToast).toHaveBeenCalledWith("请先测试 LLM 连接", "info", expect.any(String));
+
+    mocks.showToast.mockReset();
+    jobs.notifyJobStartError(Object.assign(new Error("账号不可用"), { code: "AUTH_REQUIRED" }), "sync_assess_repost_history");
+    expect(mocks.showToast).toHaveBeenCalledWith("请先扫码登录", "info", expect.any(String));
+  });
+
+  it("restores a start button when the API returns no valid job", async () => {
+    mocks.fetchJSON.mockResolvedValueOnce({ ok: true });
+    const jobs = await loadJobsModule();
+    jobs.bindActionButtons();
+    const button = document.querySelector<HTMLButtonElement>('[data-action="following_feed_scan"]');
+    button?.click();
+    await vi.waitFor(() => expect(button?.disabled).toBe(false));
+    await flush();
+    expect(mocks.showToast).toHaveBeenCalled();
+  });
+
   it("shows success toast and restores buttons before background refreshes finish", async () => {
     const summaryWait = deferred();
     const accountWait = deferred();

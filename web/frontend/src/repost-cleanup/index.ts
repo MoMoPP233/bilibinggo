@@ -1169,7 +1169,7 @@ async function requestCleanupStart(
   } finally {
     cleanupStartBusy = "";
     const settledJob = state.currentJob || null;
-    if (!settledJob || settledJob.state === "idle") {
+    if (!settledJob || (settledJob.id == null && settledJob.action === action)) {
       resetStartingJobView();
     }
     refreshCleanupJobControls();

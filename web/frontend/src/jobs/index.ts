@@ -137,7 +137,7 @@ export function buildFailureContext(message, action, log = "") {
   return { text, lowered: text.toLowerCase(), action: String(action || "") };
 }
 
-export function classifyFailureText(message, action, log = "") {
+export function classifyFailureText(message, action, log = "", errorCode = "") {
   const { text, lowered, action: actionName } = buildFailureContext(message, action, log);
   const displayMessage = sanitizeUserText(message) || sanitizeUserText(log) || "操作失败，请稍后重试";
 
@@ -185,7 +185,7 @@ export function classifyFailureText(message, action, log = "") {
       retryable: true,
     };
   }
-  if (/cookie|未登录|请先扫码|登录失效|重新扫码登录|未检测到有效登录/.test(lowered)) {
+  if (String(errorCode || "") === "AUTH_REQUIRED") {
     return {
       kind: "auth",
       severity: "error",
@@ -196,7 +196,7 @@ export function classifyFailureText(message, action, log = "") {
       retryable: true,
     };
   }
-  if (/llm|未配置|连接测试|api key|模型名称|无法连接 llm/.test(lowered)) {
+  if (String(errorCode || "") === "LLM_NOT_READY") {
     return {
       kind: "llm",
       severity: "error",
@@ -204,6 +204,17 @@ export function classifyFailureText(message, action, log = "") {
       message: displayMessage,
       hint: "在概览页填写 API Key 与模型名称，保存并通过连接测试。",
       actions: [{ id: "llm", label: "去配置 LLM" }],
+      retryable: true,
+    };
+  }
+  if (/account_network_error|b 站网络|无法连接 b 站|网络连接中断|网络异常|ssl|handshake|timeout|dns|代理/.test(lowered)) {
+    return {
+      kind: "network",
+      severity: "error",
+      title: "B 站网络异常",
+      message: displayMessage,
+      hint: "请检查本机网络、代理或 DNS；已完成的同步/评估进度已保存，网络恢复后可继续。",
+      actions: [{ id: "retry", label: "重试" }],
       retryable: true,
     };
   }
@@ -267,22 +278,21 @@ export function classifyFailureText(message, action, log = "") {
 }
 
 export function classifyJobFailure(job) {
-  return classifyFailureText(job?.message, job?.action, job?.log);
+  return classifyFailureText(job?.message, job?.action, job?.log, job?.error_code || job?.result?.error_code);
 }
 
 export function notifyJobStartError(error, action, params = {}) {
   const message = sanitizeUserText(error?.message || error);
   const code = String(error?.code || "");
-  if (code === "AUTH_REQUIRED" || message.includes("请先扫码登录")) {
+  if (code === "AUTH_REQUIRED") {
     showToast("请先扫码登录", "info", "完成登录与 LLM 配置后才能使用项目功能");
     return;
   }
-  if (
-    code === "LLM_NOT_READY" ||
-    message.includes("连接测试") ||
-    message.includes("配置并通过连接测试") ||
-    /未配置\s*LLM|配置 LLM/i.test(message)
-  ) {
+  if (code === "ACCOUNT_NETWORK_ERROR") {
+    showToast("暂时无法连接 B 站", "error", "请检查网络或代理，网络恢复后再试。");
+    return;
+  }
+  if (code === "LLM_NOT_READY") {
     showToast("请先测试 LLM 连接", "info", "保存配置后点击「测试连接」，通过后才能使用项目功能");
     return;
   }
@@ -1422,6 +1432,9 @@ export async function startJob(action, params = {}) {
     body: JSON.stringify({ action, params }),
   });
   const startedJob = startResponse?.job;
+  if (!startedJob || startedJob.id == null) {
+    throw Object.assign(new Error("任务启动失败，请稍后重试"), { code: "JOB_START_FAILED" });
+  }
   if (startedJob?.id != null && acceptJobUpdate(startedJob)) {
     // POST 已返回权威新 job_id：立刻确定当前任务身份，
     // 旧 Job 任何晚到事件都无法覆盖它。

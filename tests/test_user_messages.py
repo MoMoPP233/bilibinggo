@@ -70,3 +70,10 @@ def test_friendly_error_llm_test_required() -> None:
 
 def test_friendly_error_busy_job() -> None:
     assert "已有任务" in friendly_error(RuntimeError("已有任务正在运行"))
+
+
+def test_friendly_error_for_bilibili_tls_failure_is_resumable_network_message() -> None:
+    message = friendly_error(RuntimeError("httpx.ConnectError: SSL UNEXPECTED_EOF_WHILE_READING"))
+    assert "B 站网络连接中断" in message
+    assert "已完成进度已保存" in message
+    assert "LLM" not in message

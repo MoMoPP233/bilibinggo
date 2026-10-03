@@ -26,6 +26,15 @@ def test_profile_from_network_error_uses_cookie_and_cache(monkeypatch) -> None:
     assert "B 站" in profile["message"]
 
 
+def test_network_error_profile_keeps_cookie_without_becoming_auth_error(monkeypatch) -> None:
+    monkeypatch.setattr("web.account_service.get_login_uid", lambda: 12345)
+    monkeypatch.setattr("web.account_service._load_account_cache", lambda: {"mid": 12345})
+    profile = _profile_from_network_error(RuntimeError("httpx.ConnectError: SSL EOF"))
+    assert profile["logged_in"] is False
+    assert profile["network_error"] is True
+    assert profile["cookie_saved"] is True
+
+
 def test_api_code_handles_non_numeric() -> None:
     assert _api_code({"code": "oops"}) == -1
     assert _api_code({"code": None}) == -1

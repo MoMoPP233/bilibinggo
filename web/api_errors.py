@@ -23,6 +23,7 @@ class ErrorCode(StrEnum):
     VALIDATION_ERROR = "VALIDATION_ERROR"
     UNSUPPORTED_ACTION = "UNSUPPORTED_ACTION"
     AUTH_REQUIRED = "AUTH_REQUIRED"
+    ACCOUNT_NETWORK_ERROR = "ACCOUNT_NETWORK_ERROR"
     LLM_NOT_READY = "LLM_NOT_READY"
     NOT_FOUND = "NOT_FOUND"
     JOB_BUSY = "JOB_BUSY"
@@ -35,6 +36,7 @@ ERROR_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.VALIDATION_ERROR: 400,
     ErrorCode.UNSUPPORTED_ACTION: 400,
     ErrorCode.AUTH_REQUIRED: 401,
+    ErrorCode.ACCOUNT_NETWORK_ERROR: 503,
     ErrorCode.LLM_NOT_READY: 401,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.JOB_BUSY: 409,
@@ -104,6 +106,11 @@ def error_response(
 
 
 def require_login(account: dict[str, Any], *, message: str = "请先扫码登录后再执行此操作") -> None:
+    if account.get("network_error") and account.get("cookie_saved"):
+        raise AppError(
+            ErrorCode.ACCOUNT_NETWORK_ERROR,
+            "暂时无法连接 B 站，请检查网络、代理后重试。",
+        )
     if not account.get("logged_in"):
         raise AppError(ErrorCode.AUTH_REQUIRED, message)
 

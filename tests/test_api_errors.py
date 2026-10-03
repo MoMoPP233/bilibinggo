@@ -95,6 +95,16 @@ def test_auth_required_for_refresh_status_job() -> None:
     start_mock.assert_not_called()
 
 
+def test_account_network_error_is_not_mapped_to_auth_required() -> None:
+    with patch(
+        "web.app.get_account_profile",
+        return_value={"logged_in": False, "network_error": True, "cookie_saved": True},
+    ), patch("web.app.runner.try_start", return_value=1) as start_mock:
+        resp = client.post("/api/jobs", json={"action": "sync_assess_repost_history", "params": {}})
+    _assert_error_shape(resp, code="ACCOUNT_NETWORK_ERROR", status=503)
+    start_mock.assert_not_called()
+
+
 def test_refresh_status_ok_without_llm() -> None:
     """refresh_status 需登录、不需 LLM；就绪后应 try_start。"""
     with patch("web.app.get_account_profile", return_value={"logged_in": True}), patch(

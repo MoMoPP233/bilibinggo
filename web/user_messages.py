@@ -26,6 +26,7 @@ JOB_ACTION_LABELS: dict[str, str] = {
     "cleanup_auto_maintain": "清理数据自动维护",
     "following_feed_scan": "关注动态补漏扫描",
     "sync_repost_history": "同步我的转发历史",
+    "sync_assess_repost_history": "同步/评估转发历史",
     "scan_expired_reposts": "扫描过期抽奖转发",
     "delete_expired_reposts": "删除选中的过期抽奖转发",
 }
@@ -114,6 +115,22 @@ def friendly_error(exc: BaseException) -> str:
             return friendly_network_error(msg)
         return "操作失败，请稍后重试"
 
+    if any(
+        marker in msg.lower()
+        for marker in (
+            "connecterror",
+            "connecttimeout",
+            "readtimeout",
+            "ssl",
+            "handshake",
+            "dns",
+            "proxy",
+            "connection refused",
+            "connection reset",
+            "network",
+        )
+    ):
+        return "B 站网络连接中断，任务已停止，已完成进度已保存。网络恢复后可再次执行继续处理。"
     mapped = _friendly_plain_message(msg)
     if mapped:
         return mapped

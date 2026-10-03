@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 from src.bilibili_login import LoginCancelledError
 from src.job_store import get_job
 from web.job_runner import JobRunner
@@ -96,6 +98,35 @@ def test_login_error_sets_error_phase(isolated_home: Path) -> None:
     assert status.state == "error"
     assert status.result is not None
     assert status.result.get("login_phase") == "error"
+
+
+def test_network_failure_finishes_job_and_keeps_completed_progress(isolated_home: Path) -> None:
+    _ = isolated_home
+    done = threading.Event()
+
+    def fake_run_action(action, params, *, on_progress, cancel_event):
+        on_progress(step=150, total=200, message="已完成 150/200 条", log_append="已保存前 150 条")
+        done.set()
+        raise httpx.ConnectError("SSL UNEXPECTED_EOF_WHILE_READING")
+
+    with patch("web.job_runner.run_action", side_effect=fake_run_action):
+        job_id = JobRunner().try_start("sync_assess_repost_history")
+        assert job_id is not None
+        assert done.wait(timeout=3)
+
+    # The worker instance is intentionally retained to inspect its terminal state.
+    # A fresh runner can only observe the persisted terminal row.
+    row = get_job(job_id)
+    deadline = time.time() + 3
+    while (row is None or row.get("state") == "running") and time.time() < deadline:
+        time.sleep(0.05)
+        row = get_job(job_id)
+    assert row is not None
+    assert row["state"] == "error"
+    assert row["progress_step"] == 150
+    assert row["progress_total"] == 200
+    assert "B 站网络连接中断" in row["message"]
+    assert "已完成进度已保存" in row["message"]
 
 
 def test_login_cancel_becomes_cancelled(isolated_home: Path) -> None:
