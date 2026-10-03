@@ -953,7 +953,12 @@ async function restoreAccountAfterCleanupDelete(): Promise<void> {
 }
 
 export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<void> {
-  if (!job || (job.state !== "success" && job.state !== "error" && job.state !== "cancelled")) return;
+  if (!job || (
+    job.state !== "success"
+    && job.state !== "error"
+    && job.state !== "cancelled"
+    && job.state !== "interrupted"
+  )) return;
   try {
     // 全局任务管理器不会盲目重新启用 data-job-control；按本页选择状态恢复。
     renderSelectionState();

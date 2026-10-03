@@ -654,6 +654,25 @@ describe("repost cleanup UI", () => {
     expect(loadAccountMock).not.toHaveBeenCalled();
   });
 
+  it.each(["success", "error", "cancelled", "interrupted"] as const)(
+    "reloads server state after a delete job reaches %s",
+    async (state) => {
+      fetchJSONMock.mockResolvedValue({ ok: true, candidates: [] });
+      const module = await loadModule();
+      module.bindRepostCleanup();
+
+      await module.handleRepostCleanupJobCompletion({
+        action: "delete_expired_reposts",
+        state,
+        result: { deleted_count: 0, failed_count: 1 },
+      });
+
+      expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/history?page=1&page_size=20");
+      expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates?show_deleted=1");
+      expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/health");
+    },
+  );
+
   it("keeps each refresh metric owned by its semantic source regardless of response order", async () => {
     const pending = new Map<string, { resolve: (value: unknown) => void }>();
     fetchJSONMock.mockImplementation((url: string) => new Promise((resolve) => {
