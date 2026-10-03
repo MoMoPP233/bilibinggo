@@ -486,19 +486,32 @@ def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
 def _cleanup_progress_adapter(
     progress: ProgressCallback,
     cancel_event: threading.Event | None,
+    *,
+    log_stride: int = 1,
 ) -> Callable[..., None]:
     """Bridge cleanup services onto the existing JobRunner progress protocol."""
 
+    last_logged = -max(1, log_stride)
+
     def report(done: int, total: int, message: str, log_line: str | None = None) -> None:
+        nonlocal last_logged
         _raise_if_cancelled(cancel_event)
         step = max(0, int(done or 0))
         normalized_total = max(step, int(total or 0), 1)
         cleaned_message = str(message or "正在处理…").strip()
+        should_log = (
+            log_stride <= 1
+            or step == 0
+            or step - last_logged >= log_stride
+            or (int(total or 0) > 0 and step >= int(total))
+        )
+        if should_log:
+            last_logged = step
         progress(
             step=step,
             total=normalized_total,
             message=cleaned_message,
-            log_append=str(log_line or cleaned_message).strip(),
+            log_append=str(log_line or cleaned_message).strip() if should_log else None,
         )
 
     return report
@@ -1671,8 +1684,9 @@ def _run_action_impl(
             raise ValueError("同步个人转发历史不接受额外参数")
         progress(step=0, total=1, message="正在核对当前账号并读取个人动态…")
         result = sync_repost_history(
-            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            on_progress=_cleanup_progress_adapter(progress, cancel_event, log_stride=10),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+            enforce_request_budget=False,
         )
         _raise_if_cancelled(cancel_event)
         imported = int(result.get("imported_count") or result.get("imported") or 0)
@@ -1704,9 +1718,21 @@ def _run_action_impl(
             raise ValueError("同步/评估转发历史不接受额外参数")
         _raise_if_cancelled(cancel_event)
         progress(step=0, total=2, message="正在同步转发历史…", log_append="同步转发历史开始")
+
+        def sync_progress(**event: Any) -> None:
+            progress(
+                step=0,
+                total=2,
+                message=str(event.get("message") or "正在同步转发历史…"),
+                stage="同步转发历史",
+                current=int(event.get("step") or 0),
+                log_append=event.get("log_append"),
+            )
+
         synced = sync_repost_history(
-            on_progress=None,
+            on_progress=_cleanup_progress_adapter(sync_progress, cancel_event, log_stride=10),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+            enforce_request_budget=False,
         )
         _raise_if_cancelled(cancel_event)
         if synced.get("budget_exhausted"):
@@ -1733,8 +1759,9 @@ def _run_action_impl(
             }
         progress(step=1, total=2, message="同步完成，正在连续智能评估…", log_append="同步转发历史完成；智能评估开始")
         assessed = scan_expired_reposts(
-            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            on_progress=_cleanup_progress_adapter(progress, cancel_event, log_stride=10),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
+            enforce_request_budget=False,
         )
         _raise_if_cancelled(cancel_event)
         _raise_assessment_platform_risk(assessed)
@@ -1811,9 +1838,10 @@ def _run_action_impl(
         force_original_ids = params.get("force_original_ids") if params else None
         progress(step=0, total=1, message="正在串行评估历史抽奖…")
         result = scan_expired_reposts(
-            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            on_progress=_cleanup_progress_adapter(progress, cancel_event, log_stride=10),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
             force_original_ids=force_original_ids,
+            enforce_request_budget=False,
         )
         _raise_if_cancelled(cancel_event)
         _raise_assessment_platform_risk(result)

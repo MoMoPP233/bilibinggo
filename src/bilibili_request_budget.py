@@ -98,6 +98,7 @@ class BilibiliRequestBudgetScope:
     limit: int
     window_seconds: int
     now_fn: Callable[[], int]
+    enforce_limit: bool = True
     window_started_at: int = 0
     rolled: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -138,6 +139,14 @@ class BilibiliRequestBudgetScope:
         )
 
     def result_fields(self, *, exhausted: bool, partial: bool) -> dict[str, Any]:
+        if not self.enforce_limit:
+            return {
+                "budget_exhausted": False,
+                "partial": bool(partial),
+                "request_attempts": self.total_attempts,
+                "request_categories": self.category_counts,
+                "cache_hits": self.cache_hits,
+            }
         snap = self.snapshot()
         return {
             "budget_exhausted": bool(exhausted),
@@ -169,8 +178,9 @@ def bilibili_request_budget_scope(
     window_seconds: int | None = None,
     now_fn: Callable[[], int] | None = None,
     profile_dir: Path | None = None,
+    enforce_limit: bool = True,
 ) -> Iterator[BilibiliRequestBudgetScope]:
-    """受保护任务作用域；嵌套调用复用最外层作用域（不会重复开预算）。"""
+    """请求统计作用域；默认执行持久预算，人工清理可只统计不截断。"""
     existing = _scope_ctx.get()
     if existing is not None:
         yield existing
@@ -181,6 +191,7 @@ def bilibili_request_budget_scope(
         limit=_resolve_limit(limit),
         window_seconds=_resolve_window(window_seconds),
         now_fn=resolved_now_fn,
+        enforce_limit=enforce_limit,
     )
     token = _scope_ctx.set(scope)
     try:
@@ -384,6 +395,9 @@ def reserve_bilibili_http_attempt(url: str, *, now: int | None = None) -> None:
     """
     scope = _scope_ctx.get()
     if scope is None:
+        return
+    if not scope.enforce_limit:
+        scope.note_attempt(_categorize_endpoint(url))
         return
     snapshot = reserve_bilibili_request(
         now=scope.now_fn() if now is None else int(now),

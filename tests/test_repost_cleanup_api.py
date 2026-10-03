@@ -92,16 +92,19 @@ def test_combined_sync_assess_action_runs_both_phases_in_one_job(monkeypatch) ->
     calls: list[str] = []
     progress: list[dict] = []
 
-    def fake_sync(*, on_progress, cancel_check):
+    def fake_sync(*, on_progress, cancel_check, enforce_request_budget):
         calls.append("sync")
-        assert on_progress is None
+        assert callable(on_progress)
+        on_progress(12, 0, "已扫描 12 页")
         assert cancel_check() is False
+        assert enforce_request_budget is False
         return {"found_reposts": 4, "imported_count": 2}
 
-    def fake_scan(*, on_progress, cancel_check):
+    def fake_scan(*, on_progress, cancel_check, enforce_request_budget):
         calls.append("assess")
         assert callable(on_progress)
         assert cancel_check() is False
+        assert enforce_request_budget is False
         return {"message": "连续评估完成", "pending_originals": 0}
 
     monkeypatch.setattr("src.repost_cleanup.sync_repost_history", fake_sync)
@@ -118,6 +121,7 @@ def test_combined_sync_assess_action_runs_both_phases_in_one_job(monkeypatch) ->
     assert payload["result"]["sync"]["imported_count"] == 2
     assert payload["result"]["assessment"]["pending_originals"] == 0
     assert progress[0]["step"] == 0
+    assert any(event.get("stage") == "同步转发历史" and event.get("current") == 12 for event in progress)
     assert progress[-1]["step"] == progress[-1]["total"] == 2
 
 

@@ -53,6 +53,7 @@ from src.repost_history import (
     remove_repost_assessment,
     restore_repost,
     save_checkpoint,
+    save_sync_progress,
     set_repost_identity,
     upsert_repost_assessment,
     upsert_repost_records,
@@ -246,6 +247,7 @@ def sync_repost_history(
     on_progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
+    enforce_request_budget: bool = True,
 ) -> dict[str, Any]:
     """人工增量同步当前账号的个人转发历史。"""
     sync_started_at = int(time.time())
@@ -262,7 +264,9 @@ def sync_repost_history(
     checkpoint = initial_checkpoint
     old_head = str(getattr(checkpoint, "head_dynamic_id", "") or "")
     old_head_ts = _strict_positive_int(getattr(checkpoint, "head_published_at", None))
-    offset = ""
+    offset = str(getattr(checkpoint, "resume_offset", "") or "")
+    resumed_scan = bool(offset)
+    scan_started_at = _strict_positive_int(getattr(checkpoint, "resume_started_at", None)) or sync_started_at
     seen_offsets: set[str] = set()
     scanned_pages = 0
     scanned_items = 0
@@ -270,15 +274,20 @@ def sync_repost_history(
     imported_count = 0
     completed = False
     budget_exhausted = False
-    newest_id: str | None = None
-    newest_ts: int | None = None
+    newest_id: str | None = getattr(checkpoint, "resume_head_dynamic_id", None)
+    newest_ts: int | None = _strict_positive_int(getattr(checkpoint, "resume_head_published_at", None))
     saved_checkpoint = checkpoint
 
-    with bilibili_request_budget_scope() as budget_scope:
+    with bilibili_request_budget_scope(enforce_limit=enforce_request_budget) as budget_scope:
         with client_factory() as client:
             try:
                 _, uid = _require_verified_login(client)
                 checkpoint = get_checkpoint(str(uid))
+                offset = str(getattr(checkpoint, "resume_offset", "") or "")
+                resumed_scan = bool(offset)
+                scan_started_at = _strict_positive_int(getattr(checkpoint, "resume_started_at", None)) or sync_started_at
+                newest_id = getattr(checkpoint, "resume_head_dynamic_id", None)
+                newest_ts = _strict_positive_int(getattr(checkpoint, "resume_head_published_at", None))
                 old_head = str(getattr(checkpoint, "head_dynamic_id", "") or "")
                 old_head_ts = _strict_positive_int(
                     getattr(checkpoint, "head_published_at", None)
@@ -378,6 +387,15 @@ def sync_repost_history(
                     if not raw_items or not next_offset:
                         completed = True
                         break
+                    # 本页 history 已提交后才前移游标。崩溃夹在两次提交之间最多重读
+                    # 一页，不会跳过尚未落库的转发记录。
+                    save_sync_progress(
+                        str(uid),
+                        next_offset=next_offset,
+                        newest_id=newest_id,
+                        newest_ts=newest_ts,
+                        started_at=scan_started_at,
+                    )
                     offset = next_offset
                     if PAGE_REQUEST_DELAY > 0:
                         time.sleep(PAGE_REQUEST_DELAY)
@@ -396,7 +414,7 @@ def sync_repost_history(
                         ),
                         # 秒级时间无法区分“同步开始”和同秒 confirmed 的先后；把覆盖水位
                         # 保守地停在开始前 1 秒，最多多补同步一次，不能永久漏同步。
-                        last_synced_at=max(1, sync_started_at - 1),
+                        last_synced_at=max(1, scan_started_at - 1),
                     )
             except RequestBudgetExhausted:
                 # 登录校验/分页等任何真实请求耗尽预算：安全暂停，不推进检查点。
@@ -415,7 +433,15 @@ def sync_repost_history(
         guard_reconciliation = reconcile_uncertain_guards_from_history(str(uid))
 
     dirty_cleared = False
-    if completed and initial_sync_needed:
+    if (
+        completed
+        and initial_sync_needed
+        and (
+            not resumed_scan
+            or consumed_sync_needed_at is None
+            or int(consumed_sync_needed_at) < scan_started_at
+        )
+    ):
         dirty_cleared = clear_sync_needed_if_unchanged(
             str(uid),
             expected_sync_needed_at=consumed_sync_needed_at,
@@ -1107,6 +1133,7 @@ def scan_expired_reposts(
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
     force_original_ids: object = None,
     stale_check: Callable[[], object] | None = None,
+    enforce_request_budget: bool = True,
 ) -> dict[str, Any]:
     """一键智能评估（M4：连续批次）。
 
@@ -1126,6 +1153,46 @@ def scan_expired_reposts(
     breaker = _AssessmentBreaker()
     budget_exhausted = False
     local_cache_hits = 0
+
+    # 完全没有待处理 original/身份时，不为确认“无事可做”而访问 NAV。
+    if not enforce_request_budget and not forced:
+        _, local_uid_int = require_login()
+        local_uid = str(local_uid_int)
+        local_reposts = list_evaluable_reposts(local_uid)
+        local_existing = list_repost_assessments(local_uid)
+    else:
+        local_reposts = []
+        local_existing = {}
+    if not enforce_request_budget and not forced and all(
+        (_identity_trusted(record) or not _identity_retryable(record))
+        and record.original_dynamic_id in local_existing
+        and getattr(local_existing[record.original_dynamic_id], "assessment_status", "final") != "retryable_unknown"
+        for record in local_reposts
+    ):
+        return {
+            "uid": local_uid,
+            "history_total": len(local_reposts),
+            "evaluated_originals": 0,
+            "pending_originals": 0,
+            "budget": ASSESSMENT_BUDGET_PER_ROUND,
+            "job_budget": MAX_ASSESSMENTS_PER_JOB,
+            "batch_size": ASSESSMENT_BATCH_SIZE,
+            "frozen_scope": 0,
+            "batches_done": 0,
+            "attempted_this_job": 0,
+            "made_progress": 0,
+            "rate_limited": False,
+            "risk_code": None,
+            "stopped_early": False,
+            "stop_reason": "",
+            "message": "智能评估完成，共处理 0 条原动态（0 批）。",
+            "candidates": load_persisted_candidates(local_uid),
+            "budget_exhausted": False,
+            "partial": False,
+            "request_attempts": 0,
+            "request_categories": {},
+            "cache_hits": 0,
+        }
 
     def _semantic(record: object) -> tuple | None:
         if record is None:
@@ -1159,7 +1226,7 @@ def scan_expired_reposts(
             raise RuntimeError("运行期间数据库路径发生变化，已停止")
         # UID 已在本 Job 开始由 _require_verified_login 冻结；Profile/DB 不变即身份不变。
 
-    with bilibili_request_budget_scope() as budget_scope, client_factory() as client:
+    with bilibili_request_budget_scope(enforce_limit=enforce_request_budget) as budget_scope, client_factory() as client:
         try:
             _, uid_int = _require_verified_login(client)
         except RequestBudgetExhausted as exc:
@@ -1241,6 +1308,13 @@ def scan_expired_reposts(
                 budget_exhausted = True
                 break
             except (RemoteStateUnknown, RuntimeError, ValueError) as exc:
+                if _risk_code_from_message(exc) is not None:
+                    # 正式风控不是身份反证；不污染身份账本，也不请求后续条目。
+                    _record_global_platform_risk("scan_expired_reposts", exc)
+                    try:
+                        breaker.note_failure(exc)
+                    except AssessmentRateLimited:
+                        break
                 set_repost_identity(
                     uid, repost_id, ok=False, source="remote_detail",
                     error=str(exc), checked_at=current,

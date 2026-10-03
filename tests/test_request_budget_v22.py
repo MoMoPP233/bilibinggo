@@ -725,10 +725,6 @@ def test_case24_sync_resumes_next_window(isolated_home, monkeypatch) -> None:
     _patch_sync(
         monkeypatch,
         [
-            {
-                "items": [_feed_item(dynamic_id=_repost_id(1), ts=100, original_id=_original_id(1))],
-                "offset": "next",
-            },
             {"items": [_feed_item(dynamic_id=old_head, ts=50)], "offset": ""},
         ],
     )

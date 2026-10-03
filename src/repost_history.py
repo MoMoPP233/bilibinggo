@@ -70,6 +70,10 @@ class RepostSyncCheckpoint:
     full_scan_completed: bool
     last_synced_at: int | None
     updated_at: int
+    resume_offset: str | None = None
+    resume_head_dynamic_id: str | None = None
+    resume_head_published_at: int | None = None
+    resume_started_at: int | None = None
     sync_needed: bool = False
     sync_needed_at: int | None = None
     maintenance_risk_paused: bool = False
@@ -181,6 +185,10 @@ def _checkpoint(row: RepostSyncCheckpointRow) -> RepostSyncCheckpoint:
         full_scan_completed=bool(row.full_scan_completed),
         last_synced_at=row.last_synced_at,
         updated_at=row.updated_at,
+        resume_offset=row.resume_offset,
+        resume_head_dynamic_id=row.resume_head_dynamic_id,
+        resume_head_published_at=row.resume_head_published_at,
+        resume_started_at=row.resume_started_at,
         sync_needed=bool(row.sync_needed),
         sync_needed_at=row.sync_needed_at,
         maintenance_risk_paused=bool(row.maintenance_risk_paused),
@@ -364,6 +372,43 @@ def get_checkpoint(uid: str) -> RepostSyncCheckpoint | None:
         return _checkpoint(row) if row is not None else None
 
 
+def save_sync_progress(
+    uid: str,
+    *,
+    next_offset: str,
+    newest_id: str | None,
+    newest_ts: int | None,
+    started_at: int,
+) -> None:
+    """仅在整页 history 已提交后保存下一页游标；不推进完成锚点。"""
+    scoped_uid = _uid(uid)
+    offset = str(next_offset or "").strip()
+    if not offset or len(offset) > 4096:
+        raise ValueError("空间动态分页游标无效")
+    if (newest_id is None) != (newest_ts is None):
+        raise ValueError("续扫首页锚点 ID 与时间必须同时存在或同时为空")
+    head_id = _dynamic_id(newest_id, label="续扫首页动态 ID") if newest_id else None
+    head_ts = _timestamp(newest_ts, label="续扫首页发布时间", optional=True)
+    scan_started = _timestamp(started_at, label="续扫开始时间")
+    now = int(time.time())
+    progress = {
+        "resume_offset": offset,
+        "resume_head_dynamic_id": head_id,
+        "resume_head_published_at": head_ts,
+        "resume_started_at": scan_started,
+        "updated_at": now,
+    }
+    with session_scope() as session:
+        session.execute(
+            insert(RepostSyncCheckpointRow)
+            .values(uid=scoped_uid, full_scan_completed=False, **progress)
+            .on_conflict_do_update(
+                index_elements=["uid"],
+                set_=progress,
+            )
+        )
+
+
 def save_checkpoint(
     uid: str,
     *,
@@ -396,6 +441,10 @@ def save_checkpoint(
         "head_published_at": normalized_published,
         "full_scan_completed": full_scan_completed,
         "last_synced_at": synced_at,
+        "resume_offset": None,
+        "resume_head_dynamic_id": None,
+        "resume_head_published_at": None,
+        "resume_started_at": None,
         "updated_at": synced_at,
     }
     with session_scope() as session:

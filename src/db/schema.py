@@ -11,7 +11,7 @@ from src.db.models import SchemaMeta
 # 确保全部表注册到 metadata
 from src.db import models as _models  # noqa: F401
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _JOB_V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("label", "TEXT NOT NULL DEFAULT ''"),
@@ -351,6 +351,22 @@ def _validate_repost_v10_columns(session: Session) -> None:
     )
 
 
+def _validate_repost_v12_columns(session: Session) -> None:
+    _validate_columns(
+        session,
+        table="repost_sync_checkpoint",
+        expected_types={
+            "resume_offset": "TEXT",
+            "resume_head_dynamic_id": "VARCHAR(32)",
+            "resume_head_published_at": "INTEGER",
+            "resume_started_at": "INTEGER",
+        },
+        primary_key=["uid"],
+        required=set(),
+        label="repost_sync_checkpoint v12",
+    )
+
+
 def _table_has_columns(conn, table: str, names: set[str]) -> bool:
     existing = {str(row[1]) for row in conn.execute(text(f"PRAGMA table_info({table})"))}
     return names <= existing
@@ -629,6 +645,21 @@ def migrate_v10_to_v11(session: Session) -> None:
     )
 
 
+def migrate_v11_to_v12(session: Session) -> None:
+    """在现有转发同步 checkpoint 上增加可恢复的分页游标。"""
+    conn = session.connection()
+    columns = {
+        "resume_offset": "TEXT",
+        "resume_head_dynamic_id": "VARCHAR(32)",
+        "resume_head_published_at": "INTEGER",
+        "resume_started_at": "INTEGER",
+    }
+    for name, column_type in columns.items():
+        if not _table_has_columns(conn, "repost_sync_checkpoint", {name}):
+            conn.execute(text(f"ALTER TABLE repost_sync_checkpoint ADD COLUMN {name} {column_type}"))
+    _validate_repost_v12_columns(session)
+
+
 _MIGRATIONS: dict[int, Callable[[Session], None]] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
@@ -640,6 +671,7 @@ _MIGRATIONS: dict[int, Callable[[Session], None]] = {
     8: migrate_v8_to_v9,
     9: migrate_v9_to_v10,
     10: migrate_v10_to_v11,
+    11: migrate_v11_to_v12,
 }
 
 
@@ -702,6 +734,8 @@ def init_db() -> None:
                     _validate_repost_v9_columns(session)
                 if recorded is not None and int(recorded) >= 10:
                     _validate_repost_v10_columns(session)
+                if recorded is not None and int(recorded) >= 12:
+                    _validate_repost_v12_columns(session)
                 SQLModel.metadata.create_all(conn)
                 meta = session.get(SchemaMeta, 1)
                 current = int(meta.version) if meta is not None else 1
@@ -726,6 +760,7 @@ def init_db() -> None:
                 _validate_repost_v8_columns(session)
                 _validate_repost_v9_columns(session)
                 _validate_repost_v10_columns(session)
+                _validate_repost_v12_columns(session)
                 session.flush()
             conn.commit()
         except Exception:
