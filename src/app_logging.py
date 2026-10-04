@@ -151,6 +151,7 @@ class DailyFileHandler(logging.Handler):
         self._stream = None
         self._path: Path | None = None
         self._lock = threading.RLock()
+        self._last_cleanup_date: date | None = None
 
     def _path_for_record(self, record: logging.LogRecord) -> Path:
         local_date = datetime.fromtimestamp(record.created).astimezone().date().isoformat()
@@ -173,7 +174,10 @@ class DailyFileHandler(logging.Handler):
                 text = self.format(record)
                 self._stream.write(text + "\n")
                 self._stream.flush()
-                _cleanup_daily_logs(self.directory)
+                current_date = datetime.now().astimezone().date()
+                if current_date != self._last_cleanup_date:
+                    _cleanup_daily_logs(self.directory, today=current_date)
+                    self._last_cleanup_date = current_date
         except Exception:
             self.handleError(record)
 
