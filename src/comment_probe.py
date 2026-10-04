@@ -50,7 +50,7 @@ def run_comment_recovery_probe(
 
     manager = nullcontext(client) if client is not None else BilibiliClient(warmup=False)
     with manager as active_client:
-        csrf, _ = require_login()
+        csrf, uid = require_login()
         rid, comment_type, referer = resolve_comment_rid_and_type(active_client, dynamic_id)
         resolution = resolve_participate_text_for_activity(active_client, dynamic_id=dynamic_id)
         claim = claim_comment_probe(dynamic_id, now=now)
@@ -66,6 +66,7 @@ def run_comment_recovery_probe(
                 csrf=csrf,
                 referer=referer,
                 dynamic_id=dynamic_id,
+                uid=uid,
             )
         except Exception as exc:
             if _unknown_exception(exc):
@@ -79,7 +80,7 @@ def run_comment_recovery_probe(
         if result.detail == "恢复探测已取消":
             return {"claimed": True, "result": "cancelled", "dynamic_id": dynamic_id}
         if result.ok:
-            confirm_comment(dynamic_id)
+            confirm_comment(dynamic_id, uid=uid)
             record_comment_probe_result("success", now=now)
             clear_comment_breaker()
             logger.info("评论探测：已恢复，等待下一轮参与")

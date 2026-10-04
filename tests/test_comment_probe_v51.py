@@ -26,6 +26,8 @@ def _due(monkeypatch, *, stamp: int = 10_000) -> None:
 
 def _patch_readiness(monkeypatch) -> None:
     monkeypatch.setattr(probe, "require_login", lambda: ("csrf", 42))
+    monkeypatch.setattr("src.lottery_actions.require_login", lambda: ("csrf", 42))
+    monkeypatch.setattr("src.comment_confirmation.get_login_uid", lambda: 42)
     monkeypatch.setattr(
         probe,
         "resolve_comment_rid_and_type",
@@ -636,6 +638,7 @@ def test_scheduler_slot_uses_probe_without_starting_triple_job(isolated_home, mo
 
 
 def test_probe_comment_rechecks_breaker_and_keeps_retries_zero(isolated_home, monkeypatch) -> None:
+    _patch_readiness(monkeypatch)
     _due(monkeypatch)
     client = Mock()
     client.post_form.return_value = {"code": 0}

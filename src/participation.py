@@ -13,6 +13,7 @@ from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient
 from src.bilibili_request_budget import RequestBudgetExhausted
 from src.comment_breaker import CommentLimitActive, is_comment_breaker_active
+from src.comment_confirmation import get_comment_status
 from src.lottery_actions import (
     ACTION_INTERVAL_SEC,
     DEFAULT_PARTICIPATE_TEXT,
@@ -504,6 +505,7 @@ def participate_five_action_lottery(
             action_text=text,
             referer=context.referer,
             dynamic_id=dynamic_id,
+            uid=uid,
         )
         reader.raise_if_failed()
     except Exception as exc:
@@ -582,7 +584,13 @@ def participate_five_action_lottery(
         message = str(exc).strip() or "参与失败"
         if "无法获取动态详情" in message:
             message = "无法获取动态详情，请稍后重试"
-        unknown = mutation_action[0] is not None and _mutation_result_unknown(exc)
+        unknown = mutation_action[0] is not None and (
+            _mutation_result_unknown(exc)
+            or (
+                mutation_action[0] == "comment"
+                and get_comment_status(dynamic_id, uid=uid) in {"pending", "unknown"}
+            )
+        )
         if unknown:
             action_label = {
                 "like": "点赞",
@@ -1156,6 +1164,13 @@ def participate_activity(
                         dynamic_id, lottery_type, f"repost_{guard.repost_status}",
                         f"{labels[guard.repost_status]}，禁止自动重发，需人工确认",
                     )
+                if lottery_type in {"互动抽奖", "转发抽奖"}:
+                    comment_status = get_comment_status(dynamic_id, uid=uid)
+                    if comment_status in {"pending", "unknown"}:
+                        return _dedup_skip(
+                            dynamic_id, lottery_type, f"comment_{comment_status}",
+                            "评论结果未知，已阻止自动重试",
+                        )
                 checked_step(0, RESERVE_PARTICIPATE_STEPS if lottery_type == "预约抽奖" else 5,
                              "本地防重检查通过，正在检查当前目标…", "check")
                 if (

@@ -132,7 +132,7 @@ def no_client(*args, **kwargs):
     httpx.HTTPStatusError("comment unavailable", request=httpx.Request("POST", actions.COMMENT_URL),
                           response=httpx.Response(503)),
 ])
-def test_confirmed_then_comment_failure_restart_and_retry_does_not_repost(account, monkeypatch, comment_error):
+def test_confirmed_repost_then_unknown_comment_stays_blocked_after_restart(account, monkeypatch, comment_error):
     client = TargetClient(comment_error=comment_error)
     first = participate(client)
     assert first.status == "failed"
@@ -145,11 +145,14 @@ def test_confirmed_then_comment_failure_restart_and_retry_does_not_repost(accoun
     reset_engine_for_tests()
     second_client = TargetClient(liked=True, favorited=True)
     second = participate(second_client)
-    assert second.status == "joined"
-    assert second_client.posts == [actions.COMMENT_URL]
-    assert get_participation(DID, uid=UID).user_status == "已参加"
+    assert second.status == "skipped"
+    assert second.to_dict()["skip_reason"] == "comment_unknown"
+    assert second_client.posts == []
+    assert second_client.reads == []
+    assert get_guard(UID, DID).repost_status == "confirmed"
+    assert get_participation(DID, uid=UID) is None
     monkeypatch.setattr(flow, "BilibiliClient", no_client)
-    assert participate().to_dict()["skip_reason"] == "already_joined"
+    assert participate().to_dict()["skip_reason"] == "comment_unknown"
 
 
 @pytest.mark.parametrize("lottery_type", ["互动抽奖", "预约抽奖", "转发抽奖"])
@@ -312,7 +315,11 @@ def test_unexpected_comment_error_preserves_partial_log_and_reraises(account):
         participate(client)
     assert get_guard(UID, DID).repost_status == "confirmed"
     assert load_action_entries_for_uid(UID)[-1]["actions"][-1]["action"] == "repost"
-    assert participate(TargetClient(liked=True, favorited=True)).status == "joined"
+    next_client = TargetClient(liked=True, favorited=True)
+    assert participate(next_client).to_dict()["skip_reason"] == "comment_unknown"
+    assert next_client.posts == []
+    assert next_client.reads == []
+    assert get_guard(UID, DID).repost_status == "confirmed"
 
 
 @pytest.mark.parametrize("button_status", [1, 2])

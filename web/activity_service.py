@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import time
+import logging
 from typing import Any
 
+from src import comment_confirmation
 from src.activity_status import resolve_activity_status
 from src.activity_store import load_payload
 from src.activity_failures import list_activity_failures
@@ -22,7 +24,7 @@ from src.participation_log import (
 )
 from src.participation_store import ParticipationRecord, load_participations
 from src.comment_breaker import comment_breaker_snapshot, is_comment_breaker_active
-from src.comment_confirmation import is_comment_confirmed
+from src.comment_confirmation import is_comment_confirmed, load_comment_statuses
 from src.invalid_activities import invalid_activity_ids
 from src.manual_ignored_activities import manual_ignore_ids
 from src.participation_guard import load_blocked_guard_ids
@@ -419,6 +421,8 @@ def _pick_triple_from_rows(
     targets: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     comment_breaker_active = is_comment_breaker_active()
+    comment_statuses: dict[str, str] | None = None
+    comment_guard_unavailable = False
     for row in rows:
         if str(row.get("activity_status") or "") != "未参加":
             continue
@@ -449,6 +453,19 @@ def _pick_triple_from_rows(
         row_lottery_type = str(row.get("lottery_type") or "")
         if row_lottery_type not in PARTICIPATABLE_TYPES:
             continue
+        if row_lottery_type in {"互动抽奖", "转发抽奖"}:
+            if comment_statuses is None and not comment_guard_unavailable:
+                try:
+                    comment_statuses = load_comment_statuses(uid=participation_uid())
+                except (comment_confirmation.CommentGuardStateError, OSError) as exc:
+                    comment_guard_unavailable = True
+                    logging.getLogger(__name__).warning("评论防重记录不可用，已暂停评论型候选：%s", exc)
+            if comment_guard_unavailable or (comment_statuses or {}).get(
+                normalize_activity_id(dynamic_id) or dynamic_id
+            ) in {"pending", "unknown"}:
+                # The five-action flow is coupled. Do not requeue uncertain
+                # comments; reserve and confirmed-comment work stay eligible.
+                continue
         if comment_breaker_active and row_lottery_type in {"互动抽奖", "转发抽奖"}:
             continue
         seen_ids.add(dynamic_id)
@@ -506,6 +523,7 @@ def pick_triple_participate_targets(
 def pick_comment_probe_candidate() -> dict[str, Any] | None:
     """Pick one existing, still-participatable comment activity for recovery."""
     rows = _filtered_activity_rows()
+    comment_statuses = load_comment_statuses(uid=participation_uid())
     excluded_ids = {
         str(value or "").strip()
         for value in (comment_breaker_snapshot().get("probe_excluded_dynamic_ids") or [])
@@ -522,6 +540,7 @@ def pick_comment_probe_candidate() -> dict[str, Any] | None:
             not is_valid_dynamic_id(dynamic_id)
             or canonical_id in excluded_ids
             or is_comment_confirmed(dynamic_id)
+            or comment_statuses.get(canonical_id) in {"pending", "unknown", "confirmed"}
         ):
             continue
         last = row.get("last_participation")

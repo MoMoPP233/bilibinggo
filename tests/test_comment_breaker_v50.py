@@ -16,6 +16,11 @@ from src.comment_breaker import (
 from src.participation_errors import ParticipationReadError
 
 
+@pytest.fixture(autouse=True)
+def _local_login(monkeypatch):
+    monkeypatch.setattr(actions, "require_login", lambda: ("csrf", 42))
+
+
 def _comment_kwargs() -> dict:
     return {
         "rid": "123",
@@ -23,6 +28,7 @@ def _comment_kwargs() -> dict:
         "message": "test",
         "csrf": "csrf",
         "referer": "https://www.bilibili.com/opus/123",
+        "uid": 42,
     }
 
 
@@ -98,4 +104,3 @@ def test_participation_read_error_keeps_structured_diagnostics() -> None:
     assert error.message.find("动态不存在") >= 0
     assert error.endpoint.endswith("/x/polymer/web-dynamic/v1/detail")
     assert error.dynamic_id == "123456789"
-

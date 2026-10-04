@@ -19,9 +19,10 @@ from src.comment_breaker import (
     is_comment_breaker_active,
 )
 from src.comment_confirmation import (
-    _is_comment_confirmed_unlocked,
+    _get_comment_status_unlocked,
+    _set_comment_status_unlocked,
     confirm_comment,
-    is_comment_confirmed,
+    get_comment_status,
 )
 from src.invalid_activities import is_self_follow_failure
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
@@ -563,10 +564,14 @@ def has_comment(
     action_text: str,
     referer: str,
     dynamic_id: str | None = None,
+    uid: str | int | None = None,
 ) -> bool:
-    if dynamic_id and is_comment_confirmed(dynamic_id):
-        return True
-    uid = get_login_uid()
+    uid = uid if uid is not None else get_login_uid()
+    status = get_comment_status(dynamic_id, uid=uid) if dynamic_id else None
+    if status in {"confirmed", "pending", "unknown"}:
+        # Uncertain is NOT success. The mutation boundary will block it, and
+        # absence from one remote page must never reopen the local barrier.
+        return status == "confirmed"
     if not uid:
         return False
     try:
@@ -747,30 +752,60 @@ def comment_dynamic(
     csrf: str,
     referer: str,
     dynamic_id: str | None = None,
+    uid: str | int | None = None,
 ) -> ActionResult:
+    # The dynamic is the existing business identity. A raw reply target may
+    # instead be a video/article ID: never reinterpret its rid as a dynamic.
+    target = dynamic_id or f"reply:{comment_type}:{rid}"
     with comment_mutation_gate():
-        if dynamic_id and _is_comment_confirmed_unlocked(dynamic_id):
+        _, current_uid = require_login()
+        if uid is not None and str(uid) != str(current_uid):
+            raise RuntimeError("评论期间登录账号发生变化，已停止操作")
+        uid = current_uid
+        status = _get_comment_status_unlocked(target, uid=uid)
+        if status == "confirmed":
             return ActionResult("comment", True, "已评论，跳过")
+        if status in {"pending", "unknown"}:
+            return ActionResult("comment", False, "评论结果未知，已阻止自动重试")
         if is_comment_breaker_active():
             raise CommentLimitActive()
-        payload = client.post_form(
-            COMMENT_URL,
-            {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
-            referer=referer,
-            raise_on_code=False,
-            retries=0,
-        )
-        code = _api_code(payload)
+        _set_comment_status_unlocked(target, uid=uid, status="pending")
+        try:
+            payload = client.post_form(
+                COMMENT_URL,
+                {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
+                referer=referer,
+                raise_on_code=False,
+                retries=0,
+            )
+        except Exception:
+            # The call may already have sent. If this second local write also
+            # fails, the durable pending remains the non-expiring barrier.
+            try:
+                _set_comment_status_unlocked(target, uid=uid, status="unknown")
+            except Exception:
+                logger.exception("评论结果未知且本地状态更新失败，保留 pending 禁止重发")
+            raise
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if type(code) is not int:
+            _set_comment_status_unlocked(target, uid=uid, status="unknown")
+            return ActionResult("comment", False, "评论结果未知：响应缺少有效 code，已阻止自动重试")
+        if code in {0, 12051}:
+            # Persist immediately, before action callbacks / participation logs.
+            # A failure here leaves pending, even when the server succeeded.
+            _set_comment_status_unlocked(target, uid=uid, status="confirmed")
+            return ActionResult("comment", True, message[:80] if code == 0 else "已有相同评论")
+        # Only known explicit rejections release this attempt. An unfamiliar
+        # server/internal error cannot prove the mutation never happened.
+        rejected = code in {12014, 12078, -101, 401, -352, -509}
+        _set_comment_status_unlocked(target, uid=uid, status="failed" if rejected else "unknown")
         if code == COMMENT_LIMIT_CODE:
             detail = _api_message(payload)
             _trigger_comment_limit_unlocked(code=code, message=detail)
-    code = _api_code(payload)
-    if code == 0:
-        return ActionResult("comment", True, message[:80])
-    if code == 12051:
-        return ActionResult("comment", True, "已有相同评论")
     _raise_payload_auth(payload, "评论")
     _raise_payload_risk(payload, "评论")
+    if not rejected:
+        return ActionResult("comment", False, f"评论结果未知：code={code}，已阻止自动重试")
     return ActionResult("comment", False, f"code={code} {_api_message(payload)}".strip())
 
 
@@ -783,11 +818,20 @@ def comment_dynamic_probe(
     csrf: str,
     referer: str,
     dynamic_id: str | None = None,
+    uid: str | int | None = None,
 ) -> ActionResult:
     """Send one recovery-only comment while the breaker remains claimed active."""
     with comment_mutation_gate():
-        if dynamic_id and _is_comment_confirmed_unlocked(dynamic_id):
+        _, current_uid = require_login()
+        if uid is not None and str(uid) != str(current_uid):
+            raise RuntimeError("评论期间登录账号发生变化，已停止操作")
+        status = _get_comment_status_unlocked(
+            dynamic_id or f"reply:{comment_type}:{rid}", uid=current_uid,
+        )
+        if status == "confirmed":
             return ActionResult("comment", True, "已评论，跳过")
+        if status in {"pending", "unknown"}:
+            return ActionResult("comment", False, "评论结果未知，已阻止自动重试")
         if not is_comment_breaker_active():
             return ActionResult("comment", False, "恢复探测已取消")
         payload = client.post_form(
@@ -872,7 +916,7 @@ def execute_full_participation(
     def append_action(action: ActionResult) -> None:
         actions.append(action)
         if action.action == "comment" and action.ok:
-            confirm_comment(dynamic_id)
+            confirm_comment(dynamic_id, uid=my_uid)
         if on_action is not None:
             on_action(action)
 
@@ -959,6 +1003,7 @@ def execute_full_participation(
                 csrf=csrf,
                 referer=context.referer,
                 dynamic_id=dynamic_id,
+                uid=my_uid,
             )
         )
 
