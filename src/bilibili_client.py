@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from src.platform_risk import risk_code_of
 from src.bilibili_rate_limit import acquire_bilibili_request_slot
 from src.bilibili_request_budget import (
     RequestBudgetExhausted,
@@ -420,6 +421,8 @@ class BilibiliClient:
                 return resp.text
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
                 last_error = exc
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                    raise
                 if attempt < retries:
                     sleep_with_bili_retry_metrics(
                         1.5 * (attempt + 1), sleeper=time.sleep
@@ -454,11 +457,15 @@ class BilibiliClient:
             if vlist:
                 return vlist[0]
         except (RuntimeError, httpx.HTTPStatusError) as exc:
+            if risk_code_of(exc) is not None:
+                raise
             errors.append(str(exc))
 
         try:
             return self._get_latest_video_fallback(mid, referer=referer)
         except (RuntimeError, httpx.HTTPStatusError) as exc:
+            if risk_code_of(exc) is not None:
+                raise
             errors.append(str(exc))
             raise RuntimeError(
                 "获取最新视频失败（B 站风控 -352/-412）。\n"
@@ -468,7 +475,7 @@ class BilibiliClient:
             ) from exc
 
     def _get_latest_video_fallback(self, mid: int, *, referer: str) -> dict:
-        """WBI 风控时，尝试旧接口（有 Cookie 时通常可用）。"""
+        """主接口普通失败或无投稿时，尝试旧接口。"""
         data = self.get_json(
             "https://api.bilibili.com/x/space/arc/search",
             params={"mid": mid, "pn": 1, "ps": 1, "order": "pubdate"},
@@ -490,7 +497,9 @@ class BilibiliClient:
             detail = data.get("data")
             if detail:
                 return detail
-        except RuntimeError:
+        except RuntimeError as exc:
+            if risk_code_of(exc) is not None:
+                raise
             pass
         return self._get_video_detail_from_page(bvid, referer=referer)
 

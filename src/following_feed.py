@@ -32,6 +32,7 @@ from src.bilibili_client import BilibiliClient
 from src.bilibili_auth import get_login_uid
 from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
 from src.observability import current_metrics
+from src.platform_risk import risk_code_of
 from src.pipeline.refresh_all_pipeline import run_new_links_pipeline
 from src.sources.common import opus_link
 from src.watch_feed import extract_feed_pub_ts
@@ -1082,6 +1083,8 @@ def scan_following_feed(
                     on_progress=on_progress,
                 )
             except RuntimeError as exc:
+                if risk_code_of(exc) is not None:
+                    raise
                 state["history_stop_reason"] = "history_missing_login_uid"
                 state["last_scan_status"] = "incomplete"
                 state["last_error"] = str(exc)

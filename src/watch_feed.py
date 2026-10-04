@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 
 from src.bilibili_client import BilibiliClient, api_code
+from src.platform_risk import risk_code_of
 from src.sources.common import is_valid_dynamic_id, normalize_activity_id, opus_link
 
 SPACE_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
@@ -171,6 +172,8 @@ def _fetch_space_feed_page(
         try:
             return fetch_space_feed_page(client, mid=mid, offset=offset, retries=1)
         except Exception as exc:
+            if risk_code_of(exc) is not None:
+                raise
             last_error = exc
             if attempt < PAGE_RETRY_ATTEMPTS - 1:
                 time.sleep(PAGE_RETRY_BASE_DELAY * (attempt + 1))

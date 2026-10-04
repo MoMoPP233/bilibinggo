@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from src import following_feed as ff
+from src.message_api import _require_ok
+from src.platform_risk import risk_code_of
 
 
 CN_TZ = timezone(timedelta(hours=8))
@@ -373,6 +375,86 @@ def test_history_risk_propagates_after_live_progress_is_committed(
     assert new_id in idempotent_pipeline[0]
     assert state["last_seen_dynamic_id"] == new_id
     assert state["history_offset"] == "offset-20"
+
+
+@pytest.mark.parametrize("code", [-352, -509])
+def test_history_classification_payload_risk_is_not_login_uid_error(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    checkpoint = IDS[0]
+    ff._write_state(
+        {
+            "state_version": 2,
+            "baseline_at": NOW,
+            "history_cutoff_at": NOW - 15 * 24 * 60 * 60,
+            "history_status": "pending",
+            "history_mode": "initial_15d",
+            "history_offset": "offset-20",
+            "history_next_page": 21,
+            "last_seen_dynamic_id": checkpoint,
+            "anchors": [checkpoint],
+        }
+    )
+    pipeline_calls: list[list[str]] = []
+
+    def classify_batch(urls, **kwargs):
+        if not urls:
+            return SimpleNamespace(new_link_count=0, persisted_count=0, skip_reasons={}, partial=False)
+        pipeline_calls.append(list(urls))
+        _require_ok({"code": code, "message": "分类读取被拒绝"}, action="分类")
+
+    monkeypatch.setattr(ff, "run_new_links_pipeline", classify_batch)
+    client = QueueClient(
+        [
+            page([checkpoint], 1, published_at=NOW),
+            page([IDS[1]], 21, published_at=NOW - 3600, has_more=False),
+        ]
+    )
+    with pytest.raises(RuntimeError) as caught:
+        ff.scan_following_feed(client_factory=lambda: client)
+
+    assert risk_code_of(caught.value) == code
+    assert len(client.calls) == 2
+    assert pipeline_calls == [[ff.opus_link(IDS[1])]]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["history_stop_reason"] != "history_missing_login_uid"
+
+
+def test_history_plain_runtime_error_keeps_existing_incomplete_semantics(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = IDS[0]
+    ff._write_state(
+        {
+            "state_version": 2,
+            "baseline_at": NOW,
+            "history_cutoff_at": NOW - 15 * 24 * 60 * 60,
+            "history_status": "pending",
+            "history_mode": "initial_15d",
+            "history_offset": "offset-20",
+            "history_next_page": 21,
+            "last_seen_dynamic_id": checkpoint,
+            "anchors": [checkpoint],
+        }
+    )
+
+    def plain_failure(urls, **kwargs):
+        if not urls:
+            return SimpleNamespace(new_link_count=0, persisted_count=0, skip_reasons={}, partial=False)
+        raise RuntimeError("普通分类失败")
+
+    monkeypatch.setattr(ff, "run_new_links_pipeline", plain_failure)
+    client = QueueClient(
+        [
+            page([checkpoint], 1, published_at=NOW),
+            page([IDS[1]], 21, published_at=NOW - 3600, has_more=False),
+        ]
+    )
+    result = ff.scan_following_feed(client_factory=lambda: client)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert result["status"] == "incomplete"
+    assert state["history_stop_reason"] == "history_missing_login_uid"
+    assert risk_code_of(state["last_error"]) is None
 
 
 def test_scheduler_surfaces_history_progress_message(

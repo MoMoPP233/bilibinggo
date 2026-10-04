@@ -53,6 +53,8 @@ def _require_ok(payload: dict[str, Any], *, action: str) -> dict[str, Any]:
         raise RuntimeError("Cookie 已过期，请重新扫码登录")
     if code != 0:
         message = str(payload.get("message") or payload.get("msg") or "未知错误")
+        if code in {-352, -509}:
+            raise RuntimeError(f"API error {code}: {action}失败: {message}")
         raise RuntimeError(f"{action}失败: {message}")
     data = payload.get("data")
     if not isinstance(data, dict):
