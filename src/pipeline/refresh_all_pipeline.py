@@ -178,9 +178,8 @@ def is_expired_before_scan(activity: Mapping[str, Any], scan_started_at: int | N
     return reliable_end_time < started_at
 
 
-def _dedupe_new_dynamic_ids(raw_urls: list[str]) -> _DedupeResult:
+def _dedupe_new_dynamic_ids(raw_urls: list[str], known: set[str]) -> _DedupeResult:
     """一次本地遍历完成标准化/批内去重/数据库已有过滤，并保留严格计数。"""
-    known = known_activity_ids()
     seen: set[str] = set()
     ordered: list[str] = []
     invalid_link_count = 0
@@ -404,10 +403,12 @@ def run_new_links_pipeline(
         raw_id = normalize_activity_id(str(raw_url))
         if raw_id:
             canonical_by_raw.setdefault(raw_id, raw_id)
-    dedupe = _dedupe_new_dynamic_ids(raw_urls)
+    # 分类前去重与来源审计使用同一阶段的 Profile-local DB 快照。
+    # 分类后和最终写入前的重新检查必须保持独立，防止中途并发插入。
+    known_ids = known_activity_ids()
+    dedupe = _dedupe_new_dynamic_ids(raw_urls, known_ids)
     failure_source_urls = _failure_url_by_dynamic_id(raw_urls)
     dynamic_ids = dedupe.dynamic_ids
-    known_ids = known_activity_ids()
     for raw_url in raw_urls:
         raw_id = normalize_activity_id(str(raw_url))
         if not raw_id:
