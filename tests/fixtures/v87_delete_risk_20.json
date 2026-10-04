@@ -1,0 +1,11 @@
+{
+  "requested_count": 20,
+  "processed_count": 1,
+  "unprocessed_count": 19,
+  "deleted_count": 0,
+  "failed_count": 1,
+  "unknown_count": 0,
+  "skipped_count": 0,
+  "stopped_early": true,
+  "stop_reason": "formal_risk"
+}

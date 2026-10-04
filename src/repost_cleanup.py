@@ -2526,12 +2526,32 @@ def delete_reposts(
     if len(requested) > MAX_DELETE_BATCH:
         raise ValueError(f"单次最多删除 {MAX_DELETE_BATCH} 条转发动态")
 
-    _check_cancel(cancel_check)
+    def _result(uid: str, items: list[dict[str, str]], *, reason: str = "", message: str = "") -> dict[str, Any]:
+        processed = len(items)
+        return {
+            "uid": uid,
+            "requested_count": len(requested),
+            "processed_count": processed,
+            "unprocessed_count": len(requested) - processed,
+            "deleted_count": sum(item["status"] == "deleted" for item in items),
+            "failed_count": sum(item["status"] == "delete_failed" for item in items),
+            "unknown_count": sum(item["status"] == "unknown" for item in items),
+            "skipped_count": sum(item["status"] == "skipped" for item in items),
+            "items": items,
+            "rate_limited": reason in {"formal_risk", "platform_limit"},
+            "stopped_early": bool(reason),
+            "stop_reason": reason,
+            "message": message or "删除任务处理完成",
+        }
+
+    if cancel_check is not None and cancel_check():
+        return _result("", [], reason="cancelled", message="用户取消，剩余条目未处理")
     profile_id = get_runtime_profile_id()
     database_path = str(db_path().resolve())
     items: list[dict[str, str]] = []
     stopped = False
     stop_reason = ""
+    stop_kind = ""
     with client_factory() as client:
         _, uid_int = _require_verified_login(client)
         uid = str(uid_int)
@@ -2569,7 +2589,10 @@ def delete_reposts(
                 )
 
         for index, repost_id in enumerate(requested, 1):
-            _check_cancel(cancel_check)
+            if cancel_check is not None and cancel_check():
+                stop_kind = "cancelled"
+                stop_reason = "用户取消，剩余条目未处理"
+                break
             original_id = ""
             status = "skipped"
             message = "安全检查未通过"
@@ -2649,6 +2672,7 @@ def delete_reposts(
                     risk = _risk_code_from_message(exc)
                     if risk is not None:
                         stopped = True
+                        stop_kind = "formal_risk" if risk in (-352, -509, 429) else "platform_limit"
                         stop_reason = (
                             f"批量删除因平台限流/风控停止（{risk}），剩余条目保持原状态。"
                         )
@@ -2695,6 +2719,7 @@ def delete_reposts(
                         status, message = ("delete_failed" if saved else "unknown"), error
                         if code in (-352, -509, -799):
                             stopped = True
+                            stop_kind = "formal_risk" if code in (-352, -509) else "platform_limit"
                             stop_reason = (
                                 f"批量删除因平台限流/风控停止（{code}），剩余条目保持原状态。"
                             )
@@ -2705,6 +2730,7 @@ def delete_reposts(
                 risk = _risk_code_from_message(exc)
                 status, message = "skipped", str(exc)
                 stopped = True
+                stop_kind = "formal_risk" if risk in (-352, -509, 429) else "platform_limit"
                 stop_reason = (
                     f"批量删除因平台限流/风控停止（{risk if risk is not None else 'risk'}），"
                     f"剩余条目保持原状态。{exc}"
@@ -2732,18 +2758,7 @@ def delete_reposts(
             if stopped:
                 break
 
-    return {
-        "uid": uid,
-        "requested_count": len(requested),
-        "deleted_count": sum(item["status"] == "deleted" for item in items),
-        "failed_count": sum(item["status"] == "delete_failed" for item in items),
-        "unknown_count": sum(item["status"] == "unknown" for item in items),
-        "skipped_count": sum(item["status"] == "skipped" for item in items),
-        "items": items,
-        "rate_limited": stopped,
-        "stopped_early": stopped,
-        "message": stop_reason or "删除任务处理完成",
-    }
+    return _result(uid, items, reason=stop_kind, message=stop_reason)
 
 
 

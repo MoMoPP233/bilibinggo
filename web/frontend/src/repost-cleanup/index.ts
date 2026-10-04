@@ -183,10 +183,14 @@ interface DeleteResultItem {
 interface DeleteJobResult {
   uid?: string | number;
   requested_count?: number;
+  processed_count?: number;
+  unprocessed_count?: number;
   deleted_count?: number;
   failed_count?: number;
   unknown_count?: number;
   skipped_count?: number;
+  stopped_early?: boolean;
+  stop_reason?: string;
   items?: DeleteResultItem[];
 }
 
@@ -197,6 +201,7 @@ const DIGITS_ONLY = /^\d+$/;
 let candidates: CleanupCandidate[] = [];
 let selectedRepostIds = new Set<string>();
 let pendingDeleteIds = new Set<string>();
+let pendingDeleteOriginal = new Map<string, { status?: string | null; message?: string | null }>();
 let candidatePage = 1;
 let historyPage = 1;
 let historyPages = 1;
@@ -813,6 +818,27 @@ function deleteJobResult(job: JobStatus): DeleteJobResult {
   return result as DeleteJobResult;
 }
 
+function deleteJobCounts(result: DeleteJobResult) {
+  const processed = Number(result.processed_count ?? result.items?.length ?? 0) || 0;
+  const requested = Number(result.requested_count ?? processed) || 0;
+  return {
+    requested,
+    processed,
+    unprocessed: Number(result.unprocessed_count ?? Math.max(0, requested - processed)) || 0,
+    deleted: Number(result.deleted_count) || 0,
+    failed: Number(result.failed_count) || 0,
+    unknown: Number(result.unknown_count) || 0,
+    skipped: Number(result.skipped_count) || 0,
+  };
+}
+
+function deleteStopTitle(job: JobStatus, result: DeleteJobResult): string {
+  if (job.state === "cancelled" || result.stop_reason === "cancelled") return "删除任务已取消";
+  if (result.stop_reason === "formal_risk") return "B站正式风险，删除任务提前停止";
+  if (result.stopped_early) return "删除任务提前停止";
+  return job.state === "success" ? "" : "删除任务未完成";
+}
+
 function applyDeleteCompletion(job: JobStatus): void {
   const result = deleteJobResult(job);
   const outcomes = new Map<string, DeleteResultItem>();
@@ -825,27 +851,39 @@ function applyDeleteCompletion(job: JobStatus): void {
     const wasPending = pendingDeleteIds.has(candidate.repost_dynamic_id);
     const outcome = outcomes.get(candidate.repost_dynamic_id);
     if (!wasPending && !outcome) return [candidate];
-    const rawStatus = String(outcome?.status || (job.state === "success" ? "unknown" : "unknown"));
+    if (!outcome) {
+      // A tail item never entered DELETE. Restore the pre-submit local view;
+      // the existing terminal refresh will then load the authoritative row.
+      const previous = pendingDeleteOriginal.get(candidate.repost_dynamic_id);
+      return previous
+        ? [{ ...candidate, delete_status: previous.status, delete_message: previous.message }]
+        : [candidate];
+    }
+    const rawStatus = String(outcome.status || "");
     if (rawStatus === "deleted") return [];
     if (rawStatus === "delete_failed" || rawStatus === "failed") {
       return [{ ...candidate, delete_status: "delete_failed", delete_message: outcome?.message || "删除失败" }];
     }
     if (rawStatus === "skipped") return [];
-    return [{ ...candidate, delete_status: "unknown", delete_message: outcome?.message || "删除结果无法确认，请先重新同步核实" }];
+    if (rawStatus === "unknown") {
+      return [{ ...candidate, delete_status: "unknown", delete_message: outcome.message || "删除结果无法确认，请先重新同步核实" }];
+    }
+    return [candidate];
   });
   selectedRepostIds.clear();
   pendingDeleteIds.clear();
+  pendingDeleteOriginal.clear();
   deleteSubmitting = false;
   renderCandidates();
 
-  const deleted = Number(result.deleted_count) || 0;
-  const failed = Number(result.failed_count) || 0;
-  const unknown = Number(result.unknown_count) || 0;
-  const skipped = Number(result.skipped_count) || 0;
-  const detail = `已删除 ${deleted} · 失败 ${failed} · 结果未知 ${unknown} · 跳过 ${skipped}`;
-  if (unknown > 0) {
+  const counts = deleteJobCounts(result);
+  const detail = `已处理 ${counts.processed} / ${counts.requested} · 剩余未处理 ${counts.unprocessed} · 已删除 ${counts.deleted} · 失败 ${counts.failed} · 结果未知 ${counts.unknown} · 跳过 ${counts.skipped}`;
+  const stopTitle = deleteStopTitle(job, result);
+  if (stopTitle) {
+    showToast(stopTitle, "info", detail);
+  } else if (counts.unknown > 0) {
     showToast("部分删除结果无法确认", "info", `${detail}；不会自动重试，请重新同步后核实。`);
-  } else if (failed > 0 || skipped > 0) {
+  } else if (counts.failed > 0 || counts.skipped > 0) {
     showToast("删除任务已完成（含未删除项）", "info", detail);
   } else {
     showToast("删除任务已完成", "success", detail);
@@ -910,6 +948,10 @@ export async function deleteSelectedReposts(): Promise<void> {
 
   deleteSubmitting = true;
   pendingDeleteIds = new Set(ids);
+  pendingDeleteOriginal = new Map(ids.map((id) => [id, {
+    status: known.get(id)?.delete_status,
+    message: known.get(id)?.delete_message,
+  }]));
   if (repostDeleteProgress) {
     repostDeleteProgress.textContent = `正在删除 0 / ${ids.length} …（串行执行）`;
   }
@@ -1009,14 +1051,9 @@ export async function handleRepostCleanupJobCompletion(job: JobStatus): Promise<
       applyDeleteCompletion(job);
       if (repostDeleteProgress) {
         const result = deleteJobResult(job);
-        const deleted = Number(result.deleted_count) || 0;
-        const failed = Number(result.failed_count) || 0;
-        const unknown = Number(result.unknown_count) || 0;
-        const skipped = Number(result.skipped_count) || 0;
-        const riskStopped = Boolean((job.result as Record<string, unknown> | undefined)?.rate_limited);
-        repostDeleteProgress.textContent = riskStopped
-          ? `平台限制，本批次已提前停止。已删除 ${deleted} · 失败 ${failed} · 结果未知 ${unknown} · 剩余未执行 ${skipped}。已经完成的结果已保存，剩余项目未执行。`
-          : `本次删除：已删除 ${deleted} · 明确失败 ${failed} · 结果未知 ${unknown} · 未执行 ${skipped}`;
+        const counts = deleteJobCounts(result);
+        const stopTitle = deleteStopTitle(job, result);
+        repostDeleteProgress.textContent = `${stopTitle || "本次删除处理完成"}：已处理 ${counts.processed} / ${counts.requested} · 剩余未处理 ${counts.unprocessed} · 已删除 ${counts.deleted} · 明确失败 ${counts.failed} · 结果未知 ${counts.unknown} · 已检查跳过 ${counts.skipped}`;
       }
       await loadRepostHistory(historyPage).catch(() => {});
       await loadPersistedCandidates().catch(() => {});

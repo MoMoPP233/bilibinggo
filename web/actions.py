@@ -1899,17 +1899,33 @@ def _run_action_impl(
         progress(step=0, total=len(repost_ids), message=f"准备逐条验证并删除 {len(repost_ids)} 条转发动态…")
         result = delete_reposts(
             repost_ids,
-            on_progress=_cleanup_progress_adapter(progress, cancel_event),
+            # The service records the completed item before observing cancellation;
+            # the progress callback must not discard that durable partial result.
+            on_progress=_cleanup_progress_adapter(progress, None),
             cancel_check=(lambda: bool(cancel_event and cancel_event.is_set())),
             manual_review_confirmed=bool(params.get("manual_review_confirmed")),
         )
-        _raise_if_cancelled(cancel_event)
         deleted = int(result.get("deleted_count") or result.get("deleted") or 0)
         failed = int(result.get("failed_count") or result.get("delete_failed") or 0)
         unknown = int(result.get("unknown_count") or result.get("unknown") or 0)
-        message = f"删除处理完成：成功 {deleted} 条，失败 {failed} 条，结果未知 {unknown} 条"
-        progress(step=len(repost_ids), total=len(repost_ids), message=message, log_append=message)
-        return {"ok": True, "message": message, "result": result, "log": sanitize_log(message)}
+        processed = int(result.get("processed_count") or 0)
+        unprocessed = int(result.get("unprocessed_count") or 0)
+        stopped = bool(result.get("stopped_early"))
+        cancelled = result.get("stop_reason") == "cancelled"
+        if stopped:
+            message = (
+                f"删除任务{'已取消' if cancelled else '提前停止'}："
+                f"已处理 {processed}/{len(repost_ids)}，剩余未处理 {unprocessed} 条；"
+                f"成功 {deleted} 条，失败 {failed} 条，结果未知 {unknown} 条。"
+                f"{result.get('message') or ''}"
+            )
+        else:
+            message = f"删除处理完成：成功 {deleted} 条，失败 {failed} 条，结果未知 {unknown} 条"
+        progress(step=processed, total=len(repost_ids), message=message, log_append=message)
+        return {
+            "ok": not stopped, "cancelled": cancelled,
+            "message": message, "result": result, "log": sanitize_log(message),
+        }
 
     if action == "participate":
         dynamic_id = str(params.get("dynamic_id") or "").strip()

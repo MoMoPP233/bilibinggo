@@ -51,6 +51,8 @@ const candidate = {
   delete_status: "active",
 };
 
+const v87RiskContract = JSON.parse(readFileSync("../../tests/fixtures/v87_delete_risk_20.json", "utf-8"));
+
 function setupDom(): void {
   document.body.innerHTML = `
     <button id="repost-sync-assess-btn" data-action="sync_assess_repost_history">同步/评估转发历史</button>
@@ -652,6 +654,73 @@ describe("repost cleanup UI", () => {
     );
     expect(accountCalls).toHaveLength(0);
     expect(loadAccountMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the shared V87 first-item risk contract as 1 handled and 19 unprocessed", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    await module.handleRepostCleanupJobCompletion({
+      action: "delete_expired_reposts",
+      state: "error",
+      result: v87RiskContract,
+    });
+
+    const text = document.getElementById("repost-delete-progress")?.textContent || "";
+    expect(text).toContain("B站正式风险");
+    expect(text).toContain("已处理 1 / 20");
+    expect(text).toContain("剩余未处理 19");
+    expect(text).toContain("已检查跳过 0");
+    expect(text).not.toContain("20 / 20");
+    expect(showToastMock).toHaveBeenCalledWith(
+      "B站正式风险，删除任务提前停止", "info",
+      expect.stringContaining("剩余未处理 19"),
+    );
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/history?page=1&page_size=20");
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/candidates?show_deleted=1");
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/repost-cleanup/health");
+  });
+
+  it("keeps skipped separate from unprocessed and distinguishes cancelled from unknown", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    await module.handleRepostCleanupJobCompletion({
+      action: "delete_expired_reposts", state: "cancelled",
+      result: {
+        requested_count: 20, processed_count: 5, unprocessed_count: 15,
+        deleted_count: 3, skipped_count: 1, unknown_count: 1,
+        stopped_early: true, stop_reason: "cancelled",
+      },
+    });
+    const text = document.getElementById("repost-delete-progress")?.textContent || "";
+    expect(text).toContain("已处理 5 / 20");
+    expect(text).toContain("剩余未处理 15");
+    expect(text).toContain("结果未知 1");
+    expect(text).toContain("已检查跳过 1");
+    expect(showToastMock).toHaveBeenCalledWith("删除任务已取消", "info", expect.stringContaining("剩余未处理 15"));
+  });
+
+  it("restores untouched tail candidates without inventing unknown DELETE state", async () => {
+    const module = await loadModule();
+    module.bindRepostCleanup();
+    const choices = Array.from({ length: 20 }, (_, index) => ({
+      ...candidate, repost_dynamic_id: String(90001 + index), original_dynamic_id: String(80001 + index),
+    }));
+    module.setCandidates(choices);
+    document.getElementById("repost-select-page")!.click();
+    await module.deleteSelectedReposts();
+    fetchJSONMock.mockImplementation((url: string) =>
+      url.includes("/candidates?") ? Promise.reject(new Error("offline refresh failure")) : Promise.resolve({ ok: true }),
+    );
+    await module.handleRepostCleanupJobCompletion({
+      action: "delete_expired_reposts", state: "error",
+      result: {
+        ...v87RiskContract,
+        items: [{ repost_dynamic_id: "90001", status: "delete_failed", message: "平台风险" }],
+      },
+    });
+    expect(document.querySelector<HTMLInputElement>("[data-repost-select='90020']")).not.toBeNull();
+    expect(document.getElementById("repost-delete-progress")?.textContent).toContain("剩余未处理 19");
+    expect(document.getElementById("repost-candidates-body")?.textContent).not.toContain("结果无法确认");
   });
 
   it.each(["success", "error", "cancelled", "interrupted"] as const)(
