@@ -328,13 +328,49 @@ def _load_outbox() -> list[dict[str, Any]]:
 
 
 def _save_outbox(records: list[dict[str, Any]]) -> None:
-    _write_json(_outbox_path(), {"version": 1, "records": records[-200:]})
+    # V84: compact claim evidence is safety state, not a bounded delivery log.
+    # Persist it in the SAME atomic replacement as the batch claim. In particular,
+    # a crash before Winner clears preparation must remain safe after log pruning.
+    claims = _winner_claims()
+    for record in records:
+        if record.get("winner_preparation_claim") is True:
+            channels = claims.setdefault(record["event_id"], [])
+            if record["channel"] not in channels:
+                channels.append(record["channel"])
+    _write_json(_outbox_path(), {"version": 1, "records": records[-200:], "winner_claims": claims})
+
+
+def _winner_claims() -> dict[str, list[str]]:
+    try:
+        with _outbox_path().open(encoding="utf-8") as handle:
+            document = json.load(handle)
+        claims = document.get("winner_claims", {})
+        if not isinstance(claims, dict) or any(
+            not isinstance(value, list) or any(channel not in ALL_CHANNELS for channel in value)
+            for value in claims.values()
+        ):
+            raise ValueError("invalid Winner claim evidence")
+        return claims
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, AttributeError) as exc:
+        raise NotificationLocalError("无法读取通知 claim 凭证，停止投递") from exc
+
+
+def preparation_channels(event_type: str) -> list[str]:
+    """Snapshot enabled targets at discovery, using local configuration only."""
+    config = _load_config()
+    if not config["events"].get(event_type, True):
+        return []
+    return [channel for channel in ALL_CHANNELS if config["channels"][channel]["enabled"]]
 
 
 def _existing_status(event_id: str, channel: str) -> str | None:
     for record in _load_outbox():
         if record.get("event_id") == event_id and record.get("channel") == channel:
             return str(record.get("status") or "")
+    if channel in _winner_claims().get(event_id, []):
+        return "delivery_unknown"
     return None
 
 
@@ -347,7 +383,8 @@ def _mutate_outbox(mutator: Callable[[list[dict[str, Any]]], list[dict[str, Any]
 
 
 def _claim_records(
-    event_id: str, channels: list[str], *, event_type: str | None = None
+    event_id: str, channels: list[str], *, event_type: str | None = None,
+    winner_preparation: bool = False,
 ) -> None:
     """HTTP 之前为“本次全部待发渠道”做一次原子 batch claim。
 
@@ -374,6 +411,8 @@ def _claim_records(
             }
             if event_type is not None:
                 record["event_type"] = event_type
+            if winner_preparation:
+                record["winner_preparation_claim"] = True
             kept.append(record)
         return kept
 
@@ -381,6 +420,20 @@ def _claim_records(
         _mutate_outbox(mutate)
     except Exception as exc:  # noqa: BLE001 - 本地 IO 失败归为硬失败
         raise NotificationLocalError("无法建立通知投递记录（batch claim 写入失败）") from exc
+
+
+def _pin_existing_winner_claims(event_id: str, channels: list[str]) -> None:
+    """Also preserve pre-existing terminal channels when consuming preparation."""
+    def mutate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for record in records:
+            if record.get("event_id") == event_id and record.get("channel") in channels:
+                record["winner_preparation_claim"] = True
+        return records
+
+    try:
+        _mutate_outbox(mutate)
+    except Exception as exc:
+        raise NotificationLocalError("无法保存已有中奖通知 claim 凭证") from exc
 
 
 def _resolve_stale_claim(event_id: str, channel: str) -> None:
@@ -639,6 +692,8 @@ class NotificationService:
         channels: tuple[str, ...] | list[str] | None = None,
         force: bool = False,
         event_type: str | None = None,
+        winner_preparation: bool = False,
+        on_claimed: Callable[[], None] | None = None,
     ) -> dict[str, dict[str, str]]:
         """event_id 是本次投递实例的唯一稳定标识（同一消息重复扫描得到相同 event_id）。
 
@@ -653,7 +708,7 @@ class NotificationService:
         if not config["events"].get(event_type, True):
             return {}
         results: dict[str, dict[str, str]] = {}
-        targets = list(channels) if channels else [
+        targets = list(channels) if channels is not None else [
             channel for channel in ALL_CHANNELS if config["channels"][channel]["enabled"]
         ]
         summary = body.strip()[:80] if body else title.strip()[:80]
@@ -685,8 +740,18 @@ class NotificationService:
 
         # 阶段 1：第一个 HTTP 之前，为全部待发渠道做单次原子 batch claim。
         # 要么所有渠道都有 durable dispatching，要么一个都没有（失败抛硬错误，0 HTTP）。
+        if winner_preparation and terminal:
+            _pin_existing_winner_claims(event_id, list(terminal))
         if needs_claim:
-            _claim_records(event_id, needs_claim, event_type=event_type)
+            if winner_preparation:
+                _claim_records(event_id, needs_claim, event_type=event_type, winner_preparation=True)
+            else:
+                _claim_records(event_id, needs_claim, event_type=event_type)
+
+        # The durable batch (including its untrimmed evidence) already exists.
+        # Failure here must never permit HTTP or rollback the claim.
+        if on_claimed is not None:
+            on_claimed()
 
         # 阶段 2：逐渠道发送并把结果落盘（每渠道一次；结果独立）。
         for channel in needs_claim:

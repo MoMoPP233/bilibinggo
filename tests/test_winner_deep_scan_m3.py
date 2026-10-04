@@ -1057,12 +1057,11 @@ def test_crash_before_atomic_claim_persist_no_unknown_and_retryable(profile: Pat
     # claim 从未落盘：不存在 dispatching，也不存在 delivery_unknown
     records = [r for r in nsvc._load_outbox() if r.get("event_id") == event]
     assert records == []
-    # 下一轮（新消息）允许正常发送（此前该候选 0 HTTP、claim 无残留）
+    # V84: 真正 restart 恢复同一个 cc1，不再用新消息 cc2 冒充恢复。
     monkeypatch.setattr(nsvc, "_claim_records", real_claim)
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc2", WIN_TEXT)] if m == MessageType.AT else [], {"is_end": True, "id": "6"}))
-    result2 = winmod.service.run(None)
-    assert result2["sources"]["mention"]["advance"] is True
+    winmod.WinnerScanService().recover_notification_preparations()
     assert counters["posts"] == 3
+    assert {r["event_id"] for r in nsvc._load_outbox()} == {event}
 
 
 def test_crash_after_full_atomic_claims_before_http_stays_fail_closed(profile: Path, monkeypatch) -> None:
@@ -1106,9 +1105,8 @@ def test_no_half_batch_claim_under_internal_failure(profile: Path, monkeypatch) 
     channels = {r["channel"] for r in nsvc._load_outbox() if r.get("event_id") == event}
     assert channels == set()  # 全无；不允许半批
 
-    # 恢复后新消息可以正常发送（之前 0 HTTP、无残留 claim）
+    # 恢复同一个已持久化候选，不依赖远程再次返回任何消息。
     monkeypatch.setattr(nsvc, "_mutate_outbox", real_mutate)
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc3", WIN_TEXT)] if m == MessageType.AT else [], {"is_end": True, "id": "6"}))
-    result2 = winmod.service.run(None)
-    assert result2["sources"]["mention"]["advance"] is True
+    winmod.WinnerScanService().recover_notification_preparations()
     assert counters["posts"] == 3
+    assert {r["event_id"] for r in nsvc._load_outbox()} == {event}

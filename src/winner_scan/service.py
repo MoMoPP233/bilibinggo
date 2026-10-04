@@ -34,7 +34,8 @@ from src.bilibili_auth import require_login
 from src.data_paths import get_atomic_path_lock, get_profile_dir
 from src.message_api import fetch_dm_messages, list_dm_sessions, list_dm_sessions_page, list_feed
 from src.message_types import MessageEntry, MessageType
-from src.notification.service import NotificationLocalError, NotificationService
+from src.notification.service import NotificationLocalError, NotificationService, preparation_channels
+from src.profile_writer_lease import _ProfileWriterLease
 from src.platform_risk import risk_code_of
 from src.sources.common import is_valid_dynamic_id, opus_link
 
@@ -458,7 +459,12 @@ def _load_candidates() -> dict[str, dict[str, Any]]:
 
 def _save_candidates(candidates: dict[str, dict[str, Any]]) -> None:
     ordered = sorted(candidates.values(), key=lambda item: int(item.get("discovered_at") or 0), reverse=True)
-    _write_json(_candidates_path(), {"version": 1, "candidates": ordered[-500:]})
+    kept = ordered[-500:]
+    # A bounded UI history must not discard a still-recoverable preparation.
+    kept_keys = {record.get("key") for record in kept}
+    kept.extend(record for record in ordered if record.get("key") not in kept_keys
+                and record.get("notification_preparation", {}).get("status") == "pending")
+    _write_json(_candidates_path(), {"version": 1, "candidates": kept})
 
 
 def _load_nickname_cache() -> dict[str, dict[str, Any]]:
@@ -1341,13 +1347,17 @@ class WinnerScanService:
         """
         from src.bilibili_client import BilibiliClient
 
-        close_after = client is None
-        active_client = client if client is not None else BilibiliClient(warmup=False)
         _, uid = require_login()
         expected = int(expected_uid or uid)
         if int(uid) != expected:
             raise RuntimeError("登录账号与预期不符，已停止深检")
 
+        # Recovery does not require remote discovery; retain the workflow's local
+        # identity/cancellation checks before allowing any notification HTTP.
+        if notify:
+            self.recover_notification_preparations(cancel_check=cancel_check)
+        close_after = client is None
+        active_client = client if client is not None else BilibiliClient(warmup=False)
         state = _load_state()
         existing = _load_candidates()
         suppressed = _suppressed_candidate_keys(state)
@@ -1365,7 +1375,7 @@ class WinnerScanService:
                     "mention", MessageType.AT, entries, state=state["mention"], existing=existing, suppressed=suppressed
                 )
                 # 1) candidate durable；2) 通知（claim→HTTP→terminal durable）；3) 最后推进 checkpoint
-                _save_candidates(existing)
+                self._save_new_candidates(existing, keys, notify=notify)
                 self._dispatch_new(existing, keys, notify=notify)
                 if cancel_check and cancel_check():
                     raise RuntimeError("任务已取消")
@@ -1394,7 +1404,7 @@ class WinnerScanService:
                 saved, keys = self._scan_feed_source(
                     "reply", MessageType.REPLY, entries, state=state["reply"], existing=existing, suppressed=suppressed
                 )
-                _save_candidates(existing)
+                self._save_new_candidates(existing, keys, notify=notify)
                 self._dispatch_new(existing, keys, notify=notify)
                 if cancel_check and cancel_check():
                     raise RuntimeError("任务已取消")
@@ -1420,7 +1430,7 @@ class WinnerScanService:
                 saved, keys, auto_reply_skipped, dm_pagination = self._scan_dm_source(
                     active_client, state=state, existing=existing
                 )
-                _save_candidates(existing)
+                self._save_new_candidates(existing, keys, notify=notify)
                 self._dispatch_new(existing, keys, notify=notify)
                 self._advance_source_state(state, "dm", pagination=dm_pagination)
                 outcomes["dm"] = {
@@ -1524,6 +1534,58 @@ class WinnerScanService:
         )
         _save_state(state)
 
+    def _save_new_candidates(self, existing: dict[str, dict[str, Any]], keys: list[str], *, notify: bool) -> None:
+        channels = preparation_channels("winning_candidate") if notify else []
+        for key in keys:
+            existing[key]["notification_preparation"] = {
+                "status": "pending" if channels else "disabled", "channels": channels[:],
+            }
+        # Candidate and positive preparation evidence share ONE atomic replace.
+        _save_candidates(existing)
+
+    def recover_notification_preparations(self, *, cancel_check: Callable[[], bool] | None = None) -> None:
+        """Recover only V84 positive evidence; no login, Bilibili read, or cursor write."""
+        for key, record in _load_candidates().items():
+            if record.get("notification_preparation", {}).get("status") == "pending":
+                if cancel_check and cancel_check():
+                    raise RuntimeError("任务已取消")
+                self._dispatch_prepared(key)
+
+    def _dispatch_prepared(self, key: str) -> None:
+        # Reuse the existing OS lease implementation, on a narrow Profile-local
+        # notification boundary. This also works inside the outer workflow lease.
+        path = get_profile_dir() / "winner_notification.lock"
+        with get_atomic_path_lock(path):
+            lease = _ProfileWriterLease(path, owner="winner-notification")
+            if not lease.acquire():
+                raise NotificationLocalError("中奖通知正在准备，请稍后恢复")
+            try:
+                record = _load_candidates().get(key)
+                if not record:
+                    return
+                preparation = record.get("notification_preparation", {})
+                if preparation.get("status") != "pending" or not preparation.get("channels"):
+                    return
+
+                def claimed() -> None:
+                    try:
+                        with get_atomic_path_lock(_candidates_path()):
+                            candidates = _load_candidates()
+                            if key in candidates:
+                                candidates[key]["notification_preparation"]["status"] = "claimed"
+                                _save_candidates(candidates)
+                    except Exception as exc:
+                        raise NotificationLocalError("无法保存中奖通知准备状态") from exc
+
+                title, body = _format_winner_notification(record)
+                self.notification.dispatch(
+                    str(record.get("notification_event_id") or f"winning_candidate:{key}"),
+                    title=title, body=body, event_type="winning_candidate",
+                    channels=preparation["channels"], winner_preparation=True, on_claimed=claimed,
+                )
+            finally:
+                lease.release()
+
     def _dispatch_new(
         self,
         existing: dict[str, dict[str, Any]],
@@ -1537,16 +1599,26 @@ class WinnerScanService:
             record = existing.get(key)
             if record is None:
                 continue
+            if record.get("notification_preparation", {}).get("status") == "claimed":
+                continue
             event_id = str(record.get("notification_event_id") or f"winning_candidate:{key}")
             title, body = _format_winner_notification(record)
             # 通知本地硬失败（claim/terminal 无法落盘）属于本地 durable 失败：
             # 当前 Source 不得推进 checkpoint（由调用方 catch 处理）。
             try:
+                if record.get("notification_preparation", {}).get("status") == "pending":
+                    self._dispatch_prepared(key)
+                    # Subsequent source saves must not overwrite the transition.
+                    persisted = _load_candidates().get(key)
+                    if persisted:
+                        existing[key] = persisted
+                    continue
                 self.notification.dispatch(
                     event_id,
                     title=title,
                     body=body,
                     event_type="winning_candidate",
+                    channels=[] if record.get("notification_preparation", {}).get("status") == "disabled" else None,
                 )
             except NotificationLocalError:
                 raise
