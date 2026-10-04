@@ -78,11 +78,11 @@ def test_ds2_check_update_does_not_write_checkpoint(
     fake_client = MagicMock()
     fake_client.__enter__.return_value = fake_client
     fake_client.__exit__.return_value = False
-    fake_client.get_latest_article.return_value = {
+    fake_client.get_recent_articles.return_value = [{
         "id": 999001,
         "title": "新专栏",
         "publish_time": 1_700_000_000,
-    }
+    }]
     fake_client.get_article_detail.return_value = {
         "title": "新专栏",
         "publish_time": 1_700_000_000,
@@ -92,7 +92,7 @@ def test_ds2_check_update_does_not_write_checkpoint(
     with (
         patch("src.sources.ds2_fanqiao.BilibiliClient", return_value=fake_client),
         patch(
-            "src.sources.ds2_fanqiao.extract_opus_links_with_hints",
+            "src.sources.recent_articles.extract_opus_links_with_hints",
             return_value=(["https://www.bilibili.com/opus/1220000000000000001"], {}),
         ),
     ):

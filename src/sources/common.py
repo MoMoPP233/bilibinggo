@@ -54,6 +54,9 @@ class CheckResult:
     source_complete: bool = True
     source_incomplete_containers: list[str] = field(default_factory=list)
     ds3_expanded_containers: dict[str, dict[str, object]] = field(default_factory=dict)
+    # V89: bounded article sources cache only fully read containers in the
+    # existing snapshot raw_json. Older snapshots simply omit this field.
+    source_completed_containers: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
