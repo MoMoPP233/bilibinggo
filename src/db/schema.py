@@ -49,18 +49,6 @@ def migrate_v1_to_v2(session: Session) -> None:
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_created_at ON jobs(created_at)"))
 
 
-def migrate_v11_to_v12(session: Session) -> None:
-    """为任务增加通用阶段进度字段；不改变旧 step/total 语义。"""
-    conn = session.connection()
-    existing = {
-        str(row[1])
-        for row in conn.execute(text("PRAGMA table_info(jobs)")).fetchall()
-    }
-    for name, decl in _JOB_PROGRESS_COLUMNS:
-        if name not in existing:
-            conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {decl}"))
-
-
 def _ensure_job_progress_columns(session: Session) -> None:
     """Add observability columns without changing the public schema version."""
     conn = session.connection()
