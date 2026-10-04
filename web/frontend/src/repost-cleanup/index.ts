@@ -1249,7 +1249,7 @@ async function requestCleanupStop(): Promise<void> {
 export function bindRepostCleanup(): void {
   if (bound) return;
   bound = true;
-  bindAutoCleanupUi().catch(() => {});
+  bindManualCleanupUi().catch(() => {});
   // 同步/评估按钮由本页自管（立即 loading、逻辑锁、即时反馈）；
   // 标记 dataset.bound 避免全局 bindActionButtons 再绑一次造成重复提交。
   const combinedStartBtn = document.getElementById("repost-sync-assess-btn");
@@ -1374,9 +1374,9 @@ export async function startCleanupJob(
 }
 
 
-// ---------- M6：strict-safe 自动安全清理 ----------
+// ---------- M6：手动触发的 strict-safe 清理（保留旧 API/DOM 标识） ----------
 
-async function bindAutoCleanupPanel(): Promise<void> {
+async function bindManualCleanupPanel(): Promise<void> {
   if (!document.getElementById("auto-delete-toggle")) return;
 
   const refresh = async () => {
@@ -1386,7 +1386,7 @@ async function bindAutoCleanupPanel(): Promise<void> {
       if (toggle) {
         toggle.checked = Boolean(state && state.enabled);
         const label = document.getElementById("auto-delete-toggle-label");
-        if (label) label.textContent = "自动删除：" + (state && state.enabled ? "已开启" : "关闭");
+        if (label) label.textContent = "允许手动安全清理：" + (state && state.enabled ? "已开启" : "关闭");
       }
       const set = (id: string, value: unknown) => {
         const el = document.getElementById(id);
@@ -1398,11 +1398,11 @@ async function bindAutoCleanupPanel(): Promise<void> {
       const hint = document.getElementById("auto-delete-hint");
       if (hint) {
         hint.textContent = state && state.enabled
-          ? "已开启：仅处理 strict-safe 项；存在 delete_pending/unknown 时自动停机。"
-          : "默认关闭：开启前请确认理解删除风险。";
+          ? "已允许手动执行：仅处理 strict-safe 项；存在 delete_pending/unknown 时立即停止。"
+          : "默认关闭：开启后仍须手动点击执行，不会在后台删除。";
       }
     } catch (error) {
-      showToast(String((error as { message?: string })?.message || error), "error", "自动清理状态读取失败");
+      showToast(String((error as { message?: string })?.message || error), "error", "安全清理状态读取失败");
     }
   };
 
@@ -1412,15 +1412,15 @@ async function bindAutoCleanupPanel(): Promise<void> {
     // 开启前必须先确认；取消 → 0 PUT、0 backend mutation、UI 保持原状态
     if (enabled) {
       const confirmed = await openAppConfirm({
-        eyebrow: "自动删除",
-        title: "开启自动删除？",
-        desc: "开启后，后台只删除「明确评估为 safe 的过期抽奖转发」；删除不可恢复。",
+        eyebrow: "手动安全清理",
+        title: "允许手动安全清理？",
+        desc: "开启后仍须手动点击「立即执行安全清理」才会发起删除；仅处理明确评估为 safe 的过期抽奖转发。删除不可恢复。",
         bullets: [
-          "严格白名单：manual_review / blocked / excluded / deferred / unknown / delete_pending 永不自动删除",
+          "严格白名单：manual_review / blocked / excluded / deferred / unknown / delete_pending 均不会被本任务删除",
           "每条 DELETE 前都会再次复核 Profile、UID、动态与转发关系",
-          "遇风控或结果未知：自动停止整个任务并保持 0 DELETE barrier",
+          "遇风控或结果未知：立即停止整个任务，且不会自动重试 DELETE",
         ],
-        confirmLabel: "确认开启自动删除",
+        confirmLabel: "确认允许手动清理",
         cancelLabel: "取消",
         danger: true,
       });
@@ -1437,7 +1437,7 @@ async function bindAutoCleanupPanel(): Promise<void> {
       });
     } catch (error) {
       toggle.checked = !enabled; // 失败立即回退视觉状态，不显示假开启
-      showToast(String((error as { message?: string })?.message || error), "error", "自动删除设置失败");
+      showToast(String((error as { message?: string })?.message || error), "error", "安全清理设置失败");
     }
     await refresh(); // 无论成败都以后端真实状态为准（重新打开页面同理）
   });
@@ -1450,6 +1450,6 @@ async function bindAutoCleanupPanel(): Promise<void> {
   await refresh();
 }
 
-async function bindAutoCleanupUi(): Promise<void> {
-  await bindAutoCleanupPanel();
+async function bindManualCleanupUi(): Promise<void> {
+  await bindManualCleanupPanel();
 }

@@ -554,7 +554,7 @@ def pause_maintenance_risk(
     *,
     at: int | None = None,
 ) -> None:
-    """持久化“自动维护因平台风控暂停”：只能由用户手动恢复。"""
+    """持久化清理维护的风控暂停；只能由用户手动恢复。"""
     scoped_uid = _uid(uid)
     now = int(time.time()) if at is None else int(_timestamp(at, label="暂停时间"))
     normalized_reason = _optional_text(reason, max_length=512)
@@ -579,7 +579,7 @@ def pause_maintenance_risk(
 
 
 def clear_maintenance_risk(uid: str, *, at: int | None = None) -> None:
-    """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
+    """人工清除本地风控暂停；0 远程，不启动清理任务。"""
     scoped_uid = _uid(uid)
     now = int(time.time()) if at is None else int(_timestamp(at, label="恢复时间"))
     with session_scope() as session:

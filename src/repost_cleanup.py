@@ -1621,7 +1621,7 @@ def maintenance_risk_state(uid: str) -> dict[str, Any]:
 
 
 def recover_auto_maintenance(uid: str) -> None:
-    """人工恢复自动维护：只清除本地风控暂停，0 远程，恢复后不立即执行维护。"""
+    """人工清除清理维护的本地风控暂停；0 远程，不启动任务。"""
     clear_maintenance_risk(uid)
 
 
@@ -1644,9 +1644,9 @@ def auto_clear_expired_maintenance_risk(
     cooldown_seconds: int,
     now_ts: int | None = None,
 ) -> bool:
-    """cleanup 风控冷却到期后本地自动恢复调度资格（0 远程，不立即执行维护）。
+    """兼容旧调用：冷却到期后仅清除本地暂停（0 远程，不启动任务）。
 
-    只针对自动 cleanup maintenance 的风控暂停字段（maintenance_risk_paused /
+    只针对 cleanup maintenance 的兼容字段（maintenance_risk_paused /
     _at / _reason），以 maintenance_risk_paused_at + cooldown_seconds 判定。
     不清除任何其它人工/删除安全状态。
     """
@@ -1703,11 +1703,11 @@ def auto_maintain(
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
     assess: bool = True,
 ) -> dict[str, Any]:
-    """低频自动维护：只做增量同步 + 保守评估，绝不删除。
+    """兼容旧入口：仅由显式清理 Job 执行增量同步与保守评估，绝不删除。
 
     0 远程快速退出：风控暂停中 或 sync_needed=false 且无待评估 original。
     明确平台风控（-352/429/限流）→ 持久化 maintenance_risk_paused，需人工恢复。
-    普通临时错误 → 仅结束本轮，下一正常维护周期允许再试。
+    普通临时错误 → 仅结束本轮，后续须再次由用户启动任务。
     """
     current = int(now_ts if now_ts is not None else time.time())
     _check_cancel(cancel_check)
@@ -2764,7 +2764,7 @@ def delete_reposts(
 
 
 # ---------------------------------------------------------------------------
-# M6: strict-safe 自动清理动态（cleanup_auto_delete）
+# M6: 手动触发的 strict-safe 批量清理（保留 cleanup_auto_delete 契约名）
 # ---------------------------------------------------------------------------
 
 
@@ -2775,7 +2775,7 @@ def _auto_delete_setting_path():
 
 
 def get_auto_delete_enabled() -> bool:
-    """per-Profile 自动删除开关（默认 False，绝不放 shared）。"""
+    """读取 per-Profile 的历史命名开关；仅许可手动触发的批量清理。"""
     import json
     import os
 
@@ -2788,7 +2788,7 @@ def get_auto_delete_enabled() -> bool:
 
 
 def set_auto_delete_enabled(enabled: bool) -> bool:
-    """用户明确开启/关闭自动安全清理（原子写，per-Profile）。"""
+    """设置手动批量清理许可（原子写，保留旧文件名与 JSON key）。"""
     import json
     import os
     import tempfile
@@ -2815,7 +2815,7 @@ def set_auto_delete_enabled(enabled: bool) -> bool:
 
 
 def _strict_safe(record: object, stored: object, *, now_ts: int) -> tuple[bool, str]:
-    """正向白名单 strict-safe：任何条件不满足即不可自动删除。"""
+    """正向白名单 strict-safe：任何条件不满足即不可纳入批量删除。"""
     row = _record_dict(record)
     if str(row.get("delete_status") or "") != "active":
         return False, "delete_status 非 active"
@@ -2841,7 +2841,7 @@ def _strict_safe(record: object, stored: object, *, now_ts: int) -> tuple[bool, 
 
 
 def _repost_delete_barrier_blocked(uid: str) -> bool:
-    """delete_pending / unknown 任一存在 → 本轮禁止任何自动 DELETE。"""
+    """delete_pending / unknown 任一存在 → 本轮禁止任何 DELETE。"""
     counts = count_repost_delete_statuses(uid)
     return (int(counts.get("delete_pending") or 0) + int(counts.get("unknown") or 0)) > 0
 
@@ -2884,7 +2884,7 @@ def auto_cleanup_delete(
     now_ts: int | None = None,
     client_factory: Callable[[], BilibiliClient] = BilibiliClient,
 ) -> dict[str, Any]:
-    """strict-safe 自动清理：每批 ≤20，自动连续处理当前 Job frozen scope。
+    """手动触发的 strict-safe 清理：每批 ≤20，当前 Job 连续处理 frozen scope。
 
     规则（超集为 0 删除）：
     - auto_delete_enabled=False → 0 DELETE；
@@ -2900,7 +2900,7 @@ def auto_cleanup_delete(
     current = int(now_ts if now_ts is not None else time.time())
     _check_cancel(cancel_check)
     if not get_auto_delete_enabled():
-        return _auto_delete_result(
+        return _cleanup_delete_result(
             uid="", scope_total=0, processed=0, deleted=0, attempted=0,
             stop_reason="DISABLED", stop_message="自动删除未开启（0 DELETE）",
         )
@@ -2911,7 +2911,7 @@ def auto_cleanup_delete(
         _, uid_int = _require_verified_login(client)
         uid = str(uid_int)
         if _repost_delete_barrier_blocked(uid):
-            return _auto_delete_result(
+            return _cleanup_delete_result(
                 uid=uid, scope_total=0, processed=0, deleted=0, attempted=0,
                 stop_reason="BARRIER", stop_message="存在 delete_pending/unknown，0 DELETE",
             )
@@ -3095,7 +3095,7 @@ def auto_cleanup_delete(
                             if code in (-352, -509, 429):
                                 _record_risk(code, error)
                                 breaker.rate_limited = True
-                            # 自动路径：任何明确业务拒绝都停止整 Job，留给人工检查
+                            # 批量路径：任何明确业务拒绝都停止整 Job，留给人工检查
                             stop_reason = "DELETE_FAILED"
                             stop_message = error
                             breaker.stopped = True
@@ -3151,7 +3151,7 @@ def auto_cleanup_delete(
         elif scope_total == 0:
             stop_message = "没有符合 strict-safe 的候选（0 DELETE）"
 
-        return _auto_delete_result(
+        return _cleanup_delete_result(
             uid=uid,
             scope_total=scope_total,
             processed=processed_total,
@@ -3166,7 +3166,7 @@ def auto_cleanup_delete(
         )
 
 
-def _auto_delete_result(*, uid: str, scope_total: int, processed: int, deleted: int,
+def _cleanup_delete_result(*, uid: str, scope_total: int, processed: int, deleted: int,
                         attempted: int, stop_reason: str, stop_message: str,
                         batches_done: int = 0, items: list | None = None,
                         rate_limited: bool = False, stopped_early: bool = False) -> dict[str, Any]:
@@ -3221,8 +3221,8 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# M8: cleanup_maintenance_cycle（AutoScheduler writer Job）
-# 同一 Job：现有 sync/维护 → M4 连续评估 → 仅当评估干净才进入 M6 strict-safe 自动删除。
+# M8: 兼容旧的 cleanup_maintenance_cycle Job；Scheduler 已不再投递。
+# 同一 Job：sync/维护 → 连续评估 → 仅当评估干净才进入 strict-safe 批量删除。
 # ---------------------------------------------------------------------------
 
 

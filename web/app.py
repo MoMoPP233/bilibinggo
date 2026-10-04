@@ -674,7 +674,7 @@ def api_notifications_test(channel: str) -> dict[str, Any]:
     return {"ok": True, "result": result}
 
 
-# ---------- M6：strict-safe 自动安全清理设置 ----------
+# ---------- M6：手动清理许可设置（保留旧 API 路径） ----------
 
 
 class AutoDeleteEnabledRequest(BaseModel):

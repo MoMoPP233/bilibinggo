@@ -125,6 +125,7 @@ async function selectOnlyCandidate(module: Awaited<ReturnType<typeof loadModule>
 describe("repost cleanup UI", () => {
   it("ships one combined main action beside safe cleanup and the auto-delete switch", () => {
     const html = readFileSync("index.html", "utf-8");
+    expect(html).toContain("允许手动安全清理：关闭");
     const combined = html.indexOf('id="repost-sync-assess-btn"');
     const safeCleanup = html.indexOf('id="auto-delete-run"');
     const autoDelete = html.indexOf('id="auto-delete-toggle"');
@@ -917,6 +918,7 @@ describe("auto-delete toggle confirmation order", () => {
     loadAccountMock.mockResolvedValue({ logged_in: true, expired: false });
     setupDom();
     document.body.innerHTML += `
+      <button type="button" id="auto-delete-run">立即执行安全清理</button>
       <input type="checkbox" id="auto-delete-toggle" />
       <p id="auto-delete-hint"></p>`;
   });
@@ -972,6 +974,11 @@ describe("auto-delete toggle confirmation order", () => {
     await vi.waitFor(() => expect(putCalls().length).toBe(1), { timeout: 3000 });
     expect(putCalls()[0][1].body).toBe(JSON.stringify({ enabled: true }));
     await vi.waitFor(() => expect(toggle.checked).toBe(true), { timeout: 3000 });
+    expect(openAppConfirmMock.mock.calls[0][0].desc).toContain("仍须手动点击");
+    expect(startJobMock).not.toHaveBeenCalled();
+    startJobMock.mockResolvedValue({ ok: true });
+    document.getElementById("auto-delete-run")!.click();
+    expect(startJobMock).toHaveBeenCalledWith("cleanup_auto_delete", {});
   });
 
   it("C failed PUT never leaves a fake-on state", async () => {
