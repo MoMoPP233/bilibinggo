@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from src.app_logging import get_logger
 from src.bilibili_client import BilibiliClient
 from src.lottery_api import OpusReadError, OpusRiskControlError, fetch_opus_detail_item_strict
+from src.platform_risk import risk_code_of
 from src.sources.common import (
     EXCLUDE_CONTEXT_RE,
     CheckResult,
@@ -181,6 +182,8 @@ def expand_container_links(
     *,
     direct_dynamic_ids: set[str] | None = None,
     on_progress: SourceProgress | None = None,
+    completed_containers: dict[str, dict[str, object]] | None = None,
+    expansion_state: dict[str, object] | None = None,
 ) -> tuple[list[str], dict[str, LotteryHint]]:
     """只读取外层 cv 的 Opus 候选；合集子链接直接作为叶子交原流水线。"""
     root_ids = list(
@@ -198,7 +201,12 @@ def expand_container_links(
     excluded: set[str] = set()
     hints: dict[str, LotteryHint] = {}
     detail_blocked = False
+    detail_risk_label = "风控"
     failed_count = 0
+    failed_ids: list[str] = []
+    risk_error: OpusRiskControlError | None = None
+    expanded: dict[str, tuple[list[str], dict[str, LotteryHint]]] = {}
+    completed: dict[str, dict[str, object]] = {}
 
     def skip(dynamic_id: str, reason: str, done: int, total: int) -> None:
         logger.warning("DS-3 跳过 %s：%s", opus_link(dynamic_id), reason)
@@ -208,10 +216,24 @@ def expand_container_links(
     # 两阶段处理：先仅核对外层候选并缓存正文，再本地展开。这样根合集互链
     # 可统一排除，且无论内文有多少 OPUS 节点，都不会再产生子项 detail 请求。
     for index, dynamic_id in enumerate(probe_ids, start=1):
+        cached = (completed_containers or {}).get(dynamic_id)
+        if isinstance(cached, dict):
+            cached_links = cached.get("activity_links")
+            cached_hints = cached.get("link_hints")
+            if (
+                isinstance(cached_links, list)
+                and all(isinstance(url, str) and normalize_activity_id(url) for url in cached_links)
+                and isinstance(cached_hints, dict)
+            ):
+                expanded[dynamic_id] = (list(cached_links), dict(cached_hints))
+                completed[dynamic_id] = cached
+                excluded.add(dynamic_id)
+                continue
         if detail_blocked:
             excluded.add(dynamic_id)
             failed_count += 1
-            skip(dynamic_id, "本次已触发 -352，停止后续合集 detail 请求", index, len(probe_ids))
+            failed_ids.append(dynamic_id)
+            skip(dynamic_id, f"本次已触发 {detail_risk_label}，停止后续合集 detail 请求", index, len(probe_ids))
             continue
         _report(
             on_progress, index - 1, len(probe_ids),
@@ -222,15 +244,17 @@ def expand_container_links(
         except OpusReadError as exc:
             excluded.add(dynamic_id)
             failed_count += 1
+            failed_ids.append(dynamic_id)
             if isinstance(exc, OpusRiskControlError):
                 detail_blocked = True
+                risk_error = exc
+                detail_risk_label = str(risk_code_of(exc) or risk_code_of(exc.__cause__) or "风控")
             skip(dynamic_id, str(exc), index, len(probe_ids))
             continue
         if _is_collection_opus(item):
             containers[dynamic_id] = item
             excluded.add(dynamic_id)
 
-    expanded: dict[str, tuple[list[str], dict[str, LotteryHint]]] = {}
     for index, (dynamic_id, item) in enumerate(containers.items(), start=1):
         _report(
             on_progress, index - 1, len(containers),
@@ -240,12 +264,15 @@ def expand_container_links(
             child_links, child_hints = _container_links(item, dynamic_id)
         except OpusReadError as exc:
             failed_count += 1
+            failed_ids.append(dynamic_id)
             skip(dynamic_id, str(exc), index, len(containers))
             continue
         if not child_links:
             skip(dynamic_id, "合集正文中没有动态链接", index, len(containers))
+            completed[dynamic_id] = {"activity_links": [], "link_hints": {}}
             continue
         expanded[dynamic_id] = child_links, child_hints
+        completed[dynamic_id] = {"activity_links": child_links, "link_hints": child_hints}
         logger.info("DS-3 合集展开 %s：%d 条候选链接", opus_link(dynamic_id), len(child_links))
         _report(
             on_progress, index, len(containers),
@@ -273,9 +300,13 @@ def expand_container_links(
     if failed_count:
         warning = f"部分合集读取失败：{failed_count} 项未读取，已保留 {len(links)} 条候选动态"
         if detail_blocked:
-            warning += "；本次触发 -352，已停止后续合集 detail 请求"
+            warning += f"；本次触发 {detail_risk_label}，已停止后续合集 detail 请求"
         logger.warning("DS-3 %s", warning)
         _report(on_progress, 0, 0, warning)
+    if expansion_state is not None:
+        expansion_state["failed_container_ids"] = failed_ids
+        expansion_state["completed_containers"] = completed
+        expansion_state["risk_error"] = risk_error
     return links, hints
 
 
@@ -286,9 +317,13 @@ def check_update(*, force: bool = False, on_progress: SourceProgress | None = No
         cv_id = int(latest["id"])
         container_url = article_url(cv_id)
         previous = get_last_container(SOURCE_ID)
+        prev_output = load_previous_output(OUTPUT_PATH)
+        same_snapshot = bool(prev_output and prev_output.get("container_url") == container_url)
+        pending_snapshot = bool(
+            same_snapshot and prev_output and prev_output.get("source_complete") is False
+        )
 
-        if not force and previous == container_url:
-            prev_output = load_previous_output(OUTPUT_PATH)
+        if not force and previous == container_url and not pending_snapshot:
             _report(on_progress, 0, 0, "最新专栏没有变化，使用已有候选链接")
             return CheckResult(
                 source_id=SOURCE_ID,
@@ -307,11 +342,19 @@ def check_update(*, force: bool = False, on_progress: SourceProgress | None = No
         detail = client.get_article_detail(cv_id)
         links, hints = extract_opus_links_with_hints(detail)
         direct_ids = _direct_dynamic_ids(detail["opus"]["content"].get("paragraphs") or [])
+        reusable = (
+            prev_output.get("ds3_expanded_containers") or {}
+            if not force and pending_snapshot and prev_output
+            else {}
+        )
+        expansion_state: dict[str, object] = {}
         links, hints = expand_container_links(
             client, links, hints, direct_dynamic_ids=direct_ids, on_progress=on_progress,
+            completed_containers=reusable if isinstance(reusable, dict) else {},
+            expansion_state=expansion_state,
         )
 
-        return CheckResult(
+        result = CheckResult(
             source_id=SOURCE_ID,
             updated=True,
             container_url=container_url,
@@ -322,7 +365,23 @@ def check_update(*, force: bool = False, on_progress: SourceProgress | None = No
             activity_links=links,
             checked_at=int(time.time()),
             link_hints=hints,
+            source_complete=not bool(expansion_state["failed_container_ids"]),
+            source_incomplete_containers=list(expansion_state["failed_container_ids"]),
+            ds3_expanded_containers=dict(expansion_state["completed_containers"]),
         )
+        risk_error = expansion_state["risk_error"]
+        if isinstance(risk_error, OpusRiskControlError):
+            # Preserve successful leaves locally, then stop the workflow before
+            # classification or any further Bilibili request. No checkpoint.
+            if risk_code_of(risk_error) is None and risk_code_of(risk_error.__cause__) == 429:
+                risk_error.code = 429
+            try:
+                save_result(result)
+            except Exception as exc:
+                logger.exception("DS-3 风控后保存部分候选失败")
+                raise risk_error from exc
+            raise risk_error
+        return result
 
 
 def save_result(result: CheckResult) -> Path | None:

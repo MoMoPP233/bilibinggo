@@ -371,6 +371,7 @@ def _source_client(monkeypatch) -> MagicMock:
         },
     }
     monkeypatch.setattr(ds3, "BilibiliClient", lambda: client)
+    monkeypatch.setattr(ds3, "load_previous_output", lambda path: None)
     return client
 
 

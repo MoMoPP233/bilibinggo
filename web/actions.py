@@ -463,11 +463,15 @@ def _run_ds_check(
             check_kwargs["on_progress"] = on_source_progress
         result, detail = _capture_output(check_update, **check_kwargs)
         out_path = save_result(result)
-    status_text = "发现新专栏，已爬取" if result.updated else "同一专栏，已跳过"
+    status_text = (
+        "本轮部分完成，下次将继续补读合集" if not result.source_complete else
+        "发现新专栏，已爬取" if result.updated else "同一专栏，已跳过"
+    )
     log_line = f"【{source_id}】{status_text}，共 {len(result.activity_links)} 条链接"
     payload = {
         "source_id": source_id,
         "updated": result.updated,
+        "source_complete": result.source_complete,
         "link_count": len(result.activity_links),
         "saved": bool(out_path),
         "log_line": log_line,
@@ -741,6 +745,7 @@ def _run_source_refresh(
                 "source": {
                     "source_id": payload["source_id"],
                     "updated": payload["updated"],
+                    "source_complete": check_result.source_complete,
                     "link_count": payload["link_count"],
                     "saved": payload["saved"],
                 },
@@ -782,6 +787,8 @@ def _run_source_refresh(
             "已成功结果已保存，剩余候选将在后续刷新继续"
         )
         log_lines.append(partial_line)
+    elif not check_result.source_complete:
+        log_lines.append("【部分完成】DS-3 合集尚未全部读取；已保存成功结果，下次将继续补读")
     else:
         commit_source_checkpoint(check_result)
     invalidate_activity_cache()
@@ -811,6 +818,7 @@ def _run_source_refresh(
         "source": {
             "source_id": payload["source_id"],
             "updated": payload["updated"],
+            "source_complete": check_result.source_complete,
             "link_count": payload["link_count"],
             "saved": payload["saved"],
         },
@@ -820,6 +828,8 @@ def _run_source_refresh(
     message = f"{source_id} 更新完成：{_format_source_scan_counts(counts)}"
     if pipeline_result.partial:
         message += "（部分完成：LLM 服务异常，剩余候选待后续刷新）"
+    elif not check_result.source_complete:
+        message += "（部分完成：合集未全部读取，下次继续补读）"
     return {
         "ok": True,
         "message": message,
@@ -1311,6 +1321,10 @@ def _run_action_impl(
                 try:
                     ds_payloads.append(future.result())
                 except Exception as exc:
+                    # DS-3 detail risk retains a structured code (HTTP 429 can
+                    # otherwise be lost when this exception is string-wrapped).
+                    if source_id == "DS-3" and _risk_code_of(exc) is not None:
+                        raise
                     raise RuntimeError(f"{source_id} 检查失败：{exc}") from exc
 
         ds_payloads.sort(key=lambda item: item[0])
@@ -1324,6 +1338,7 @@ def _run_action_impl(
                 {
                     "source_id": payload["source_id"],
                     "updated": payload["updated"],
+                    "source_complete": check_result.source_complete,
                     "link_count": payload["link_count"],
                     "saved": payload["saved"],
                 }
@@ -1393,7 +1408,12 @@ def _run_action_impl(
             log_lines.append(partial_line)
         else:
             for check_result in ds_check_results:
-                commit_source_checkpoint(check_result)
+                if check_result.source_complete:
+                    commit_source_checkpoint(check_result)
+                else:
+                    log_lines.append(
+                        "【部分完成】DS-3 合集尚未全部读取；已保存成功结果，下次将继续补读"
+                    )
         invalidate_activity_cache()
         for line in _pipeline_log_lines(pipeline_result):
             log_lines.append(line)
@@ -1413,6 +1433,8 @@ def _run_action_impl(
             summary_parts.append(f"跳过 {pipeline_result.skipped_count} 条")
         if pipeline_result.partial:
             summary_parts.append("部分完成（LLM 服务异常，剩余候选待后续刷新）")
+        elif any(not result.source_complete for result in ds_check_results):
+            summary_parts.append("部分完成（合集未全部读取，下次继续补读）")
 
         logger.info(
             "一键更新完成：新链接 %s，入库 %s",

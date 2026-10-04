@@ -49,6 +49,11 @@ class CheckResult:
     activity_source_observations: list[dict[str, str]] = field(default_factory=list)
     # Source-owned page aggregates; page_index is assigned by the fetcher.
     source_page_stats: list[dict[str, object]] = field(default_factory=list)
+    # A source may yield useful candidates while some of its containers remain
+    # unread. This is independent of the downstream pipeline's partial state.
+    source_complete: bool = True
+    source_incomplete_containers: list[str] = field(default_factory=list)
+    ds3_expanded_containers: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -56,7 +61,7 @@ class CheckResult:
 
 def commit_source_checkpoint(result: CheckResult) -> None:
     """流水线/检查成功后再写入专栏检查点；检查阶段不得提前调用。"""
-    if not result.updated:
+    if not result.updated or not result.source_complete:
         return
     from src.state_store import set_last_container
 
