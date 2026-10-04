@@ -1,0 +1,18 @@
+{
+  "network": {
+    "action": "refresh_source",
+    "state": "error",
+    "message": "无法连接 B 站服务器，请检查网络、代理或 DNS 后重试",
+    "log": "Traceback: 旧日志提到重新扫码和 API error -352: 风控",
+    "result": { "error_code": "ACCOUNT_NETWORK_ERROR" },
+    "expected_kind": "network"
+  },
+  "risk": {
+    "action": "refresh_source",
+    "state": "error",
+    "message": "API error -352: 平台返回",
+    "log": "Traceback: TLS EOF，网络异常",
+    "result": { "risk_code": -352 },
+    "expected_kind": "rate"
+  }
+}

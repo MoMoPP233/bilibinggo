@@ -21,6 +21,7 @@ from src.job_store import (
 )
 from src.log_context import job_log_context
 from src.log_span import log_event
+from src.llm_client import LlmTemporaryError
 from src.observability import (
     JobMetrics,
     format_performance_summary,
@@ -786,6 +787,12 @@ class JobRunner:
                     current = self.get_status()
                     result = dict(current.result or {})
                     result["login_phase"] = "error"
+                error_code = getattr(exc, "code", None)
+                if isinstance(exc, LlmTemporaryError):
+                    error_code = "LLM_TEMPORARY_ERROR"
+                if error_code in {"AUTH_REQUIRED", "ACCOUNT_NETWORK_ERROR", "LLM_NOT_READY", "LLM_TEMPORARY_ERROR"}:
+                    result = dict(result or {})
+                    result["error_code"] = str(error_code)
                 self._apply_terminal(
                     job_id,
                     state="error",

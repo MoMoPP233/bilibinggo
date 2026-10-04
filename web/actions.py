@@ -544,17 +544,13 @@ def _make_ds_source_progress(
 
 # ===== 一键更新全部数据源：编排层，串行复用单数据源逻辑 =====
 
-_DS_PLATFORM_RISK_MARKERS = (
-    "-352",
-    "-509",
-    "-799",
-    "429",
+# 旧源仅有文本时保留有限的兼容停止；普通错误/日志里偶然提及错误码不得决定控制流。
+# 正式风控仍由 risk_code_of 识别真实 API 信封或 HTTP response。
+_DS_LEGACY_LIMIT_RE = re.compile(
+    r"^(?:API error -(?:352|509|799)\s*[:：]|HTTP 429 Too Many Requests\b|"
+    r"-509 访问过于频繁\b|访问过于频繁 -799\b)",
+    re.IGNORECASE,
 )
-
-# 仅匹配结构化 code 文本令牌（-352/-509/-799/429）——Binggo 正式平台风控只认
-# -352/-509/HTTP429（platform_risk.risk_code_of）。-799 是临时反爬/频率受限，不是正式风控；
-# 正文字样（“风控/限流/too many…”等）一律不参与判断。本组只用于“保守停止后续只读数据源”
-# 的本地兼容行为：不写 global cooldown / 不写 risk pause / 不触发 mutation breaker。
 
 # 内部导入阶段提示（出现在单源 refresh_source 的流水线消息里）
 _DS_IMPORT_PHASE_MARKERS = (
@@ -571,8 +567,7 @@ _DS_IMPORT_PHASE_MARKERS = (
 
 
 def _looks_like_platform_risk(message: object) -> bool:
-    lowered = str(message or "").lower()
-    return any(marker in lowered for marker in _DS_PLATFORM_RISK_MARKERS)
+    return _DS_LEGACY_LIMIT_RE.match(str(message or "").strip()) is not None
 
 
 def _ds_phase_from_message(message: str) -> str | None:
@@ -1042,7 +1037,14 @@ def _update_all_datasources(
                 stopped_index = index
                 emit("done", index, log_append=f"【一键更新】{source_id} 已取消")
                 break
-            risk_code = _risk_code_of(exc)
+            # 传输异常链比错误字符串里的旧 code 片段更可信；只有真实 API/HTTP
+            # 风险信封才停止后续来源。普通网络错误不能被诊断文字升级成风控。
+            transport_failure = (
+                getattr(exc, "code", None) == "ACCOUNT_NETWORK_ERROR"
+                or isinstance(exc, httpx.RequestError)
+                or isinstance(exc.__cause__, httpx.RequestError)
+            )
+            risk_code = None if transport_failure else _risk_code_of(exc)
             if risk_code is not None:
                 # 正式结构化平台风控（-352/-509/HTTP429）：保守停止后续只读源
                 risk_stopped = True
@@ -1053,7 +1055,7 @@ def _update_all_datasources(
                 stopped_index = index
                 emit("done", index, log_append=f"一键更新：{source_id} 平台风控停止")
                 break
-            if _looks_like_platform_risk(message):
+            if not transport_failure and _looks_like_platform_risk(message):
                 # 文本含 -799/429 等 code 令牌但未确认正式风控：source-local 保守停止
                 # （禁止升级为 platform risk / global cooldown / mutation breaker）
                 risk_stopped = True
@@ -1324,7 +1326,9 @@ def _run_action_impl(
                 except Exception as exc:
                     # DS-3 detail risk retains a structured code (HTTP 429 can
                     # otherwise be lost when this exception is string-wrapped).
-                    if source_id == "DS-3" and _risk_code_of(exc) is not None:
+                    if (source_id == "DS-3" and _risk_code_of(exc) is not None) or (
+                        source_id == "DS-1" and getattr(exc, "code", None) == "ACCOUNT_NETWORK_ERROR"
+                    ):
                         raise
                     raise RuntimeError(f"{source_id} 检查失败：{exc}") from exc
 

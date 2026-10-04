@@ -2,6 +2,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import indexHtml from "../../index.html?raw";
+import v88ErrorJobContract from "../../../../tests/fixtures/v88_error_job_contract.json";
 
 const mocks = vi.hoisted(() => ({
   fetchJSON: vi.fn(),
@@ -250,6 +251,79 @@ describe("job completion responsiveness", () => {
     expect(failure.kind).toBe("network");
     expect(failure.title).toContain("B 站");
     expect(failure.hint).not.toContain("LLM");
+  });
+
+  it("keeps backend network code above stale login and risk traceback", async () => {
+    const jobs = await loadJobsModule();
+    const failure = jobs.classifyJobFailure(job({
+      state: "error",
+      action: "refresh_source",
+      message: "无法连接 B 站服务器，请检查网络、代理或 DNS",
+      log: "Traceback: 旧文案要求重新扫码；历史日志 API error -352: 风控",
+      result: { error_code: "ACCOUNT_NETWORK_ERROR" },
+    }));
+    expect(failure.kind).toBe("network");
+    expect(failure.title).toContain("网络");
+    expect(failure.actions).not.toContainEqual(expect.objectContaining({ id: "login" }));
+    expect(failure.message).not.toContain("扫码");
+  });
+
+  it("classifies the same DS-1 Job result contract asserted by backend tests", async () => {
+    const jobs = await loadJobsModule();
+    for (const scenario of [v88ErrorJobContract.network, v88ErrorJobContract.risk]) {
+      const failure = jobs.classifyJobFailure(job(scenario));
+      expect(failure.kind).toBe(scenario.expected_kind);
+      if (scenario.expected_kind === "network") {
+        expect(failure.actions).not.toContainEqual(expect.objectContaining({ id: "login" }));
+        expect(failure.message).toContain("网络");
+      } else {
+        expect(failure.retryable).toBe(false);
+        expect(failure.title).toContain("B 站风险");
+      }
+    }
+  });
+
+  it("uses structured auth and LLM domains before unrelated log words", async () => {
+    const jobs = await loadJobsModule();
+    const auth = jobs.classifyJobFailure(job({
+      state: "error", message: "需要登录", log: "TLS EOF 风控", result: { error_code: "AUTH_REQUIRED" },
+    }));
+    expect(auth.kind).toBe("auth");
+    expect(auth.actions).toContainEqual(expect.objectContaining({ id: "login" }));
+    const llm = jobs.classifyJobFailure(job({
+      state: "error", message: "请配置 LLM", log: "重新扫码 -352", result: { error_code: "LLM_NOT_READY" },
+    }));
+    expect(llm.kind).toBe("llm");
+    expect(llm.actions).toContainEqual(expect.objectContaining({ id: "llm" }));
+    const temporary = jobs.classifyJobFailure(job({
+      state: "error", message: "LLM 服务当前限流（HTTP 429）", log: "API error -352: 风控", result: { error_code: "LLM_TEMPORARY_ERROR" },
+    }));
+    expect(temporary.kind).toBe("llm_temporary");
+    expect(temporary.title).toContain("LLM");
+    const internal = jobs.classifyJobFailure(job({
+      state: "error", message: "操作失败", log: "Traceback: 重新扫码；API error -352: 风控", result: { error_code: "INTERNAL" },
+    }));
+    expect(internal.kind).toBe("generic");
+    expect(internal.actions).not.toContainEqual(expect.objectContaining({ id: "login" }));
+  });
+
+  it.each([-352, -509, 429])("displays structured Bilibili risk %i above generic network text", async (riskCode) => {
+    const jobs = await loadJobsModule();
+    const failure = jobs.classifyJobFailure(job({
+      state: "error", message: "网络异常", log: "请重新扫码", result: { risk_code: riskCode },
+    }));
+    expect(failure.kind).toBe("rate");
+    expect(failure.title).toContain("B 站风险");
+    expect(failure.retryable).toBe(false);
+    expect(failure.actions).toEqual([]);
+  });
+
+  it.each([-315, -412])("does not classify nonformal Bilibili code %i as formal risk", async (code) => {
+    const jobs = await loadJobsModule();
+    const failure = jobs.classifyJobFailure(job({
+      state: "error", message: `API error ${code}: 普通业务失败`, result: { error_code: "INTERNAL" },
+    }));
+    expect(failure.kind).not.toBe("rate");
   });
 
   it("uses LLM and login prompts only for their structured error codes", async () => {

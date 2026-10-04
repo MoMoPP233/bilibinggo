@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
 
 import web.actions as actions
@@ -37,7 +38,7 @@ def _save_result(_result: CheckResult) -> Path:
 
 
 def _make_record_check(sequence: list[str], source_id: str, *, updated: bool = False):
-    def check_update(*, force=False) -> CheckResult:
+    def check_update(*, force=False, **_kwargs) -> CheckResult:
         sequence.append(f"check:{source_id}")
         return _check_result(source_id, updated=updated)
 
@@ -158,6 +159,66 @@ def test_ordinary_failure_is_recorded_and_next_source_continues(
     assert payload["result"]["update_all"]["failed_count"] == 1
     # DS-3 之后仍继续执行到 DS-7
     assert sequence == [f"check:{sid}" for sid in DS_ALL]
+
+
+@pytest.mark.parametrize("message", [
+    "网络请求失败，诊断记录中偶然提及 -352，但没有平台响应码",
+    "TLS EOF: earlier log mentioned -509 / HTTP 429",
+])
+def test_ds1_network_text_with_incidental_risk_tokens_does_not_stop(
+    isolated_home: Path, message: str,
+) -> None:
+    sequence: list[str] = []
+    payload = _run_all(_fake_handlers(sequence, updated=False, fail_on="DS-1", error=message))
+    result = payload["result"]["update_all"]
+    assert result["risk_stopped"] is False
+    assert result["sources"][0]["status"] == "failed"
+    assert sequence == [f"check:{sid}" for sid in DS_ALL]
+
+
+def test_ds1_transport_cause_overrides_embedded_api_code_text(isolated_home: Path) -> None:
+    sequence: list[str] = []
+
+    def fail_ds1(*, force: bool = False) -> CheckResult:
+        sequence.append("check:DS-1")
+        request = httpx.Request("GET", "https://api.bilibili.com/x/space/arc/search")
+        try:
+            raise httpx.ConnectError("TLS EOF", request=request)
+        except httpx.ConnectError as exc:
+            raise RuntimeError("网络请求失败: old diagnostic API error -352: unavailable") from exc
+
+    handlers = [("DS-1", fail_ds1, _save_result)] + [
+        (source_id, _make_record_check(sequence, source_id), _save_result)
+        for source_id in DS_ALL[1:]
+    ]
+    payload = _run_all(handlers)
+    assert payload["result"]["update_all"]["risk_stopped"] is False
+    assert sequence == [f"check:{sid}" for sid in DS_ALL]
+
+
+@pytest.mark.parametrize("code", [-352, -509, 429])
+def test_ds1_real_structured_risk_stops_later_sources(
+    isolated_home: Path, code: int,
+) -> None:
+    sequence: list[str] = []
+
+    def fail_ds1(*, force: bool = False) -> CheckResult:
+        sequence.append("check:DS-1")
+        if code == 429:
+            request = httpx.Request("GET", "https://api.bilibili.com/x/space/wbi/arc/search")
+            raise httpx.HTTPStatusError("rate limited", request=request, response=httpx.Response(429, request=request))
+        raise RuntimeError(f"API error {code}: 平台返回")
+
+    handlers = [("DS-1", fail_ds1, _save_result)] + [
+        (source_id, _make_record_check(sequence, source_id), _save_result)
+        for source_id in DS_ALL[1:]
+    ]
+    payload = _run_all(handlers)
+    result = payload["result"]["update_all"]
+    assert result["risk_stopped"] is True
+    assert result["sources"][0]["status"] == "risk"
+    assert all(item["status"] == "not_run" for item in result["sources"][1:])
+    assert sequence == ["check:DS-1"]
 
 
 @pytest.mark.parametrize("message", ["API error -352: 风控", "-509 访问过于频繁", "HTTP 429 Too Many Requests"])

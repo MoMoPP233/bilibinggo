@@ -63,8 +63,6 @@ def _friendly_plain_message(msg: str) -> str:
         return "Cookie 已过期，请重新扫码登录"
     if "请先扫码登录" in text or "未检测到有效登录" in text:
         return "请先扫码登录后再试"
-    if any(token in text for token in ("频繁", "限流", "风控")) or any(token in lowered for token in ("412", "-509")):
-        return "请求过于频繁，请稍后重试；日常建议在「数据源」页逐个更新"
     if "未配置 llm" in lowered or ("llm" in lowered and "未配置" in text):
         return "未配置 LLM，请在概览页填写 API Key 与模型名称并保存"
     if "连接测试" in text or "请先测试" in text:
@@ -73,6 +71,8 @@ def _friendly_plain_message(msg: str) -> str:
         return "无法连接 LLM 接口，请检查 API Key、接口地址与网络"
     if "llm 服务" in lowered or "llm 返回" in lowered:
         return text if len(text) <= 120 else "LLM 服务暂时不可用，请稍后重试"
+    if any(token in text for token in ("频繁", "限流", "风控")) or any(token in lowered for token in ("412", "-509")):
+        return "请求过于频繁，请稍后重试；日常建议在「数据源」页逐个更新"
     if any(token in text for token in ("已有任务", "正在运行", "仍在运行")):
         return "当前已有任务在运行，请等待结束后再试"
     if "任务已取消" in text or text == "已取消":
@@ -84,6 +84,8 @@ def _friendly_plain_message(msg: str) -> str:
 
 
 def friendly_error(exc: BaseException) -> str:
+    if getattr(exc, "code", None) == "ACCOUNT_NETWORK_ERROR":
+        return "无法连接 B 站服务器，请检查网络、代理或 DNS 后重试"
     if isinstance(exc, LoginCancelledError):
         return "已取消扫码登录"
 

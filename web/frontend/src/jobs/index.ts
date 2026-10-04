@@ -137,9 +137,62 @@ export function buildFailureContext(message, action, log = "") {
   return { text, lowered: text.toLowerCase(), action: String(action || "") };
 }
 
-export function classifyFailureText(message, action, log = "", errorCode = "") {
-  const { text, lowered, action: actionName } = buildFailureContext(message, action, log);
-  const displayMessage = sanitizeUserText(message) || sanitizeUserText(log) || "操作失败，请稍后重试";
+export function classifyFailureText(message, action, log = "", errorCode = "", riskCode = null) {
+  const code = String(errorCode || "");
+  const formalRisk = [-352, -509, 429].includes(Number(riskCode));
+  // 结构化结果存在时，旧日志与 traceback 只能用于诊断，不能参与分类或展示。
+  const { text, lowered, action: actionName } = buildFailureContext(message, action, code || formalRisk ? "" : log);
+  const displayMessage = sanitizeUserText(message) || (code || formalRisk ? "操作失败，请稍后重试" : sanitizeUserText(log)) || "操作失败，请稍后重试";
+
+  if (actionName === "delete_expired_reposts") {
+    return {
+      kind: "repost_delete", severity: "error", title: "删除任务未完全确认", message: displayMessage,
+      hint: "为避免重复删除，不提供任务重试。请先重新同步本人转发历史并核实状态。",
+      actions: [], retryable: false,
+    };
+  }
+  if (formalRisk) {
+    return {
+      kind: "rate", severity: "error", title: "B 站风险，任务已停止", message: `B 站返回风险码 ${riskCode}，任务已停止。`,
+      hint: "请暂停操作并稍后再试；本次不建议立即重试。",
+      actions: [], retryable: false,
+    };
+  }
+  if (code === "AUTH_REQUIRED") {
+    return {
+      kind: "auth", severity: "error", title: "需要登录", message: "当前账号需要重新登录。",
+      hint: "本地登录状态已失效，请重新扫码。",
+      actions: [{ id: "login", label: "去登录" }], retryable: true,
+    };
+  }
+  if (code === "ACCOUNT_NETWORK_ERROR") {
+    return {
+      kind: "network", severity: "error", title: "B 站网络异常", message: "无法连接 B 站服务器，请检查网络、代理或 DNS。",
+      hint: "请检查本机网络、代理或 DNS；网络恢复后可继续。",
+      actions: [{ id: "retry", label: "重试" }], retryable: true,
+    };
+  }
+  if (code === "LLM_NOT_READY") {
+    return {
+      kind: "llm", severity: "error", title: "LLM 未就绪", message: "LLM 配置未就绪，请先完成连接测试。",
+      hint: "在概览页填写 API Key 与模型名称，保存并通过连接测试。",
+      actions: [{ id: "llm", label: "去配置 LLM" }], retryable: true,
+    };
+  }
+  if (code === "LLM_TEMPORARY_ERROR") {
+    return {
+      kind: "llm_temporary", severity: "error", title: "LLM 服务暂时不可用", message: "LLM 服务暂时不可用，请稍后重试。",
+      hint: "请稍后重试 LLM 服务；这不是 B 站风控。",
+      actions: [{ id: "retry", label: "稍后重试" }], retryable: true,
+    };
+  }
+  if (code) {
+    return {
+      kind: "generic", severity: "error", title: "执行失败", message: "操作失败，请查看任务日志了解详情。",
+      hint: "若持续失败，可查看右下角任务日志了解详情。",
+      actions: [{ id: "retry", label: "重试" }], retryable: true,
+    };
+  }
 
   if (/无可参与|没有可参与|已跳过/.test(text)) {
     return {
@@ -163,17 +216,6 @@ export function classifyFailureText(message, action, log = "", errorCode = "") {
       retryable: false,
     };
   }
-  if (actionName === "delete_expired_reposts") {
-    return {
-      kind: "repost_delete",
-      severity: "error",
-      title: "删除任务未完全确认",
-      message: displayMessage,
-      hint: "为避免重复删除，不提供任务重试。请先重新同步本人转发历史并核实状态。",
-      actions: [],
-      retryable: false,
-    };
-  }
   if (actionName === "login" || /二维码|扫码登录|sessdata|确认超时|登录未完成/.test(lowered)) {
     return {
       kind: "login",
@@ -182,28 +224,6 @@ export function classifyFailureText(message, action, log = "", errorCode = "") {
       message: displayMessage,
       hint: "请重新发起扫码登录，并在手机上确认。",
       actions: [{ id: "login", label: "重新扫码" }],
-      retryable: true,
-    };
-  }
-  if (String(errorCode || "") === "AUTH_REQUIRED") {
-    return {
-      kind: "auth",
-      severity: "error",
-      title: "需要登录",
-      message: displayMessage,
-      hint: "本地登录状态已失效，请重新扫码。",
-      actions: [{ id: "login", label: "去登录" }],
-      retryable: true,
-    };
-  }
-  if (String(errorCode || "") === "LLM_NOT_READY") {
-    return {
-      kind: "llm",
-      severity: "error",
-      title: "LLM 未就绪",
-      message: displayMessage,
-      hint: "在概览页填写 API Key 与模型名称，保存并通过连接测试。",
-      actions: [{ id: "llm", label: "去配置 LLM" }],
       retryable: true,
     };
   }
@@ -218,7 +238,7 @@ export function classifyFailureText(message, action, log = "", errorCode = "") {
       retryable: true,
     };
   }
-  if (/频繁|限流|412|509|风控|-509/.test(lowered)) {
+  if (/频繁|限流|509|风控|-509/.test(lowered)) {
     const actions = [{ id: "retry", label: "稍后重试" }];
     if (actionName === "refresh_all" || actionName === "refresh_source") {
       actions.push({ id: "sources", label: "去数据源页" });
@@ -278,7 +298,7 @@ export function classifyFailureText(message, action, log = "", errorCode = "") {
 }
 
 export function classifyJobFailure(job) {
-  return classifyFailureText(job?.message, job?.action, job?.log, job?.error_code || job?.result?.error_code);
+  return classifyFailureText(job?.message, job?.action, job?.log, job?.error_code || job?.result?.error_code, job?.risk_code ?? job?.result?.risk_code);
 }
 
 export function notifyJobStartError(error, action, params = {}) {
