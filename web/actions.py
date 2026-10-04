@@ -39,7 +39,7 @@ from src.sources import (
     ds9_topics,
 )
 from src.sources.common import CheckResult, commit_source_checkpoint, is_valid_dynamic_id
-from src.state_store import set_last_pipeline_persisted, set_watch_last_synced_at
+from src.state_store import set_last_pipeline_persisted
 from src.status_refresh import refresh_local_activity_statuses
 from web.activity_service import (
     PARTICIPATE_TRIPLE_LIMIT,
@@ -53,6 +53,7 @@ from web.activity_service import (
     resolve_participate_lottery_type,
 )
 from src.watch_sync import save_watch_result, sync_watch_forwards
+from src.watch_resume import acknowledge_pipeline as acknowledge_watch_pipeline
 from web.user_messages import format_participation_log, sanitize_log
 
 logger = get_logger("job")
@@ -1628,14 +1629,18 @@ def _run_action_impl(
             log_append=log_lines[-1] if log_lines else "",
         )
 
-        if pipeline_result.partial:
-            # V21：partial 时保留监控窗口 checkpoint，下一轮重扫同一窗口；
-            # 已成功结果由 DB 去重与 classification cache 挡下。
+        if pipeline_result.partial or not pipeline_result.ok:
+            # Partial/failed Pipeline retains the durable candidate batch and
+            # source resume. A completed source alone cannot commit the window.
             log_lines.append(
                 "【部分完成】LLM 服务异常，未推进监控窗口检查点；剩余候选将在后续刷新继续"
             )
         else:
-            set_watch_last_synced_at(watch_result.synced_at)
+            acknowledge_watch_pipeline(
+                watch_result.resume_token, source_complete=watch_result.source_complete,
+            )
+        if not watch_result.source_complete:
+            log_lines.append("【监控续读】部分用户尚未扫描完整，已保存续读位置，未推进完成检查点")
         save_watch_result(watch_result)
         set_last_pipeline_persisted(
             action="refresh_watch",
@@ -1650,6 +1655,8 @@ def _run_action_impl(
         ]
         if pipeline_result.partial:
             summary_parts.append("部分完成（LLM 服务异常，剩余候选待后续刷新）")
+        if not watch_result.source_complete:
+            summary_parts.append("部分用户待续读（未推进完成检查点）")
         logger.info(
             "监控用户更新完成：窗口 %s 条，入库 %s",
             watch_result.link_count,

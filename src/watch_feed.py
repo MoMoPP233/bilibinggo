@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from src.bilibili_client import BilibiliClient, api_code
 from src.platform_risk import risk_code_of
@@ -184,6 +185,26 @@ def _fetch_space_feed_page(
     raise RuntimeError("拉取空间动态失败")
 
 
+@dataclass(frozen=True, slots=True)
+class ForwardScanResult:
+    links: list[ForwardLink]
+    complete: bool
+    next_offset: str
+    pages: int
+    seen_offsets: list[str]
+
+
+def valid_feed_offset(value: object) -> bool:
+    # The API cursor is opaque: validate its transport shape, never synthesize it
+    # from a page number, timestamp or dynamic ID.
+    return (
+        isinstance(value, str)
+        and len(value) <= 4096
+        and value.strip() == value
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
 def collect_forward_links_for_user(
     client: BilibiliClient,
     mid: int,
@@ -191,31 +212,57 @@ def collect_forward_links_for_user(
     since_ts: int,
     until_ts: int | None = None,
     max_pages: int = DEFAULT_MAX_PAGES,
-) -> list[ForwardLink]:
-    """扫描单个用户在时间窗口内的转发原动态（仅 DYNAMIC_TYPE_FORWARD）。"""
+    offset: str = "",
+    seen_offsets: list[str] | None = None,
+    on_page: Callable[[ForwardScanResult], None] | None = None,
+    before_page: Callable[[], None] | None = None,
+) -> ForwardScanResult:
+    """扫描固定窗口；只有时间下界/服务端结束才 complete，cap 只保存续页。"""
     upper = int(until_ts if until_ts is not None else time.time())
     lower = int(since_ts)
     if lower > upper:
-        return []
+        raise ValueError("WATCH 时间窗口无效")
+    if not valid_feed_offset(offset):
+        raise ValueError("WATCH offset 格式异常")
 
-    offset = ""
     collected: list[ForwardLink] = []
     seen_dynamic: set[str] = set()
+    visited = list(seen_offsets or [])
 
-    for _ in range(max(1, max_pages)):
+    for page in range(1, min(DEFAULT_MAX_PAGES, max(1, max_pages)) + 1):
+        if before_page:
+            before_page()
+        if offset in visited:
+            raise ValueError("WATCH offset 重复，未推进续读位置")
         data = _fetch_space_feed_page(client, mid=mid, offset=offset)
-        items = data.get("items") or []
-        if not items:
-            break
+        items = data.get("items")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise ValueError("WATCH items 格式异常，未推进续读位置")
+        next_offset = data.get("offset", "")
+        if not valid_feed_offset(next_offset):
+            raise ValueError("WATCH offset 格式异常，未推进续读位置")
+        has_more = data.get("has_more")
+        if "has_more" in data and not (
+            isinstance(has_more, (bool, int)) and has_more in (0, 1)
+        ):
+            raise ValueError("WATCH has_more 格式异常，未推进续读位置")
+        if "has_more" not in data and "offset" not in data:
+            raise ValueError("WATCH 缺少分页信息，未推进续读位置")
+        # Older payloads omit has_more. Only an absent next offset is an end;
+        # a short page with a next offset must not be mistaken for completion.
+        more = bool(next_offset) if has_more is None else bool(has_more)
+        if more and (not items or not next_offset):
+            raise ValueError("WATCH 分页响应不完整，未推进续读位置")
 
         reached_older = False
+        page_links: list[ForwardLink] = []
         for item in items:
-            if not isinstance(item, dict):
-                continue
             pub_ts = extract_feed_pub_ts(item)
-            if pub_ts is not None and pub_ts > upper:
+            if pub_ts is None:
+                raise ValueError("WATCH 动态缺少有效发布时间，未推进续读位置")
+            if pub_ts > upper:
                 continue
-            if pub_ts is not None and pub_ts < lower:
+            if pub_ts < lower:
                 reached_older = True
                 continue
 
@@ -223,7 +270,7 @@ def collect_forward_links_for_user(
             if not dynamic_id or dynamic_id in seen_dynamic:
                 continue
             seen_dynamic.add(dynamic_id)
-            collected.append(
+            page_links.append(
                 ForwardLink(
                     dynamic_id=dynamic_id,
                     url=opus_link(dynamic_id),
@@ -232,13 +279,22 @@ def collect_forward_links_for_user(
                 )
             )
 
-        if reached_older:
-            break
-
-        next_offset = str(data.get("offset") or "")
-        if not next_offset or len(items) < FEED_PAGE_SIZE:
-            break
+        complete = reached_older or not more
+        if not complete and (next_offset == offset or next_offset in visited):
+            raise ValueError("WATCH offset 重复，未推进续读位置")
+        visited.append(offset)
+        collected.extend(page_links)
+        result = ForwardScanResult(
+            links=page_links, complete=complete,
+            next_offset="" if complete else next_offset,
+            pages=page, seen_offsets=list(visited),
+        )
+        # Candidate data and the cursor covering it must be persisted together.
+        if on_page:
+            on_page(result)
+        if complete:
+            return ForwardScanResult(collected, True, "", page, visited)
         offset = next_offset
         time.sleep(PAGE_REQUEST_DELAY)
 
-    return collected
+    return ForwardScanResult(collected, False, offset, page, visited)
