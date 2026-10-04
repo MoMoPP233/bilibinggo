@@ -46,6 +46,18 @@ MIXIN_KEY_ENC_TAB = [
 WBI_FILTER_RE = re.compile(r"[!'()*]")
 
 
+class BilibiliNetworkError(RuntimeError):
+    """B 站传输失败；供 Job/UI 区分于平台正式风控。"""
+
+    code = "ACCOUNT_NETWORK_ERROR"
+
+
+def _is_request_failure(exc: BaseException) -> bool:
+    return isinstance(exc, (httpx.RequestError, BilibiliNetworkError)) or isinstance(
+        exc.__cause__, httpx.RequestError
+    )
+
+
 def api_code(payload: dict) -> int:
     """解析 B 站 API 响应 code；code=0 表示成功（勿用 ``code or -1``，0 会被误判）。"""
     code = payload.get("code")
@@ -446,6 +458,7 @@ class BilibiliClient:
             "platform": "web",
         }
         errors: list[str] = []
+        network_failure = False
         try:
             data = self.get_json(
                 "https://api.bilibili.com/x/space/wbi/arc/search",
@@ -456,23 +469,26 @@ class BilibiliClient:
             vlist = (data.get("data") or {}).get("list", {}).get("vlist") or []
             if vlist:
                 return vlist[0]
-        except (RuntimeError, httpx.HTTPStatusError) as exc:
-            if risk_code_of(exc) is not None:
+        except (RuntimeError, httpx.HTTPError) as exc:
+            if _is_request_failure(exc):
+                network_failure = True
+            elif risk_code_of(exc) is not None:
                 raise
             errors.append(str(exc))
 
         try:
             return self._get_latest_video_fallback(mid, referer=referer)
-        except (RuntimeError, httpx.HTTPStatusError) as exc:
-            if risk_code_of(exc) is not None:
+        except (RuntimeError, httpx.HTTPError) as exc:
+            if _is_request_failure(exc):
+                network_failure = True
+            elif risk_code_of(exc) is not None:
                 raise
             errors.append(str(exc))
-            raise RuntimeError(
-                "获取最新视频失败（B 站风控 -352/-412）。\n"
-                "请在当前账号 Profile 中重新扫码登录后重试。\n"
-                "Cookie 会保存到当前 Profile 的 cookies.txt。\n"
-                + "\n".join(errors)
-            ) from exc
+            if network_failure:
+                raise BilibiliNetworkError(
+                    "获取最新视频失败：网络请求失败，请检查网络、代理或 DNS"
+                ) from exc
+            raise RuntimeError("获取最新视频失败：" + "；".join(errors)) from exc
 
     def _get_latest_video_fallback(self, mid: int, *, referer: str) -> dict:
         """主接口普通失败或无投稿时，尝试旧接口。"""
@@ -488,6 +504,7 @@ class BilibiliClient:
 
     def get_video_detail(self, bvid: str) -> dict:
         referer = f"https://www.bilibili.com/video/{bvid}"
+        network_failure = False
         try:
             data = self.get_json(
                 "https://api.bilibili.com/x/web-interface/view",
@@ -497,11 +514,23 @@ class BilibiliClient:
             detail = data.get("data")
             if detail:
                 return detail
-        except RuntimeError as exc:
-            if risk_code_of(exc) is not None:
+        except (RuntimeError, httpx.HTTPError) as exc:
+            if _is_request_failure(exc):
+                network_failure = True
+            elif risk_code_of(exc) is not None:
                 raise
-            pass
-        return self._get_video_detail_from_page(bvid, referer=referer)
+        try:
+            return self._get_video_detail_from_page(bvid, referer=referer)
+        except (RuntimeError, httpx.HTTPError) as exc:
+            if _is_request_failure(exc):
+                network_failure = True
+            elif risk_code_of(exc) is not None:
+                raise
+            if network_failure:
+                raise BilibiliNetworkError(
+                    "获取视频详情失败：网络请求失败，请检查网络、代理或 DNS"
+                ) from exc
+            raise
 
     def _get_video_detail_from_page(self, bvid: str, *, referer: str) -> dict:
         html = self.get_text(f"https://www.bilibili.com/video/{bvid}", referer=referer)
