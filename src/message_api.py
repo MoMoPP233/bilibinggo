@@ -239,9 +239,16 @@ def list_feed(
         ),
         action=f"获取{msg_type.label}",
     )
-    items = [normalize_feed_item(msg_type, item) for item in data.get("items") or [] if isinstance(item, dict)]
-    cursor = data.get("cursor") or {}
-    return items, cursor if isinstance(cursor, dict) else {}
+    raw_items = data.get("items")
+    cursor = data.get("cursor")
+    if (
+        not isinstance(raw_items, list)
+        or not all(isinstance(item, dict) for item in raw_items)
+        or not isinstance(cursor, dict)
+    ):
+        raise RuntimeError(f"获取{msg_type.label}失败: 响应缺少有效 items/cursor")
+    items = [normalize_feed_item(msg_type, item) for item in raw_items]
+    return items, cursor
 
 
 def list_system_notices(

@@ -88,7 +88,7 @@ def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     notify = _FakeNotify()
 
     def fake_feed(client, msg_type):
-        return [], {"id": "1", "time": 1}
+        return [], {"is_end": True, "id": "1", "time": 1}
 
     def fake_sessions(client, *, size=20, begin_ts=0, include_system=False):
         return [_session()] if messages else []

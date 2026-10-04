@@ -347,6 +347,8 @@ def _default_sources_state() -> dict[str, Any]:
         "mention": {
             "cursor_id": 0,
             "cursor_time": 0,
+            "checkpoint_keys": [],
+            "catch_up": None,
             "last_success_at": None,
             "last_error": "",
             "last_scan_at": None,
@@ -357,6 +359,8 @@ def _default_sources_state() -> dict[str, Any]:
         "reply": {
             "cursor_id": 0,
             "cursor_time": 0,
+            "checkpoint_keys": [],
+            "catch_up": None,
             "last_success_at": None,
             "last_error": "",
             "last_scan_at": None,
@@ -791,11 +795,13 @@ class WinnerScanService:
     def _cursor_tuple(cursor: dict[str, Any] | None) -> tuple[int, int] | None:
         if not isinstance(cursor, dict):
             return None
-        try:
-            cursor_id = int(cursor.get("id") or 0)
-            cursor_time = int(cursor.get("time") or 0)
-        except (TypeError, ValueError):
+        values = [cursor.get(field, 0) for field in ("id", "time")]
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, str))
+            or not str(value).isdigit() for value in values
+        ):
             return None
+        cursor_id, cursor_time = (int(value) for value in values)
         if cursor_id <= 0 and cursor_time <= 0:
             return None
         return cursor_id, cursor_time
@@ -806,26 +812,68 @@ class WinnerScanService:
         msg_type: MessageType,
         *,
         state: dict[str, Any],
+        cancel_check: Callable[[], bool] | None = None,
     ) -> tuple[list[MessageEntry], dict[str, Any], dict[str, Any]]:
-        """从最新页开始，在本次 run 内追到旧 feed cursor。
+        """Read a bounded part of a fixed window, without changing durable state.
 
-        ``list_feed`` 的 response cursor 是该 endpoint 已验证的历史翻页
-        契约；持久化 cursor 只用于判断历史边界，不作为下一轮的请求起点。
+        The API's first-page continuation token becomes the completed boundary
+        only after the whole window closes. The last-page token is exclusively
+        a resume position. Exact stable keys from the completed first page also
+        identify that boundary when new items shift subsequent page endings;
+        no numeric ordering of message IDs or invented cursor is used.
         """
         old_cursor = self._cursor_tuple(
             {"id": state.get("cursor_id"), "time": state.get("cursor_time")}
         )
         first_run = not state.get("last_success_at") and old_cursor is None
-        entries: list[MessageEntry] = []
-        seen_keys: set[str] = set()
+        source_type = "mention" if msg_type is MessageType.AT else "reply"
+        checkpoint_keys = set(state.get("checkpoint_keys") or [])
+        pending = state.get("catch_up")
+        head_cursor: dict[str, Any] = {}
+        head_keys = sorted(checkpoint_keys)
+        remaining_keys = set(checkpoint_keys)
         seen_cursors: set[tuple[int, int]] = set()
         request_cursor = (0, 0)
+        if pending is not None:
+            if not isinstance(pending, dict):
+                raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_resume")
+            resume = self._cursor_tuple(pending.get("resume_cursor"))
+            head = self._cursor_tuple(pending.get("head_cursor"))
+            visited = pending.get("seen_cursors")
+            saved_keys = pending.get("head_keys")
+            remaining = pending.get("remaining_keys")
+            if (
+                resume is None or head is None
+                or min(resume) <= 0 or min(head) <= 0
+                or not isinstance(visited, list)
+                or not isinstance(saved_keys, list)
+                or not all(isinstance(key, str) for key in saved_keys)
+                or not isinstance(remaining, list)
+                or not all(isinstance(key, str) for key in remaining)
+            ):
+                raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_resume")
+            if not set(remaining).issubset(checkpoint_keys) or (checkpoint_keys and not remaining):
+                raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_resume")
+            for cursor in visited:
+                pair = self._cursor_tuple(cursor)
+                if pair is None or min(pair) <= 0:
+                    raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_resume")
+                seen_cursors.add(pair)
+            request_cursor = resume
+            seen_cursors.add(resume)
+            head_cursor = {"id": head[0], "time": head[1]}
+            head_keys = saved_keys
+            remaining_keys = set(remaining)
+            first_run = False
+        entries: list[MessageEntry] = []
+        seen_keys: set[str] = set()
         pages_fetched = 0
         stop_reason = ""
         complete = False
-        latest_cursor: dict[str, Any] = {}
 
         for page_no in range(1, MAX_FEED_PAGES + 1):
+            if cancel_check and cancel_check():
+                raise RuntimeError("任务已取消")
             if request_cursor == (0, 0):
                 page_entries, cursor = list_feed(client, msg_type)
             else:
@@ -836,11 +884,26 @@ class WinnerScanService:
                     cursor_time=request_cursor[1],
                 )
             pages_fetched = page_no
-            latest_cursor = dict(cursor or {})
+            if cancel_check and cancel_check():
+                raise RuntimeError("任务已取消")
+            if not isinstance(cursor, dict) or type(cursor.get("is_end")) is not bool:
+                raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_cursor")
+            cursor_pair = self._cursor_tuple(cursor)
+            if cursor_pair is None and any(
+                str(cursor.get(field, 0)) != "0"
+                for field in ("id", "time")
+            ):
+                raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_cursor")
+            is_end = cursor["is_end"]
+            if not is_end and (
+                cursor_pair is None or cursor_pair[0] <= 0 or cursor_pair[1] <= 0
+            ):
+                raise RuntimeError(f"{msg_type.label} 分页未完整结束：invalid_cursor")
+            page_keys: set[str] = set()
             for entry in page_entries:
-                key = _source_entry_key(
-                    "mention" if msg_type is MessageType.AT else "reply", entry
-                )
+                key = _source_entry_key(source_type, entry)
+                if key:
+                    page_keys.add(key)
                 # Malformed entries are retained once so existing fail-closed
                 # accounting can explain them, while valid duplicates are removed.
                 dedupe_key = key or f"malformed:{entry.id}:{entry.timestamp}:{len(entries)}"
@@ -849,27 +912,25 @@ class WinnerScanService:
                 seen_keys.add(dedupe_key)
                 entries.append(entry)
 
-            cursor_pair = self._cursor_tuple(cursor)
-            is_end = cursor.get("is_end") if isinstance(cursor, dict) else None
+            if page_no == 1 and pending is None and (page_entries or not is_end):
+                head_cursor = (
+                    {"id": cursor_pair[0], "time": cursor_pair[1]}
+                    if cursor_pair is not None else {}
+                )
+                head_keys = sorted(page_keys)
+            remaining_keys.difference_update(page_keys)
+            if cursor_pair is not None and cursor_pair in seen_cursors:
+                stop_reason = "pagination_loop"
+                break
             if is_end is True:
                 stop_reason = "api_history_end"
                 complete = True
                 break
-            if "is_end" not in (cursor or {}):
-                # Legacy/offline providers without the explicit signal are
-                # treated as one-page windows; no cursor is guessed.
-                stop_reason = "legacy_single_page"
-                complete = True
-                break
-            if is_end is not False or cursor_pair is None:
-                stop_reason = "invalid_cursor"
-                break
-            if old_cursor is not None and cursor_pair == old_cursor:
+            if (old_cursor is not None and cursor_pair == old_cursor) or (
+                checkpoint_keys and not remaining_keys
+            ):
                 stop_reason = "checkpoint_reached"
                 complete = True
-                break
-            if cursor_pair in seen_cursors:
-                stop_reason = "pagination_loop"
                 break
             if first_run and page_no == 1:
                 stop_reason = "first_run_baseline"
@@ -880,14 +941,25 @@ class WinnerScanService:
         else:
             stop_reason = "hard_cap_reached"
 
-        if not complete:
+        if not complete and stop_reason != "hard_cap_reached":
             raise RuntimeError(
                 f"{msg_type.label} 分页未完整结束：{stop_reason or 'incomplete'}"
             )
-        return entries, latest_cursor, {
+        catch_up = None if complete else {
+            "resume_cursor": {"id": request_cursor[0], "time": request_cursor[1]},
+            "head_cursor": head_cursor,
+            "head_keys": head_keys,
+            "remaining_keys": sorted(remaining_keys),
+            "seen_cursors": [
+                {"id": pair[0], "time": pair[1]} for pair in sorted(seen_cursors)
+            ],
+        }
+        return entries, head_cursor, {
             "pages_fetched": pages_fetched,
             "stop_reason": stop_reason,
-            "catch_up_complete": True,
+            "catch_up_complete": complete,
+            "checkpoint_keys": head_keys,
+            "catch_up": catch_up,
         }
 
     @staticmethod
@@ -1287,7 +1359,7 @@ class WinnerScanService:
                 raise RuntimeError("任务已取消")
             try:
                 entries, cursor, pagination = self._fetch_feed_window(
-                    active_client, MessageType.AT, state=state["mention"]
+                    active_client, MessageType.AT, state=state["mention"], cancel_check=cancel_check
                 )
                 saved, keys = self._scan_feed_source(
                     "mention", MessageType.AT, entries, state=state["mention"], existing=existing, suppressed=suppressed
@@ -1295,9 +1367,15 @@ class WinnerScanService:
                 # 1) candidate durable；2) 通知（claim→HTTP→terminal durable）；3) 最后推进 checkpoint
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
+                if cancel_check and cancel_check():
+                    raise RuntimeError("任务已取消")
                 self._advance_source_state(state, "mention", cursor=cursor, pagination=pagination)
+                complete = bool(pagination["catch_up_complete"])
+                partial = partial or not complete
                 outcomes["mention"] = {
-                    "status": "success", "found": saved, "advance": True, **pagination
+                    "status": "success" if complete else "incomplete",
+                    "found": saved, "advance": complete,
+                    **{key: value for key, value in pagination.items() if key not in {"checkpoint_keys", "catch_up"}},
                 }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
@@ -1311,16 +1389,22 @@ class WinnerScanService:
                 raise RuntimeError("任务已取消")
             try:
                 entries, cursor, pagination = self._fetch_feed_window(
-                    active_client, MessageType.REPLY, state=state["reply"]
+                    active_client, MessageType.REPLY, state=state["reply"], cancel_check=cancel_check
                 )
                 saved, keys = self._scan_feed_source(
                     "reply", MessageType.REPLY, entries, state=state["reply"], existing=existing, suppressed=suppressed
                 )
                 _save_candidates(existing)
                 self._dispatch_new(existing, keys, notify=notify)
+                if cancel_check and cancel_check():
+                    raise RuntimeError("任务已取消")
                 self._advance_source_state(state, "reply", cursor=cursor, pagination=pagination)
+                complete = bool(pagination["catch_up_complete"])
+                partial = partial or not complete
                 outcomes["reply"] = {
-                    "status": "success", "found": saved, "advance": True, **pagination
+                    "status": "success" if complete else "incomplete",
+                    "found": saved, "advance": complete,
+                    **{key: value for key, value in pagination.items() if key not in {"checkpoint_keys", "catch_up"}},
                 }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
@@ -1397,20 +1481,26 @@ class WinnerScanService:
     ) -> None:
         """checkpoint 推进：只在候选已落库且通知 durable state 就绪后调用。"""
         entry = state[source_type]
-        entry["last_success_at"] = int(time.time())
+        complete = not pagination or bool(pagination.get("catch_up_complete"))
+        if complete:
+            entry["last_success_at"] = int(time.time())
         entry["last_scan_at"] = int(time.time())
         entry["last_error"] = ""
         if pagination:
             entry["last_pages_fetched"] = int(pagination.get("pages_fetched") or 0)
             entry["last_stop_reason"] = str(pagination.get("stop_reason") or "")
             entry["last_catch_up_complete"] = bool(pagination.get("catch_up_complete"))
+            if source_type in {"mention", "reply"}:
+                entry["catch_up"] = pagination.get("catch_up")
+                if complete:
+                    entry["checkpoint_keys"] = pagination.get("checkpoint_keys", [])
             if source_type == "dm" and isinstance(pagination.get("session_checkpoints"), dict):
                 entry["session_checkpoints"] = {
                     str(key): int(value or 0)
                     for key, value in pagination["session_checkpoints"].items()
                     if str(key).isdigit() and int(value or 0) >= 0
                 }
-        if cursor:
+        if complete and cursor:
             cursor_id = str(cursor.get("id") or "0").strip()
             if cursor_id.isdigit():
                 entry["cursor_id"] = int(cursor_id)

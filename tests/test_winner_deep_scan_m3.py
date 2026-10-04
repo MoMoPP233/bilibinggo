@@ -131,11 +131,11 @@ def _install(
         if msg_type == MessageType.AT:
             if at_error is not None:
                 raise at_error
-            return list(at or []), dict(at_cursor or {"id": "11", "time": 111})
+            return list(at or []), {"is_end": True, **dict(at_cursor or {"id": "11", "time": 111})}
         if msg_type == MessageType.REPLY:
             if reply_error is not None:
                 raise reply_error
-            return list(reply or []), dict(reply_cursor or {"id": "22", "time": 222})
+            return list(reply or []), {"is_end": True, **dict(reply_cursor or {"id": "22", "time": 222})}
         raise AssertionError(msg_type)
 
     def fake_sessions(client, *, size=20, begin_ts=0, include_system=False):
@@ -230,7 +230,7 @@ def test_cross_midnight_messages_are_found_and_restart_deduplicates(profile: Pat
         lambda client, msg_type: ([
             _feed_entry("late-2358", WIN_TEXT, ts=1_758_999_480),
             _feed_entry("early-0001", WIN_TEXT, ts=1_759_000_060),
-        ], {"id": "late-2358", "time": 1_759_000_060}) if msg_type == MessageType.AT else ([], {"id": "22", "time": 222}),
+        ], {"is_end": True, "id": "88", "time": 1_759_000_060}) if msg_type == MessageType.AT else ([], {"is_end": True, "id": "22", "time": 222}),
     )
     second = _run(monkeypatch)
     assert second["sources"]["mention"]["found"] == 2
@@ -631,7 +631,7 @@ def test_real_outbox_dedup_for_repeated_scan(profile: Path, monkeypatch) -> None
     monkeypatch.setattr(nsvc, "create_notify_client", lambda: SpyClient())
     # 真实 NotificationService（复用 M2 outbox）：验证实例级 event_id 去重
     monkeypatch.setattr(winmod, "service", winmod.WinnerScanService(notification=nsvc.NotificationService()))
-    monkeypatch.setattr(winmod, "list_feed", lambda client, msg_type: ([_feed_entry("81", WIN_TEXT)] if msg_type == MessageType.AT else [], {"id": "1", "time": 1}))
+    monkeypatch.setattr(winmod, "list_feed", lambda client, msg_type: ([_feed_entry("81", WIN_TEXT)] if msg_type == MessageType.AT else [], {"is_end": True, "id": "1", "time": 1}))
     monkeypatch.setattr(winmod, "list_dm_sessions", lambda *a, **k: [])
     monkeypatch.setattr(winmod, "fetch_dm_messages", lambda *a, **k: [])
     winmod.service.run(None)
@@ -653,7 +653,7 @@ def test_profile_isolation(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(winmod, "require_login", lambda: ("csrf", UID))
     monkeypatch.setattr(winmod, "get_profile_dir", lambda: a)
     monkeypatch.setattr(nsvc, "get_profile_dir", lambda: a)
-    monkeypatch.setattr(winmod, "list_feed", lambda client, msg_type: ([_feed_entry("1", WIN_TEXT)], {"id": "1"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda client, msg_type: ([_feed_entry("1", WIN_TEXT)], {"is_end": True, "id": "1"}))
     monkeypatch.setattr(winmod, "list_dm_sessions", lambda *a, **k: [])
     monkeypatch.setattr(winmod, "fetch_dm_messages", lambda *a, **k: [])
     winmod.service.run(None)
@@ -758,11 +758,8 @@ def test_blacklist_keyword_rule_respected(profile: Path, monkeypatch) -> None:
 
 def test_cancel_stops_following_requests(profile: Path, monkeypatch) -> None:
     fake = _install(monkeypatch, at=[_feed_entry("1", WIN_TEXT)])
-    calls = {"n": 0}
-
     def cancel_check():
-        calls["n"] += 1
-        return calls["n"] >= 2  # mention 之后取消
+        return winmod._load_state()["mention"]["last_success_at"] is not None
 
     with pytest.raises(RuntimeError, match="任务已取消"):
         _run(monkeypatch, cancel=cancel_check)
@@ -808,7 +805,7 @@ def _real_notify_run(profile, monkeypatch, *, feed_entries=None, feed_error=None
     def feed(client, msg_type):
         if feed_error is not None:
             raise feed_error
-        return (entries if msg_type == MessageType.AT else []), {"id": "7", "time": 7}
+        return (entries if msg_type == MessageType.AT else []), {"is_end": True, "id": "7", "time": 7}
 
     monkeypatch.setattr(winmod, "list_feed", feed)
     monkeypatch.setattr(winmod, "list_dm_sessions", lambda *a, **k: [])
@@ -822,7 +819,7 @@ def test_crash_after_candidate_save_before_dispatch_no_advance(profile: Path, mo
             raise winmod.NotificationLocalError("模拟崩溃：dispatch 前进程死亡")
 
     monkeypatch.setattr(winmod, "service", winmod.WinnerScanService(notification=BoomNotify()))
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("c1", WIN_TEXT)], {"id": "9"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("c1", WIN_TEXT)], {"is_end": True, "id": "9"}))
     monkeypatch.setattr(winmod, "list_dm_sessions", lambda *a, **k: [])
     monkeypatch.setattr(winmod, "fetch_dm_messages", lambda *a, **k: [])
     result = winmod.service.run(None)
@@ -934,7 +931,7 @@ def test_multi_channel_partial_durable_and_advance(profile: Path, monkeypatch) -
             return httpx.Response(200, json={"code": 0}, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(nsvc, "create_notify_client", lambda: MultiSpyClient())
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("m2", WIN_TEXT)] if m == MessageType.AT else [], {"id": "8"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("m2", WIN_TEXT)] if m == MessageType.AT else [], {"is_end": True, "id": "8"}))
     result = winmod.service.run(None)
     assert result["sources"]["mention"]["advance"] is True
     assert counters["posts"] == 2
@@ -1008,7 +1005,7 @@ def _three_channel_run(profile, monkeypatch, *, provider_hook=None, claim_raise=
         monkeypatch.setattr(nsvc, "_claim_records", boom)
 
     monkeypatch.setattr(winmod, "service", winmod.WinnerScanService(notification=nsvc.NotificationService()))
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc1", WIN_TEXT)] if m == MessageType.AT else [], {"id": "6"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc1", WIN_TEXT)] if m == MessageType.AT else [], {"is_end": True, "id": "6"}))
     monkeypatch.setattr(winmod, "list_dm_sessions", lambda *a, **k: [])
     monkeypatch.setattr(winmod, "fetch_dm_messages", lambda *a, **k: [])
     return counters
@@ -1062,7 +1059,7 @@ def test_crash_before_atomic_claim_persist_no_unknown_and_retryable(profile: Pat
     assert records == []
     # 下一轮（新消息）允许正常发送（此前该候选 0 HTTP、claim 无残留）
     monkeypatch.setattr(nsvc, "_claim_records", real_claim)
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc2", WIN_TEXT)] if m == MessageType.AT else [], {"id": "6"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc2", WIN_TEXT)] if m == MessageType.AT else [], {"is_end": True, "id": "6"}))
     result2 = winmod.service.run(None)
     assert result2["sources"]["mention"]["advance"] is True
     assert counters["posts"] == 3
@@ -1111,7 +1108,7 @@ def test_no_half_batch_claim_under_internal_failure(profile: Path, monkeypatch) 
 
     # 恢复后新消息可以正常发送（之前 0 HTTP、无残留 claim）
     monkeypatch.setattr(nsvc, "_mutate_outbox", real_mutate)
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc3", WIN_TEXT)] if m == MessageType.AT else [], {"id": "6"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([_feed_entry("cc3", WIN_TEXT)] if m == MessageType.AT else [], {"is_end": True, "id": "6"}))
     result2 = winmod.service.run(None)
     assert result2["sources"]["mention"]["advance"] is True
     assert counters["posts"] == 3

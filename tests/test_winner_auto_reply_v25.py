@@ -113,9 +113,9 @@ def _install(
     def fake_feed(client, msg_type):
         counters[msg_type.value] += 1
         if msg_type == MessageType.AT:
-            return list(at or []), {"id": "11", "time": 111}
+            return list(at or []), {"is_end": True, "id": "11", "time": 111}
         if msg_type == MessageType.REPLY:
-            return list(reply or []), {"id": "22", "time": 222}
+            return list(reply or []), {"is_end": True, "id": "22", "time": 222}
         raise AssertionError(msg_type)
 
     def fake_sessions(client, *, size=20, begin_ts=0, include_system=False):
@@ -342,7 +342,7 @@ def test_case14_profile_isolation(tmp_path: Path, monkeypatch) -> None:
     profile_b.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(winmod, "require_login", lambda: ("csrf", UID))
-    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([], {"id": "1"}))
+    monkeypatch.setattr(winmod, "list_feed", lambda c, m: ([], {"is_end": True, "id": "1"}))
     monkeypatch.setattr(
         winmod,
         "list_dm_sessions",

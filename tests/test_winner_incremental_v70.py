@@ -80,8 +80,10 @@ def test_mention_fetches_cursor_pages_from_latest_and_stops_at_old_cursor(profil
     ]
     assert len(notify.calls) == 40
     saved = winmod._load_state()["mention"]
-    assert saved["cursor_id"] == 99
-    assert saved["cursor_time"] == 9
+    # The first server continuation bounds the newly completed window. The
+    # last cursor (99/9) only proves we reached the previous boundary.
+    assert saved["cursor_id"] == 20
+    assert saved["cursor_time"] == 2
 
 
 def test_feed_cursor_loop_is_incomplete_and_does_not_advance_source(profile, monkeypatch):
@@ -356,4 +358,3 @@ def test_dm_session_list_hard_cap_does_not_request_page_21(profile, monkeypatch)
     with pytest.raises(winmod.DmSessionListIncomplete, match="hard_cap_reached"):
         winmod.WinnerScanService(notification=_Notify())._collect_dm_sessions(object())
     assert len(calls) == winmod.MAX_DM_SESSION_LIST_PAGES - 1
-
