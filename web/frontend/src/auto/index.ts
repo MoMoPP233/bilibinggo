@@ -139,7 +139,18 @@ function hasAutoCountdownTarget(status) {
 }
 
 function runningAutoTask(status) {
-  return Object.values(status?.tasks || {}).find((task: any) => task?.status === "running") as any;
+  return Object.entries(status?.tasks || {}).find(([key, task]: [string, any]) => {
+    if (task?.status !== "running") return false;
+    if (key !== "participate") return true;
+    // 参与的 Scheduler 状态不能单独证明 Job 已取得 Runner 槽位。
+    const probe = status?.job_probe;
+    const click = status?.last_click;
+    return probe?.job_state === "running"
+      && probe?.job_action === "participate_triple"
+      && probe?.job_id != null
+      && click?.action === "participate_triple"
+      && String(click?.job_id) === String(probe.job_id);
+  })?.[1] as any;
 }
 
 function safeAutoLogText(value) {

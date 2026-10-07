@@ -207,6 +207,68 @@ describe("scheduler start/stop async race", () => {
     expect(fetchJSONMock.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
   });
 
+  it("only calls an accepted participation Job executing", async () => {
+    const mod = await import("./index");
+    const now = Math.floor(Date.now() / 1000);
+    const base = {
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 0, at_unix: now - 1 },
+      tasks: { participate: { status: "dispatch_check" } },
+    };
+    mod.renderAutoDock(base);
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在确认状态…");
+
+    mod.renderAutoDock({
+      ...base,
+      tasks: { participate: { status: "running" } },
+      job_probe: { job_state: "running", job_action: "refresh_all", job_id: 41 },
+    });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).not.toBe("正在执行");
+
+    mod.renderAutoDock({
+      ...base,
+      tasks: { participate: { status: "running" } },
+      last_click: { action: "participate_triple", job_id: 42 },
+      job_probe: { job_state: "running", job_action: "participate_triple", job_id: 41 },
+    });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).not.toBe("正在执行");
+
+    mod.renderAutoDock({
+      ...base,
+      tasks: { participate: { status: "running" } },
+      last_click: { action: "participate_triple", job_id: 42 },
+      job_probe: { job_state: "running", job_action: "participate_triple", job_id: 42 },
+    });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("正在执行");
+
+    mod.renderAutoDock({
+      ...base,
+      next_task: { label: "自动参与", minutes: 5, at_unix: now + 300 },
+      tasks: { participate: { status: "skipped_busy" } },
+      job_probe: { job_state: "running", job_action: "refresh_all", job_id: 41 },
+    });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).toBe("05:00");
+    expect(document.getElementById("auto-dock-job")?.textContent).toContain("refresh_all");
+  });
+
+  it("auto snapshots do not replace a running scan Job in SSE state", async () => {
+    const { state } = await import("../state");
+    const { handleSseMessage } = await import("../realtime/sse");
+    state.currentJob = { id: 41, state: "running", action: "refresh_all", progress_message: "扫描中" };
+    const now = Math.floor(Date.now() / 1000);
+    handleSseMessage("auto.snapshot", {
+      ...runningStatus(),
+      server_now_unix: now,
+      next_task: { label: "自动参与", minutes: 0, at_unix: now - 1 },
+      tasks: { participate: { status: "dispatch_check" } },
+      job_probe: { job_state: "running", job_action: "refresh_all", job_id: 41 },
+    });
+
+    expect(state.currentJob).toMatchObject({ id: 41, state: "running", action: "refresh_all" });
+    expect(document.getElementById("auto-dock-countdown")?.textContent).not.toBe("正在执行");
+  });
+
   it("uses risk cooldown and hides countdown when the scheduler is stopped", async () => {
     const mod = await import("./index");
     const now = Math.floor(Date.now() / 1000);

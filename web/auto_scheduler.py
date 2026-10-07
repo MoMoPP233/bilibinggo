@@ -1037,8 +1037,8 @@ class AutoScheduler:
             self._skip_remote_slot("triple", gate, done=self._done_triple, key=key)
             return
         self._set_pipeline(active=False)
-        self._set_phase("三连参与", f"触发三连参与 {key}")
-        self._set_task_status("participate", "running", "三连参与开始")
+        self._set_phase("检查任务占用", f"三连参与刻度 {key} 已到，检查任务占用")
+        self._set_task_status("participate", "dispatch_check", "检查任务占用")
         self._log("info", f"三连参与刻度 {key}")
         try:
             # 评论恢复探测会先读取目标动态并准备评论，随后才 claim / POST。
@@ -1078,6 +1078,7 @@ class AutoScheduler:
         except CollisionError:
             self._log("warn", "三连参与发现已有任务在运行，本轮跳过。")
             self._set_task_status("participate", "skipped_busy", "本轮跳过（任务占用）")
+            self._set_phase("等待下一刻度", "本轮参与因任务占用跳过，等待重新计划")
             self._done_triple.add(key)
         except Exception as exc:
             if matches_platform_risk(exc):
@@ -1147,7 +1148,10 @@ class AutoScheduler:
             raise CollisionError(
                 f"调度已停止或被新一代接管，放弃自动点击「{label}」（{action}）"
             )
-        self._set_phase(f"点击：{label}", f"正在点击「{label}」")
+        if action == "participate_triple":
+            self._set_phase("检查任务占用", "准备投递三连参与任务")
+        else:
+            self._set_phase(f"点击：{label}", f"正在点击「{label}」")
         self._log("info", f"点击按钮：{label} ({action})")
 
         if self._runner.is_running():
@@ -1176,6 +1180,9 @@ class AutoScheduler:
                 "response_ok": True,
                 "job_id": job_id,
             }
+        if action == "participate_triple":
+            # 只有 JobRunner 真正接受 Job 后，Scheduler 才能声明参与正在执行。
+            self._set_task_status("participate", "running", "三连参与开始")
         self._schedule_auto_snapshot(force=False)
 
         if pipeline_index is not None:
