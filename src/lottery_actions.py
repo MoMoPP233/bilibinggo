@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import contextvars
 import json
+import logging
+import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -31,6 +34,7 @@ from src.favorite_confirmation import (
 )
 from src.invalid_activities import is_self_follow_failure
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
+from src.log_span import log_event
 from src.platform_risk import API_RISK_CODES, risk_code_of as _risk_code_of
 from src.participation_errors import ParticipationReadError
 from src.sources.common import opus_link
@@ -81,6 +85,60 @@ except ImportError:  # pragma: no cover
 
 
 logger = get_logger("participation")
+
+
+def _log_comment_unknown(
+    *, stage: str, error_domain: str, error_type: str,
+    http_status: int | None = None, bili_code: int | None = None,
+) -> None:
+    """Only controlled fields: never log exception text, POST body or credentials."""
+    fields: dict[str, str | int] = {
+        "action": "comment", "result": "unknown", "error_type": error_type,
+    }
+    if http_status is not None:
+        fields["http_status"] = http_status
+    if bili_code is not None:
+        fields["bili_code"] = bili_code
+    log_event(
+        logger, "评论结果未知：安全诊断", level=logging.WARNING,
+        event="participation.comment.unknown", component="participation",
+        phase=stage, error_kind=error_domain, **fields,
+    )
+
+
+def _log_comment_post_exception(exc: Exception) -> None:
+    # post_form wraps transport/JSON errors in RuntimeError but preserves the
+    # original exception as __cause__. Classify by type only, never by text.
+    cause: BaseException = exc
+    for _ in range(3):
+        nested = cause.__cause__
+        if not isinstance(nested, (httpx.HTTPError, json.JSONDecodeError, ssl.SSLError)):
+            break
+        cause = nested
+    http_status = (
+        cause.response.status_code if isinstance(cause, httpx.HTTPStatusError) else None
+    )
+    risk_code: int | None = None
+    if isinstance(cause, json.JSONDecodeError):
+        stage, domain = "response_parse", "response"
+    elif isinstance(cause, httpx.HTTPStatusError):
+        stage, domain = "post", "risk" if http_status == 429 else "http"
+        if http_status == 429:
+            risk_code = 429
+    elif isinstance(cause, (httpx.RequestError, ssl.SSLError, socket.gaierror, TimeoutError, ConnectionError)):
+        stage, domain = "post", "network"
+    else:
+        stage, domain = "post", "unknown"
+        # Only the existing standard exception envelope can prove a Bili code.
+        # Transport/parse exception text is never promoted into formal risk here.
+        risk_code = _risk_code_of(exc)
+        if risk_code in API_RISK_CODES:
+            domain = "risk"
+    _log_comment_unknown(
+        stage=stage, error_domain=domain, error_type=type(cause).__name__,
+        http_status=http_status,
+        bili_code=risk_code if risk_code in {-352, -509} else None,
+    )
 
 
 def _dynamic_id_from_params(params: dict | None) -> str | None:
@@ -833,17 +891,26 @@ def comment_dynamic(
                 raise_on_code=False,
                 retries=0,
             )
-        except Exception:
+        except Exception as exc:
             # The call may already have sent. If this second local write also
             # fails, the durable pending remains the non-expiring barrier.
             try:
                 _set_comment_status_unlocked(target, uid=uid, status="unknown")
-            except Exception:
-                logger.exception("评论结果未知且本地状态更新失败，保留 pending 禁止重发")
+            except Exception as state_exc:
+                log_event(
+                    logger, "评论结果未知且本地状态更新失败，保留 pending 禁止重发",
+                    level=logging.ERROR, event="participation.comment.guard_write_failed",
+                    component="participation", phase="post", error_kind="storage",
+                    action="comment", result="unknown", error_type=type(state_exc).__name__,
+                )
+            _log_comment_post_exception(exc)
             raise
         code = payload.get("code") if isinstance(payload, dict) else None
         if type(code) is not int:
             _set_comment_status_unlocked(target, uid=uid, status="unknown")
+            _log_comment_unknown(
+                stage="response_validate", error_domain="response", error_type="InvalidCode",
+            )
             return ActionResult("comment", False, "评论结果未知：响应缺少有效 code，已阻止自动重试")
         if code in {0, 12051}:
             # Persist immediately, before action callbacks / participation logs.
@@ -854,6 +921,11 @@ def comment_dynamic(
         # server/internal error cannot prove the mutation never happened.
         rejected = code in {12014, 12078, -101, 401, -352, -509}
         _set_comment_status_unlocked(target, uid=uid, status="failed" if rejected else "unknown")
+        if not rejected:
+            _log_comment_unknown(
+                stage="response_validate", error_domain="response",
+                error_type="UnconfirmedCode", bili_code=code,
+            )
         if code == COMMENT_LIMIT_CODE:
             detail = _api_message(payload)
             _trigger_comment_limit_unlocked(code=code, message=detail)
