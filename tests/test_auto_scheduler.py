@@ -298,8 +298,8 @@ def test_next_slot_participate_minute() -> None:
     AutoScheduler(delay_sampler=lambda low, high: 301)._plan_triple(now, None)
     slot = _next_slot(now)
     assert slot["kind"] == "participate"
-    assert slot["hour"] == 2
-    assert slot["minute"] == 55
+    assert slot["hour"] == 7
+    assert slot["minute"] == 5
     assert slot["action"] == "participate_triple"
     assert slot["action_label"] == "三连参与"
 def _cn(dt):
@@ -330,7 +330,7 @@ def test_next_auto_task_participate_after_refresh_hour() -> None:
     AutoScheduler(delay_sampler=lambda low, high: 300)._plan_triple(now, None)
     task = next_auto_task(now)
     assert task["label"] == "自动参与"
-    assert task["minutes"] == 5
+    assert task["minutes"] == 235  # 07:00 + the original 300s jitter
 
 
 def test_next_auto_task_winner_uses_twice_daily_slot() -> None:

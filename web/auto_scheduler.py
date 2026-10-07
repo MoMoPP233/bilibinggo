@@ -267,7 +267,7 @@ class SchedulerStatus:
     night_continue_enabled: bool = False
     night_quiet: bool = False
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, now: datetime | None = None) -> dict[str, Any]:
         return {
             "state": self.state,
             "state_label": STATE_LABELS.get(self.state, self.state),
@@ -290,7 +290,7 @@ class SchedulerStatus:
             "tasks": {key: dict(value) for key, value in self.tasks.items()},
             "night_continue_enabled": self.night_continue_enabled,
             "night_quiet": self.night_quiet,
-            "next_task": next_auto_task(),
+            "next_task": next_auto_task(now),
             "schedule": {
                 "refresh_hours": sorted(REFRESH_HOURS),
                 "refresh_slots": [f"{hour:02d}:{minute:02d}" for hour, minute in REFRESH_SLOTS],
@@ -351,6 +351,8 @@ class AutoScheduler:
         self._snapshot_pending = False
         # 上一次“自动远程大任务”结束的单调时间；用于不同大任务之间 60s 错峰。
         self._last_remote_stage_finished_mono = 0.0
+        # 夜间提示只随当前进程中的 quiet period 状态变化记录一次。
+        self._last_night_quiet_notice: str | None = None
 
     def _active_stop_event(self) -> threading.Event:
         """当前线程绑定的 stop Event；直接调用（无线程上下文，如单测）回退到实例当前 Event。"""
@@ -370,7 +372,7 @@ class AutoScheduler:
         return self._active_stop_event().is_set()
 
     def get_status(self) -> dict[str, Any]:
-        now = datetime.now(CN_TZ)
+        now = self._clock()
         night_continue_enabled = get_night_continue_enabled()
         slot = _next_slot(now)
         probe = _probe_job(self._runner)
@@ -383,7 +385,7 @@ class AutoScheduler:
             self._status.next_slot = slot
             self._status.next_hint = slot.get("hint") or ""
             self._status.job_probe = probe
-            self._status.server_now = _now_iso()
+            self._status.server_now = now.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
             self._status.server_now_unix = int(now.timestamp())
             self._status.night_continue_enabled = night_continue_enabled
             self._status.night_quiet = is_night_quiet(now, config=night_continue_enabled)
@@ -400,7 +402,7 @@ class AutoScheduler:
                     task.pop("resume_at", None)
             if not self._status.refresh_pipeline:
                 self._status.refresh_pipeline = _idle_pipeline()
-            return self._status.to_dict()
+            return self._status.to_dict(now)
 
     def start(self) -> dict[str, Any]:
         # 在 restart gate 内先把调度器状态变为 running；Profile 切换随后
@@ -538,7 +540,7 @@ class AutoScheduler:
             self._status.current_phase = phase
             if message is not None:
                 self._status.message = message
-            slot = _next_slot(datetime.now(CN_TZ))
+            slot = _next_slot(self._clock())
             self._status.next_slot = slot
             self._status.next_hint = slot.get("hint") or ""
             changed = prev != (
@@ -639,10 +641,20 @@ class AutoScheduler:
 
     def _log_remote_gate_skip(self, task: str, gate: RemoteGateDecision) -> None:
         """同一 slot 只记录一次主要跳过日志。"""
-        if gate.kind in ("cooldown", "invalid_state", "night_quiet"):
+        if gate.kind == "night_quiet":
+            self._log_night_quiet_once()
+        elif gate.kind in ("cooldown", "invalid_state"):
             self._log("warn", f"{gate.message}（{task}）")
         elif gate.kind == "gap":
             self._log("info", gate.message)
+
+    def _log_night_quiet_once(self) -> None:
+        now = self._clock().astimezone(CN_TZ)
+        period = now.date().isoformat()
+        if self._last_night_quiet_notice == period:
+            return
+        self._last_night_quiet_notice = period
+        self._log("info", "夜间静默中，自动远程任务将在早上恢复；调度器继续运行。")
 
     def _skip_remote_slot(
         self,
@@ -828,7 +840,7 @@ class AutoScheduler:
                     delay = self._delay_sampler(TRIPLE_DELAY_MIN_SECONDS, TRIPLE_DELAY_MAX_SECONDS)
                     if type(delay) is not int or not TRIPLE_DELAY_MIN_SECONDS <= delay <= TRIPLE_DELAY_MAX_SECONDS:
                         raise SlotStateError("自动参与随机等待时间必须在 240～420 秒之间")
-                    state[_TRIPLE_NEXT_RUN] = (now + timedelta(seconds=delay)).isoformat()
+                    state[_TRIPLE_NEXT_RUN] = _eligible_triple_due(now, delay).isoformat()
                     try:
                         _write_slot_state_atomic(path, state)
                     except OSError as exc:
@@ -846,6 +858,18 @@ class AutoScheduler:
             state = _read_slot_state(_slot_state_path())
             raw = state.get(_TRIPLE_NEXT_RUN)
             due = _triple_due(state)
+            if due is not None and state.get("triple") != f"jitter-{raw}" and _quiet_defer_reopened(now, due):
+                # User enabled "night continue" after a plan was deferred.
+                # Restore the ordinary short jitter once, without replaying it.
+                self._plan_triple(now, raw)
+                return
+            if due is not None and state.get("triple") != f"jitter-{raw}" and is_night_quiet(due):
+                # Pre-V99 or just-created plans may fall inside the quiet
+                # window. CAS-replan once; never claim a slot or start a Job.
+                self._plan_triple(now, raw)
+                if is_night_quiet(now):
+                    self._log_night_quiet_once()
+                return
             if due is None or state.get("triple") == f"jitter-{raw}":
                 if not self._runner.is_running():
                     self._plan_triple(now, raw)
@@ -937,7 +961,10 @@ class AutoScheduler:
                 self._log("warn", f"刷新批次结束（当前任务失败）{key}：{message}")
             elif remote_skipped:
                 # 远程动作被门禁拦截：记录一次结构化跳过；本地 refresh_status 已运行。
-                self._log("warn", f"{gate.message}（refresh；本地状态已刷新）")
+                if gate.kind == "night_quiet":
+                    self._log_night_quiet_once()
+                else:
+                    self._log("warn", f"{gate.message}（refresh；本地状态已刷新）")
                 self._set_task_status(
                     "refresh",
                     "skipped_by_platform_cooldown"
@@ -1248,6 +1275,28 @@ def _triple_due(state: dict[str, str]) -> datetime | None:
         raise SlotStateError("自动参与 next_run 损坏，已停止自动调度") from exc
 
 
+def _eligible_triple_due(now: datetime, delay: int) -> datetime:
+    """Preserve one 240–420s sample, placing quiet-time plans after 07:00."""
+    candidate = now.astimezone(CN_TZ) + timedelta(seconds=delay)
+    if is_night_quiet(candidate):
+        resume = candidate.replace(hour=7, minute=0, second=0, microsecond=0)
+        return resume + timedelta(seconds=delay)
+    return candidate
+
+
+def _quiet_defer_reopened(now: datetime, due: datetime) -> bool:
+    """Recognize a 07:00+jitter plan when night-continue is enabled mid-window."""
+    current = now.astimezone(CN_TZ)
+    if not 0 <= current.hour < 7 or is_night_quiet(current):
+        return False
+    resume = current.replace(hour=7, minute=0, second=0, microsecond=0)
+    return (
+        resume + timedelta(seconds=TRIPLE_DELAY_MIN_SECONDS)
+        <= due
+        <= resume + timedelta(seconds=TRIPLE_DELAY_MAX_SECONDS)
+    )
+
+
 def _dedicated_minute(now: datetime) -> bool:
     return (
         ((now.hour, now.minute) in REFRESH_SLOTS)
@@ -1273,7 +1322,7 @@ def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]
     try:
         state = _read_slot_state(_slot_state_path())
         due = _triple_due(state)
-        if (due is not None and due >= now
+        if (due is not None and due >= now and not is_night_quiet(due)
                 and state.get("triple") != f"jitter-{state[_TRIPLE_NEXT_RUN]}"):
             candidates.append(("participate", "自动参与", due))
     except SlotStateError:

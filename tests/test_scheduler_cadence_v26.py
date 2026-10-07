@@ -104,7 +104,7 @@ def test_case10_triple_shows_only_persisted_next_run() -> None:
     now = datetime(2026, 7, 17, 0, 0, tzinfo=CN_TZ)
     AutoScheduler(delay_sampler=lambda low, high: 301)._plan_triple(now, None)
     participate = [due for kind, _label, due in _day_candidates() if kind == "participate"]
-    assert participate == [now + timedelta(seconds=301)]
+    assert participate == [now.replace(hour=7) + timedelta(seconds=301)]
 
 
 def test_case11_no_same_minute_between_dedicated_and_triple() -> None:
