@@ -210,6 +210,27 @@ def delete_profile(profile_id: str) -> None:
     profile_dir = get_profile_dir(value)
     if not profile_dir.is_dir():
         raise ValueError(f"Profile 不存在：{value}")
+    from src.runtime_instances import (
+        RuntimeBusyError, acquire_runtime_lock, get_runtime_instance,
+    )
+
+    if get_runtime_instance(value):
+        raise ValueError("账号正在运行，请先退出该账号。")
+    try:
+        runtime_lease = acquire_runtime_lock(value)
+    except RuntimeBusyError as exc:
+        raise ValueError("账号正在运行，请先退出该账号。") from exc
+    try:
+        # Reservation may have appeared between the first registry read and
+        # lock acquisition. Never delete a Profile a supervisor is starting.
+        if get_runtime_instance(value):
+            raise ValueError("账号正在运行，请先退出该账号。")
+        _delete_profile_contents(value, profile_dir)
+    finally:
+        runtime_lease.release()
+
+
+def _delete_profile_contents(value: str, profile_dir: Path) -> None:
 
     # 目标 Profile 的跨进程 WriterLease：busy → 拒绝删除，绝不 rmtree 正在被写入的目录。
     from src.profile_writer_lease import (

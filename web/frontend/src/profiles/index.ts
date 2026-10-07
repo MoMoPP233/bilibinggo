@@ -8,6 +8,9 @@ type Profile = {
   profile_id: string;
   mid: string;
   nickname: string;
+  running?: boolean;
+  runtime_ready?: boolean;
+  runtime_port?: number | null;
 };
 
 type ProfilesPayload = {
@@ -111,11 +114,12 @@ function renderProfiles(payload: ProfilesPayload): void {
     .map((profile) => {
       const isRuntime = profile.profile_id === payload.runtime_profile_id;
       const isActive = profile.profile_id === payload.active_profile_id;
-      const deleteDisabled = isRuntime || isActive;
+      const isRunningElsewhere = !isRuntime && Boolean(profile.running);
+      const deleteDisabled = isRuntime || isActive || isRunningElsewhere;
       const switchDisabled = isRuntime && isActive;
       const switchLabel = switchDisabled
         ? "已选择"
-        : isActive
+        : isActive && !isRunningElsewhere
           ? "重启生效"
           : "切换账号";
       const badges = [
@@ -123,6 +127,7 @@ function renderProfiles(payload: ProfilesPayload): void {
         isActive && !isRuntime
           ? '<span class="profile-badge is-next">下次启动</span>'
           : "",
+        isRunningElsewhere ? '<span class="profile-badge is-runtime">其他窗口运行中</span>' : "",
       ].join("");
       return `
         <div class="profile-row${isRuntime ? " is-runtime" : ""}">
@@ -134,7 +139,10 @@ function renderProfiles(payload: ProfilesPayload): void {
             <p>${escapeHtml(profile.profile_id)} · MID ${escapeHtml(profile.mid || "—")}</p>
           </div>
           <div class="profile-row-actions">
-            <button type="button" class="btn btn-secondary btn-compact btn-pill" data-profile-activate="${escapeHtml(profile.profile_id)}" ${switchDisabled ? "disabled" : ""}>${switchLabel}</button>
+            ${isRuntime ? "" : `<button type="button" class="btn btn-secondary btn-compact btn-pill" data-profile-activate="${escapeHtml(profile.profile_id)}" ${switchDisabled ? "disabled" : ""}>${switchLabel}</button>`}
+            ${isRuntime ? "" : isRunningElsewhere
+              ? `<button type="button" class="btn btn-secondary btn-compact btn-pill" data-profile-open="${escapeHtml(profile.profile_id)}" ${profile.runtime_ready ? "" : "disabled"}>${profile.runtime_ready ? "打开窗口" : "启动中..."}</button>`
+              : `<button type="button" class="btn btn-secondary btn-compact btn-pill" data-profile-launch="${escapeHtml(profile.profile_id)}">新窗口运行</button>`}
             <button type="button" class="btn btn-ghost btn-compact btn-pill profile-delete" data-profile-delete="${escapeHtml(profile.profile_id)}" ${deleteDisabled ? "disabled" : ""}>删除</button>
           </div>
         </div>`;
@@ -160,6 +168,10 @@ async function activateProfile(
 ): Promise<void> {
   const profile = currentPayload?.profiles.find((item) => item.profile_id === profileId);
   if (!profile || mutating) return;
+  if (profile.running && profile.profile_id !== currentPayload?.runtime_profile_id) {
+    showToast("该账号已经在其它窗口运行，请先退出该窗口或点击“打开窗口”。", "info");
+    return;
+  }
   mutating = true;
   let restartRequested = false;
   let restartReady = false;
@@ -193,6 +205,48 @@ async function activateProfile(
       mutating = false;
       setButtonLoading(button, false);
     }
+  }
+}
+
+function openProfileWindow(profileId: string): void {
+  const profile = currentPayload?.profiles.find((item) => item.profile_id === profileId);
+  const port = profile?.runtime_port;
+  if (!profile?.runtime_ready || !port || !Number.isInteger(port)) {
+    showToast("目标窗口尚未就绪，请稍后刷新账号列表。", "info");
+    return;
+  }
+  const url = `http://127.0.0.1:${port}/`;
+  const opened = window.open(url, "_blank");
+  if (!opened) showToast(`浏览器阻止了新窗口，请手动访问 ${url}`, "info");
+}
+
+async function launchProfile(profileId: string, button: HTMLButtonElement): Promise<void> {
+  if (mutating) return;
+  mutating = true;
+  setButtonLoading(button, true, { label: "正在启动..." });
+  try {
+    const result = await fetchJSON<{
+      already_running: boolean;
+      ready: boolean;
+      url: string;
+      browser_opened?: boolean;
+    }>(`/api/profiles/${encodeURIComponent(profileId)}/launch`, {
+      method: "POST", timeoutMs: 60000,
+    });
+    await loadProfiles();
+    if (result.ready && !result.already_running && result.browser_opened) {
+      showToast("账号已在新窗口启动。", "success");
+    } else if (result.ready) {
+      showToast(`账号已就绪，请点击“打开窗口”；地址：${result.url}`, "info");
+    } else {
+      showToast("该账号正在启动，请稍后点击“打开窗口”。", "info");
+    }
+  } catch (error) {
+    showToast(errorMessage(error), "error");
+    await loadProfiles().catch(() => undefined);
+  } finally {
+    mutating = false;
+    setButtonLoading(button, false);
   }
 }
 
@@ -231,8 +285,12 @@ export function bindProfiles(): void {
     const target = event.target instanceof Element ? event.target.closest("button") : null;
     if (!(target instanceof HTMLButtonElement) || target.disabled) return;
     const activateId = target.dataset.profileActivate;
+    const launchId = target.dataset.profileLaunch;
+    const openId = target.dataset.profileOpen;
     const deleteId = target.dataset.profileDelete;
     if (activateId) activateProfile(activateId, target).catch(() => undefined);
+    if (launchId) launchProfile(launchId, target).catch(() => undefined);
+    if (openId) openProfileWindow(openId);
     if (deleteId) deleteProfile(deleteId).catch(() => undefined);
   });
 }
@@ -264,6 +322,7 @@ type OnboardingCompleteResult = {
   display_name?: string;
   uid?: string;
   restart_required?: boolean;
+  already_running?: boolean;
 };
 
 function errorMessageOnboarding(error: unknown): string {
@@ -369,7 +428,7 @@ export async function runOnboardingFlow(): Promise<void> {
     if (!qrReady || !isActive(modal)) return;
 
     // 二维码确认展示后才轮询；只使用 onboarding_id，绝不接触 Cookie/UID。
-    let result: { profile_id: string; created_new: boolean } | null = null;
+    let result: { profile_id: string; created_new: boolean; already_running: boolean } | null = null;
     let terminal = false;
     const failOnboarding = (message: string, reason = ""): void => {
       terminal = true;
@@ -417,12 +476,18 @@ export async function runOnboardingFlow(): Promise<void> {
           break;
         }
         onboardingFlowToken += 1; // 成功：使任何陈旧续作失效
-        result = { profile_id: profileId, created_new: Boolean(completed?.created_new) };
+        result = {
+          profile_id: profileId,
+          created_new: Boolean(completed?.created_new),
+          already_running: Boolean(completed?.already_running),
+        };
         terminal = true;
         if (statusEl) {
           statusEl.textContent = result.created_new
-            ? "账号创建成功，正在切换账号并重启…"
-            : "该 B站账号已存在，正在更新登录状态并切换…";
+            ? "账号创建成功，可在列表中点击“新窗口运行”。"
+            : result.already_running
+              ? "该账号已在其他窗口运行，未覆盖 Cookie；请点击“打开窗口”。"
+              : "该 B站账号已存在，登录状态已更新。";
         }
       } else if (status === "scanned") {
         if (statusEl) statusEl.textContent = "已扫码，请在手机端确认登录";
@@ -446,27 +511,14 @@ export async function runOnboardingFlow(): Promise<void> {
     }
     window.setTimeout(() => modal.remove(), 2500);
     if (result) {
-      // complete 已写入 active pointer；switch 只触发 supervisor 优雅重启（不热切）。
-      let restartRequested = false;
-      try {
-        await fetchJSON(`/api/profiles/${encodeURIComponent(result.profile_id)}/switch`, {
-          method: "POST",
-        });
-        restartRequested = true;
-      } catch {
-        restartRequested = false;
-      }
-      if (restartRequested) {
-        showToast("账号已就绪，正在切换并重启…", "success");
-      } else {
-        showToast("账号已创建成功，但自动重启失败，请手动重启 Binggo。", "error");
-      }
+      showToast(result.already_running
+        ? "该账号已在其他窗口运行，未覆盖 Cookie；请点击“打开窗口”。"
+        : "账号已就绪，可点击“新窗口运行”。", "success");
       try {
         await loadProfiles();
       } catch {
-        // 账号创建与重启请求已完成，列表刷新失败不得改变账号状态
+        // Profile 已持久化；列表刷新失败不改变账号状态。
       }
-      window.setTimeout(() => window.location.reload(), 3000);
     }
   } catch (error) {
     showToast(errorMessageOnboarding(error), "error");

@@ -285,6 +285,16 @@ def test_spawn_marks_child_as_supervised(
     assert os.environ[RESTART_SUPERVISED_ENV] == parent_value
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console flag only")
+def test_additional_source_runtime_hides_its_service_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.delattr(launcher.sys, "frozen", raising=False)
+    monkeypatch.setattr(launcher, "OPEN_BROWSER", False)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda _args, **kwargs: captured.update(kwargs) or _FakeProcess(0))
+    launcher._spawn_server_process()
+    assert captured["creationflags"] == launcher.CREATE_NO_WINDOW
+
+
 def test_source_command_delegates_to_launcher_supervisor(monkeypatch: pytest.MonkeyPatch) -> None:
     import scripts.run_dashboard as source_entry
 

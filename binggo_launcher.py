@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import subprocess
 import sys
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 
@@ -24,6 +26,11 @@ CREATE_NO_WINDOW = 0x08000000
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 8181 if bool(getattr(sys, "frozen", False)) else 8787
 DASHBOARD_URL = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
+RUNTIME_PROFILE_ID = ""
+INSTANCE_ID = ""
+OPEN_BROWSER = True
+_SERVER_PROC = None
+_RUNTIME_LEASE = None
 
 # 非 Windows 文件锁句柄，进程存活期间保持打开
 _LOCK_FH = None
@@ -84,7 +91,6 @@ def _port_available(host: str, port: int) -> bool:
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
         except OSError:
@@ -93,9 +99,25 @@ def _port_available(host: str, port: int) -> bool:
 
 
 def _windows_mutex_name() -> str:
-    """安装版保留原 mutex；源码版使用独立的 8787 supervisor mutex。"""
+    """The same data root and Profile share one Windows mutex in all run modes."""
+    if RUNTIME_PROFILE_ID:
+        from src.data_paths import get_data_root
 
+        root_key = os.path.normcase(str(get_data_root().resolve(strict=False))).encode("utf-8")
+        digest = hashlib.sha256(root_key).hexdigest()[:20]
+        return f"Global\\BilibiliBinggoDashboard.{digest}.{RUNTIME_PROFILE_ID}"
     return MUTEX_NAME if bool(getattr(sys, "frozen", False)) else SOURCE_MUTEX_NAME
+
+
+def _open_existing_runtime() -> None:
+    if not RUNTIME_PROFILE_ID:
+        webbrowser.open(DASHBOARD_URL)
+        return
+    from src.runtime_instances import get_runtime_instance
+
+    existing = get_runtime_instance(RUNTIME_PROFILE_ID)
+    if existing and existing["ready"]:
+        webbrowser.open(f"http://127.0.0.1:{existing['port']}/", new=1)
 
 
 def _acquire_windows_mutex() -> bool:
@@ -123,12 +145,12 @@ def _acquire_windows_mutex() -> bool:
             # ERROR_ACCESS_DENIED 通常表示同名 Global mutex 已由更高权限
             # 进程持有；与 ERROR_ALREADY_EXISTS 一样按已有实例处理。
             if error_code in {5, 183}:
-                webbrowser.open(DASHBOARD_URL)
+                _open_existing_runtime()
                 return False
             return True
         if error_code == 183:
             close_handle(handle)
-            webbrowser.open(DASHBOARD_URL)
+            _open_existing_runtime()
             return False
         _WINDOWS_MUTEX_HANDLE = handle
         return True
@@ -139,6 +161,16 @@ def _acquire_windows_mutex() -> bool:
 def _acquire_file_lock() -> bool:
     """非 Windows：fcntl 文件锁，避免双开竞态。失败则打开浏览器并退出。"""
     global _LOCK_FH
+    if RUNTIME_PROFILE_ID:
+        from src.runtime_instances import RuntimeBusyError, acquire_runtime_lock
+
+        global _RUNTIME_LEASE
+        try:
+            _RUNTIME_LEASE = acquire_runtime_lock(RUNTIME_PROFILE_ID)
+            return True
+        except RuntimeBusyError:
+            _open_existing_runtime()
+            return False
     if sys.platform == "win32":
         return True
     try:
@@ -173,14 +205,52 @@ def _acquire_file_lock() -> bool:
 def _acquire_single_instance() -> bool:
     if not _acquire_windows_mutex():
         return False
-    return _acquire_file_lock()
+    if not _acquire_file_lock():
+        _release_windows_mutex()
+        return False
+    return True
+
+
+def _release_windows_mutex() -> None:
+    global _WINDOWS_MUTEX_HANDLE
+    if _WINDOWS_MUTEX_HANDLE is not None and sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+            close_handle.argtypes = (wintypes.HANDLE,)
+            close_handle.restype = wintypes.BOOL
+            close_handle(_WINDOWS_MUTEX_HANDLE)
+        finally:
+            _WINDOWS_MUTEX_HANDLE = None
+
+
+def _release_single_instance() -> None:
+    global _RUNTIME_LEASE, _LOCK_FH
+    if _RUNTIME_LEASE is not None:
+        _RUNTIME_LEASE.release()
+        _RUNTIME_LEASE = None
+    if _LOCK_FH is not None:
+        try:
+            _LOCK_FH.close()
+        finally:
+            _LOCK_FH = None
+    _release_windows_mutex()
 
 
 def _wait_for_server(timeout_sec: float = STARTUP_TIMEOUT_SEC) -> bool:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        if _port_open(DASHBOARD_HOST, DASHBOARD_PORT):
+        if INSTANCE_ID and RUNTIME_PROFILE_ID:
+            from src.runtime_instances import runtime_ready
+
+            if runtime_ready(RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID, port=DASHBOARD_PORT):
+                return True
+        elif _port_open(DASHBOARD_HOST, DASHBOARD_PORT):
             return True
+        if _SERVER_PROC is not None and _SERVER_PROC.poll() is not None:
+            return False
         time.sleep(0.25)
     return False
 
@@ -208,8 +278,14 @@ def _spawn_server_process() -> subprocess.Popen[bytes]:
 
     env = os.environ.copy()
     env[RESTART_SUPERVISED_ENV] = "1"
+    if RUNTIME_PROFILE_ID:
+        from src.runtime_instances import RUNTIME_INSTANCE_ENV, RUNTIME_PORT_ENV, RUNTIME_PROFILE_ENV
+
+        env[RUNTIME_PROFILE_ENV] = RUNTIME_PROFILE_ID
+        env[RUNTIME_PORT_ENV] = str(DASHBOARD_PORT)
+        env[RUNTIME_INSTANCE_ENV] = INSTANCE_ID
     kwargs: dict = {"cwd": str(bundle_root()), "env": env}
-    if sys.platform == "win32" and bool(getattr(sys, "frozen", False)):
+    if sys.platform == "win32" and (bool(getattr(sys, "frozen", False)) or not OPEN_BROWSER):
         kwargs["creationflags"] = CREATE_NO_WINDOW
     return subprocess.Popen(_server_process_args(), **kwargs)
 
@@ -261,9 +337,11 @@ def _startup_failure_message(*, log_path: Path, data_root: Path, exit_code: int 
 
 def _supervise_server(*, log_path: Path, data_root: Path) -> int:
     """监督服务子进程；仅专用退出码会触发下一轮启动。"""
-    browser_opened = False
+    global _SERVER_PROC, RUNTIME_PROFILE_ID, INSTANCE_ID
+    browser_opened = not OPEN_BROWSER
     while True:
         proc = _spawn_server_process()
+        _SERVER_PROC = proc
         try:
             server_ready = _wait_for_server()
         except KeyboardInterrupt:
@@ -278,7 +356,16 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
                     exit_code=exit_code,
                 )
             )
-            return 1
+            return 3 if RUNTIME_PROFILE_ID and _port_open(DASHBOARD_HOST, DASHBOARD_PORT) else 1
+
+        if RUNTIME_PROFILE_ID:
+            from src.runtime_instances import mark_runtime_ready
+
+            try:
+                mark_runtime_ready(RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID)
+            except RuntimeError:
+                _stop_process(proc)
+                raise
 
         if not browser_opened:
             webbrowser.open(DASHBOARD_URL)
@@ -300,12 +387,26 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
                 f"Binggo 已安全退出，但端口 {DASHBOARD_PORT} 未及时释放，无法自动重新启动。"
             )
             return 1
+        if RUNTIME_PROFILE_ID:
+            from src.data_paths import get_selected_profile_id
+            from src.runtime_instances import clear_runtime, claim_runtime
+
+            target = get_selected_profile_id()
+            if target != RUNTIME_PROFILE_ID:
+                clear_runtime(RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID)
+                _release_single_instance()
+                RUNTIME_PROFILE_ID = target
+                INSTANCE_ID = uuid.uuid4().hex
+                if not _acquire_single_instance():
+                    _show_error("目标账号已经在其它窗口运行，请打开该窗口。")
+                    return 1
+                claim_runtime(target, instance_id=INSTANCE_ID, port=DASHBOARD_PORT, pid=os.getpid())
         # 专用退出码才表示 Profile 切换；父进程继续持有单实例锁，
         # 下一轮仅重启服务子进程，不重复打开浏览器。
 
 
 def run_server_mode() -> int:
-    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected
+    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected, get_runtime_profile_id
 
     try:
         if bool(getattr(sys, "frozen", False)):
@@ -315,6 +416,9 @@ def run_server_mode() -> int:
         else:
             os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(ROOT))
         ensure_data_root_selected()
+        from src.runtime_instances import acquire_service_lock
+
+        service_lease = acquire_service_lock(get_runtime_profile_id())
     except (OSError, RuntimeError) as exc:
         _show_error(str(exc))
         return 1
@@ -322,12 +426,12 @@ def run_server_mode() -> int:
     try:
         from src.app_logging import get_logger, setup_logging
         from src.app_paths import ensure_user_dirs
-        from src.dashboard_server import run_dashboard_server
+        from src.dashboard_server import get_dashboard_url, run_dashboard_server
 
         ensure_user_dirs()
         setup_logging(console=False)
         logger = get_logger("launcher")
-        logger.info("Binggo 服务进程启动，监听 %s", DASHBOARD_URL)
+        logger.info("Binggo 服务进程启动，监听 %s", get_dashboard_url())
         restart_requested = run_dashboard_server()
         return RESTART_EXIT_CODE if restart_requested else 0
     except (OSError, RuntimeError) as exc:
@@ -339,15 +443,21 @@ def run_server_mode() -> int:
         except Exception:
             pass
         return 1
+    finally:
+        service_lease.release()
 
 
 def main() -> int:
-    # Windows mutex 必须早于首次目录选择与任何 Profile 初始化，避免双开
-    # 分别选择 A/B 后互相覆盖 locator。非 Windows 文件锁也沿用同一入口。
-    if not _acquire_single_instance():
-        return 0
-
+    global RUNTIME_PROFILE_ID, INSTANCE_ID, DASHBOARD_PORT, DASHBOARD_URL, OPEN_BROWSER
+    import argparse
     from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected
+
+    parser = argparse.ArgumentParser(description="Binggo local runtime")
+    parser.add_argument("--profile")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--instance-id")
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args([value for value in sys.argv[1:] if value != SERVE_FLAG])
 
     try:
         if bool(getattr(sys, "frozen", False)):
@@ -361,32 +471,81 @@ def main() -> int:
         _show_error(str(exc))
         return 1
 
-    if not _port_available(DASHBOARD_HOST, DASHBOARD_PORT):
-        webbrowser.open(DASHBOARD_URL)
-        _show_error(
-            f"控制台已在运行中。\n\n若页面打不开，请关闭占用 {DASHBOARD_PORT} 端口的程序后重试。\n\n{DASHBOARD_URL}"
-        )
-        return 0
+    from src.data_paths import get_runtime_profile_id, initialize_data_layout, validate_profile_id
+    from src.runtime_instances import (
+        RUNTIME_PRIMARY_ENV, RUNTIME_PROFILE_ENV, RuntimeBusyError, claim_runtime, clear_runtime, get_runtime_instance,
+        reserve_runtime,
+    )
 
     try:
+        RUNTIME_PROFILE_ID = validate_profile_id(args.profile) if args.profile else get_runtime_profile_id()
+        INSTANCE_ID = args.instance_id or uuid.uuid4().hex
+        if args.instance_id and (len(args.instance_id) != 32 or not all(c in "0123456789abcdef" for c in args.instance_id)):
+            raise ValueError("instance_id 无效")
+        if args.port is not None and not 1024 <= args.port <= 65535:
+            raise ValueError("运行端口无效")
+        os.environ[RUNTIME_PROFILE_ENV] = RUNTIME_PROFILE_ID
+        OPEN_BROWSER = not args.no_browser
+        os.environ[RUNTIME_PRIMARY_ENV] = "0" if args.profile else "1"
+        if not _acquire_single_instance():
+            return 0
+        try:
+            initialize_data_layout()
+        except BaseException:
+            _release_single_instance()
+            raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        _show_error(str(exc))
+        return 1
+
+    try:
+        excluded_ports: set[int] = set()
+        preferred_port = args.port or DASHBOARD_PORT
+        while True:
+            try:
+                if args.port is None:
+                    DASHBOARD_PORT = reserve_runtime(
+                        RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID,
+                        preferred_port=preferred_port, owner_pid=os.getpid(),
+                        excluded_ports=excluded_ports,
+                    )
+                else:
+                    DASHBOARD_PORT = args.port
+                DASHBOARD_URL = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
+                if not _port_available(DASHBOARD_HOST, DASHBOARD_PORT):
+                    if args.port is not None:
+                        raise RuntimeBusyError(f"端口 {DASHBOARD_PORT} 已被占用")
+                    clear_runtime(RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID)
+                    excluded_ports.add(DASHBOARD_PORT)
+                    continue
+                claim_runtime(RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID, port=DASHBOARD_PORT, pid=os.getpid())
+                break
+            except RuntimeBusyError as exc:
+                existing = get_runtime_instance(RUNTIME_PROFILE_ID)
+                if existing and existing["ready"]:
+                    webbrowser.open(f"http://127.0.0.1:{existing['port']}/", new=1)
+                    return 0
+                _show_error(str(exc))
+                return 1
+
         from src.app_logging import log_file
         from src.app_paths import ensure_user_dirs, runtime_label, user_home
 
         ensure_user_dirs()
+        home = user_home()
+        log_path = log_file()
+        print(f"Binggo 运行模式: {runtime_label()}")
+        print(f"数据目录: {home}")
+        print(f"日志文件: {log_path}")
+        print(f"控制台: {DASHBOARD_URL}")
+        return _supervise_server(log_path=Path(log_path), data_root=home)
     except (OSError, RuntimeError) as exc:
         _show_error(str(exc))
         return 1
-
-    home = user_home()
-    # supervisor 会跨 Profile 存活，不能长期持有初始 Profile 的日志句柄；
-    # 真正的服务子进程会在每轮启动时为其固定 runtime_profile 配置日志。
-    log_path = log_file()
-    print(f"Binggo 运行模式: {runtime_label()}")
-    print(f"数据目录: {home}")
-    print(f"日志文件: {log_path}")
-    print(f"控制台: {DASHBOARD_URL}")
-
-    return _supervise_server(log_path=Path(log_path), data_root=home)
+    finally:
+        if RUNTIME_PROFILE_ID and INSTANCE_ID:
+            clear_runtime(RUNTIME_PROFILE_ID, instance_id=INSTANCE_ID)
+        _release_single_instance()
 
 
 if __name__ == "__main__":

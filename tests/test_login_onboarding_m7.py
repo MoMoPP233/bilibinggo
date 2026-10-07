@@ -70,7 +70,7 @@ def test_new_uid_creates_independent_profile(root: Path) -> None:
     result = commit_staged_login(cookie_str=COOKIE_A, nickname="newbie")
     assert result["created_new"] is True
     assert result["profile_id"] == "account-2"
-    assert result["restart_required"] is True
+    assert result["restart_required"] is False
     profile_dir = root / "profiles" / "account-2"
     assert (profile_dir / "cookies.txt").read_text(encoding="utf-8") == COOKIE_A
     metadata = json.loads((profile_dir / "profile.json").read_text(encoding="utf-8"))
@@ -80,9 +80,9 @@ def test_new_uid_creates_independent_profile(root: Path) -> None:
     assert (profile_dir / "binggo.db").exists()
     # 旧账号未受影响
     assert _old_cookie(root) == "SESSDATA=old;DedeUserID=88001"
-    # active pointer 已切到新 Profile
+    # V109 扫码只添加 Profile，不切换当前 runtime 或默认启动指针。
     pointer = json.loads((root / "active_profile.json").read_text(encoding="utf-8"))
-    assert pointer["profile_id"] == "account-2"
+    assert pointer["profile_id"] == "account-1"
 
 
 def test_failed_onboarding_leaves_no_formal_profile(root: Path, monkeypatch) -> None:
@@ -108,14 +108,9 @@ def test_create_failure_leaves_no_partial_profile(root: Path, monkeypatch) -> No
     assert pointer["profile_id"] == "account-1"
 
 
-def test_pointer_write_failure_keeps_profile_created_not_activated(root: Path, monkeypatch) -> None:
-    def boom(*a, **k):
-        raise OSError("pointer write failed")
-
-    monkeypatch.setattr("src.login_onboarding._update_active_pointer", boom)
-    with pytest.raises(OnboardingError) as exc:
-        commit_staged_login(cookie_str=COOKIE_A, nickname="x")
-    assert exc.value.code == "profile_created_not_activated"
+def test_onboarding_never_writes_active_pointer(root: Path) -> None:
+    result = commit_staged_login(cookie_str=COOKIE_A, nickname="x")
+    assert result["profile_id"] == "account-2"
     # Profile 已保留、无半成品残留
     assert (root / "profiles" / "account-2").is_dir()
     assert not list((root / "profiles").glob(".creating-*"))
@@ -126,6 +121,7 @@ def test_pointer_write_failure_keeps_profile_created_not_activated(root: Path, m
 def test_existing_uid_reuses_profile_updates_cookie(root: Path) -> None:
     # 预先标记 account-1 归属 UID 90001
     _write_profile_metadata(root / "profiles" / "account-1", profile_id="account-1", mid="90001", nickname="same")
+    (root / "profiles" / "account-1" / "cookies.txt").write_text("SESSDATA=old;DedeUserID=90001", encoding="utf-8")
     result = commit_staged_login(cookie_str=COOKIE_A, nickname="again")
     assert result["reused_existing"] is True
     assert result["profile_id"] == "account-1"
@@ -137,6 +133,7 @@ def test_existing_uid_writer_busy_zero_cookie_write(root: Path, monkeypatch) -> 
     from src.profile_writer_lease import profile_writer_acquire, profile_writer_release
 
     _write_profile_metadata(root / "profiles" / "account-1", profile_id="account-1", mid="90001", nickname="same")
+    (root / "profiles" / "account-1" / "cookies.txt").write_text("SESSDATA=old;DedeUserID=90001", encoding="utf-8")
     old_cookie = _old_cookie(root)
     lease = profile_writer_acquire(profile_id="account-1", owner="other")
     try:
@@ -217,7 +214,7 @@ def test_concurrent_same_uid_never_creates_duplicate_profile(root: Path) -> None
     assert len(owners) == 1
 
 
-def test_next_process_binds_new_active_profile(root: Path) -> None:
+def test_next_ordinary_process_keeps_default_profile_after_scan(root: Path) -> None:
     commit_staged_login(cookie_str=COOKIE_A, nickname="bind")
     root_dir = str(Path(__file__).resolve().parents[1])
     code = "\n".join([
@@ -235,7 +232,7 @@ def test_next_process_binds_new_active_profile(root: Path) -> None:
         timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "account-2"
+    assert proc.stdout.strip() == "account-1"
 
 
 # ---------- E/F/L/U/W：新 Profile 隔离 + 默认能力 + 无 .creating 泄漏 ----------

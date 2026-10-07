@@ -1,18 +1,17 @@
-"""M7：扫码登录新账号 → 自动创建/复用独立 Profile（staging onboarding commit）。
+"""扫码登录新账号 → 创建/复用独立 Profile（staging onboarding commit）。
 
 设计：
 - 扫码阶段与正式 Profile 完全隔离：只产生内存/staging Cookie，绝不写当前 Profile。
 - UID 必须来自本次 staged Cookie（DedeUserID）；拿不到 UID → onboarding 失败。
 - commit 时进入极窄 ProfileRegistryLease：UID 二次查重 → 分配 account-N →
   `.creating-*` 初始化（profile.json/cookies/DB）→ durable 后 atomic publish →
-  原子写 active pointer → 释放 registry（restart 由上层现有机制触发）。
+  释放 registry；V109 只刷新 Profile 列表，不改默认启动指针或自动重启。
 - 已有 UID：RegistryLease 内确认 → 释放 registry → 获取该 ProfileWriterLease →
-  安全更新 Cookie/profile metadata（busy → 0 写入 fail-closed）→ 写 pointer。
+  非运行目标才安全更新 Cookie/profile metadata（busy → 0 写入 fail-closed）。
 - V18 保护：active pointer invalid/unreadable/dangling 时 onboarding fail-closed
   （不自动覆盖/回退/降级为第一个 Profile）；missing 视为用户显式选择的合法前置状态。
 - 锁顺序恒定 RegistryLease → ProfileWriterLease；绝不反向。
-- 失败语义：rename 前失败 → 无正式半成品（.creating 不进入列表/忽略）；
-  rename 成功但 pointer 写失败 → 保留新 Profile + 旧 pointer，返回 created_not_activated。
+- 失败语义：rename 前失败 → 无正式半成品（.creating 不进入列表/忽略）。
 """
 from __future__ import annotations
 
@@ -39,13 +38,13 @@ except ImportError:  # pragma: no cover
 _logger = get_logger("login_onboarding")
 
 from src.data_paths import (
-    get_active_profile_path,
     get_atomic_path_lock,
     get_data_root,
     get_profile_dir,
     get_profile_metadata_path,
     get_profiles_dir,
     read_active_profile_pointer_state,
+    validate_profile_id,
 )
 from src.profile_manager import get_profile_metadata, sweep_stale_creating_profiles
 from src.profile_writer_lease import (
@@ -102,14 +101,25 @@ def _existing_profile_for_uid(uid: str) -> str | None:
         if not directory.is_dir():
             continue
         name = directory.name
-        if not _ACCOUNT_ID_RE.match(name) or name.startswith(".creating-"):
+        try:
+            validate_profile_id(name)
+        except ValueError:
             continue
         metadata = directory / "profile.json"
         try:
             raw = json.loads(metadata.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            continue
-        if str(raw.get("mid") or "") == str(uid):
+            raw = {}
+        mid = str(raw.get("mid") or "") if isinstance(raw, dict) else ""
+        try:
+            cookie_text = (directory / "cookies.txt").read_text(encoding="utf-8")
+        except OSError:
+            cookie_text = ""
+        cookie_match = _UID_RE.search(cookie_text)
+        cookie_mid = cookie_match.group(1).strip() if cookie_match else ""
+        if mid == str(uid) or cookie_mid == str(uid):
+            if mid and cookie_mid and mid != cookie_mid:
+                raise OnboardingError("profile_identity_conflict", "已有 Profile 的 MID 与本地 Cookie 不一致，已停止复用。")
             return name
     return None
 
@@ -187,13 +197,6 @@ def _init_profile_db(profile_dir: Path) -> None:
         )
 
 
-def _update_active_pointer(profile_id: str) -> None:
-    _atomic_write_text(
-        get_active_profile_path(),
-        json.dumps({"profile_id": profile_id}, ensure_ascii=False, indent=2) + "\n",
-    )
-
-
 def _publish_new_profile(*, uid: str, nickname: str, cookie_str: str, attempt_id: str) -> str:
     profiles_dir = get_profiles_dir()
     profiles_dir.mkdir(parents=True, exist_ok=True)
@@ -221,13 +224,26 @@ def _save_cookie_into_existing_profile(profile_id: str, *, uid: str, nickname: s
     profile_dir = get_profile_dir(profile_id)
     if not profile_dir.is_dir():
         raise OnboardingError("profile_missing", f"目标 Profile 不存在：{profile_id}")
-    with profile_writer_lease(profile_id=profile_id, owner="onboarding:relogin"):
-        # 双保险：WriterLease 内再次核对 UID 归属
-        current = _existing_profile_for_uid(uid)
-        if current != profile_id:
-            raise OnboardingError("uid_mismatch", "Profile 与 UID 归属不一致，已停止")
-        write_text_secret(profile_dir / "cookies.txt", cookie_str)
-        _write_profile_metadata(profile_dir, profile_id=profile_id, mid=uid, nickname=nickname)
+    from src.runtime_instances import RuntimeBusyError, acquire_runtime_lock, get_runtime_instance
+
+    if get_runtime_instance(profile_id):
+        raise OnboardingError("profile_running", "该账号已经运行，未覆盖运行中的 Cookie；请打开已有窗口。")
+    try:
+        runtime_lease = acquire_runtime_lock(profile_id)
+    except RuntimeBusyError as exc:
+        raise OnboardingError("profile_running", "该账号已经运行，未覆盖运行中的 Cookie；请打开已有窗口。") from exc
+    try:
+        if get_runtime_instance(profile_id):
+            raise OnboardingError("profile_running", "该账号正在启动，未覆盖 Cookie。")
+        with profile_writer_lease(profile_id=profile_id, owner="onboarding:relogin"):
+            # 双保险：WriterLease 内再次核对 UID 归属
+            current = _existing_profile_for_uid(uid)
+            if current != profile_id:
+                raise OnboardingError("uid_mismatch", "Profile 与 UID 归属不一致，已停止")
+            write_text_secret(profile_dir / "cookies.txt", cookie_str)
+            _write_profile_metadata(profile_dir, profile_id=profile_id, mid=uid, nickname=nickname)
+    finally:
+        runtime_lease.release()
 
 
 def commit_staged_login(
@@ -271,39 +287,41 @@ def _commit_staged_login_impl(
                 uid=str(resolved_uid), nickname=str(nickname or ""),
                 cookie_str=cookie_str, attempt_id=attempt_id,
             )
-            try:
-                _update_active_pointer(profile_id)
-            except Exception as exc:  # noqa: BLE001
-                # rename 已成功但 pointer 失败：保留新 Profile、旧 pointer 不变。
-                raise OnboardingError(
-                    "profile_created_not_activated",
-                    f"新 Profile {profile_id} 已创建但激活指针更新失败（{exc}），"
-                    "请稍后手动选择该账号后重启",
-                ) from exc
             return {
                 "profile_id": profile_id,
                 "uid": str(resolved_uid),
                 "display_name": str(nickname or ""),
                 "created_new": True,
                 "reused_existing": False,
-                "restart_required": True,
+                "restart_required": False,
+                "already_running": False,
             }
 
     # existing UID 重登录：registry 已释放
     if existing is not None:
+        from src.runtime_instances import get_runtime_instance
+
+        if get_runtime_instance(existing):
+            return {
+                "profile_id": existing,
+                "uid": str(resolved_uid),
+                "display_name": str(nickname or ""),
+                "created_new": False,
+                "reused_existing": True,
+                "restart_required": False,
+                "already_running": True,
+            }
         _save_cookie_into_existing_profile(
             existing, uid=str(resolved_uid), nickname=str(nickname or ""), cookie_str=cookie_str
         )
-        # pointer 指向已有 Profile（短 registry 临界区）
-        with profile_registry_lease(owner="onboarding:activate"):
-            _update_active_pointer(existing)
         return {
             "profile_id": existing,
             "uid": str(resolved_uid),
             "display_name": str(nickname or ""),
             "created_new": False,
             "reused_existing": True,
-            "restart_required": True,
+            "restart_required": False,
+            "already_running": False,
         }
     raise OnboardingError("unreachable", "unreachable")  # pragma: no cover
 
@@ -499,7 +517,7 @@ def onboarding_complete(onboarding_id: str, *, nickname: str = "") -> dict[str, 
         raise
     # uid（DedeUserID）不写入 receipt / 返回体，保持 sanitized
     sanitized_result = {key: value for key, value in dict(result).items() if key != "uid"}
-    # Profile/pointer 已确定：构造并原子 durable 保存 sanitized completed receipt（无任何 secret）
+    # Profile 已确定：构造并原子 durable 保存 sanitized completed receipt（无任何 secret）
     completed = {
         "onboarding_id": onboarding_id,
         "status": "completed",

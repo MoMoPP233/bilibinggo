@@ -189,7 +189,7 @@ describe("profiles onboarding main flow", () => {
       (call) => call[1] && (call[1] as { method?: string }).method === "POST" && String(call[0]) === "/api/profiles",
     );
     expect(postCreates).toEqual([]); // 没有先 POST /api/profiles 建空 Profile
-    expect(urls.some((u) => u === "/api/profiles/account-2/switch")).toBe(true);
+    expect(urls.some((u) => u === "/api/profiles/account-2/switch")).toBe(false);
     expect(urls.some((u) => u === "/api/accounts/onboarding/o1/poll")).toBe(true);
     expect(urls.some((u) => u === COMPLETE_PATH)).toBe(true);
     expect(wrongCompleteCalls()).toEqual([]);
@@ -264,7 +264,7 @@ describe("profiles onboarding main flow", () => {
     expect(errorToasts()).toEqual([]);
   });
 
-  it("CASE 21+22: success calls complete and switches with the real profile_id", async () => {
+  it("CASE 21+22: success calls complete and only refreshes the Profile list", async () => {
     await load();
     installBackend({
       onboardingId: "o-ok",
@@ -287,11 +287,11 @@ describe("profiles onboarding main flow", () => {
     const completeCall = mocks.fetchJSON.mock.calls.find((call) => String(call[0]) === COMPLETE_PATH);
     expect((completeCall?.[1] as { method?: string } | undefined)?.method).toBe("POST");
     expect(JSON.stringify(completeCall?.[1])).toContain("o-ok");
-    expect(switchCalls()).toEqual(["/api/profiles/account-x/switch"]);
+    expect(switchCalls()).toEqual([]);
     expect(
       mocks.fetchJSON.mock.calls.every((call) => !String(call[0]).includes("undefined")),
     ).toBe(true);
-    expect(mocks.showToast).toHaveBeenCalledWith("账号已就绪，正在切换并重启…", "success");
+    expect(mocks.showToast).toHaveBeenCalledWith("账号已就绪，可点击“新窗口运行”。", "success");
   });
 
   it("CASE 23: missing result fails explicitly instead of running on undefined", async () => {
@@ -541,7 +541,7 @@ describe("profiles onboarding main flow", () => {
     );
   });
 
-  it("V30 CASE 18-20: switch failure keeps the account result and asks for a manual restart", async () => {
+  it("V109: onboarding never invokes switch even if that endpoint would fail", async () => {
     await load();
     installBackend({
       onboardingId: "o-switchfail",
@@ -554,11 +554,8 @@ describe("profiles onboarding main flow", () => {
     await vi.advanceTimersByTimeAsync(2100);
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(mocks.showToast).toHaveBeenCalledWith(
-      "账号已创建成功，但自动重启失败，请手动重启 Binggo。",
-      "error",
-    );
-    expect(switchCalls()).toEqual(["/api/profiles/account-9/switch"]);
+    expect(mocks.showToast).toHaveBeenCalledWith("账号已就绪，可点击“新窗口运行”。", "success");
+    expect(switchCalls()).toEqual([]);
     expect(completeCalls()).toHaveLength(1); // 不重复 complete
     expect(startCalls()).toHaveLength(1); // 不重新扫码
     expect(pollCalls()).toHaveLength(1);
@@ -578,7 +575,7 @@ describe("profiles onboarding main flow", () => {
     await vi.advanceTimersByTimeAsync(2100);
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(mocks.showToast).toHaveBeenCalledWith("账号已就绪，正在切换并重启…", "success");
+    expect(mocks.showToast).toHaveBeenCalledWith("账号已就绪，可点击“新窗口运行”。", "success");
     expect(
       mocks.showToast.mock.calls.some((call) => String(call[0]).includes("账号创建失败")),
     ).toBe(false);

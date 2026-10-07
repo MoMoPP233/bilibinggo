@@ -25,45 +25,51 @@ def main() -> int:
         print("请先安装依赖: pip install -r requirements.txt", file=sys.stderr)
         return 1
 
-    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected
+    from src.data_paths import LEGACY_DATA_ROOT_ENV, ensure_data_root_selected, get_runtime_profile_id
 
     try:
         os.environ.setdefault(LEGACY_DATA_ROOT_ENV, str(ROOT))
         ensure_data_root_selected()
+        from src.runtime_instances import acquire_service_lock
+
+        service_lease = acquire_service_lock(get_runtime_profile_id())
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    from src.app_logging import setup_logging
-    from src.app_paths import ensure_user_dirs
-    from src.dashboard_server import DASHBOARD_URL, run_dashboard_server
-
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    ensure_user_dirs()
-    log_path = setup_logging()
-    print(f"日志文件: {log_path}")
-    print(f"控制台地址: {DASHBOARD_URL}")
     try:
-        from src.config_health import log_config_health
+        from src.app_logging import setup_logging
+        from src.app_paths import ensure_user_dirs
+        from src.dashboard_server import DASHBOARD_URL, run_dashboard_server
 
-        log_config_health(force=True)
-    except Exception as exc:
-        print(f"配置自检跳过: {exc}", file=sys.stderr)
-    dist_index = ROOT / "web" / "static" / "dist" / "index.html"
-    if not dist_index.exists():
-        print(
-            "未找到 web/static/dist。开发请另开: cd web/frontend && npm run dev\n"
-            "生产请先: cd web/frontend && npm ci && npm run build",
-            file=sys.stderr,
-        )
-    restart_requested = run_dashboard_server()
-    if restart_requested:
-        from src.restart_control import RESTART_EXIT_CODE
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-        return RESTART_EXIT_CODE
-    return 0
+        ensure_user_dirs()
+        log_path = setup_logging()
+        print(f"日志文件: {log_path}")
+        print(f"控制台地址: {DASHBOARD_URL}")
+        try:
+            from src.config_health import log_config_health
+
+            log_config_health(force=True)
+        except Exception as exc:
+            print(f"配置自检跳过: {exc}", file=sys.stderr)
+        dist_index = ROOT / "web" / "static" / "dist" / "index.html"
+        if not dist_index.exists():
+            print(
+                "未找到 web/static/dist。开发请另开: cd web/frontend && npm run dev\n"
+                "生产请先: cd web/frontend && npm ci && npm run build",
+                file=sys.stderr,
+            )
+        restart_requested = run_dashboard_server()
+        if restart_requested:
+            from src.restart_control import RESTART_EXIT_CODE
+
+            return RESTART_EXIT_CODE
+        return 0
+    finally:
+        service_lease.release()
 
 
 if __name__ == "__main__":

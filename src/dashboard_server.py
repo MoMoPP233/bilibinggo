@@ -17,6 +17,15 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 def get_dashboard_port() -> int:
     """源码/开发模式用 8787，Windows 安装包用 8181。"""
+    explicit = os.environ.get("BINGGO_RUNTIME_PORT", "").strip()
+    if explicit:
+        try:
+            port = int(explicit)
+        except ValueError as exc:
+            raise RuntimeError("显式控制台端口无效") from exc
+        if not 1024 <= port <= 65535:
+            raise RuntimeError("显式控制台端口超出允许范围")
+        return port
     return PACKAGED_DASHBOARD_PORT if is_frozen() else DEV_DASHBOARD_PORT
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,11 @@ from src.llm_settings import (
 from src.sources.common import is_valid_dynamic_id, load_previous_output
 from src.state_store import get_watch_last_synced_at
 from src.profile_manager import create_profile, delete_profile, list_profiles, set_active_profile
+from src.runtime_instances import (
+    RUNTIME_INSTANCE_ENV, RUNTIME_PRIMARY_ENV, RuntimeBusyError, get_runtime_instance,
+    list_runtime_instances,
+)
+from src.runtime_launch import launch_existing_profile
 from src.restart_control import (
     RestartPendingError,
     RestartUnavailableError,
@@ -334,16 +340,62 @@ def _selected_binding_or_none() -> str | None:
 def api_profiles() -> dict[str, Any]:
     runtime_profile_id = _runtime_binding_or_none()
     active_profile_id = _selected_binding_or_none()
-    active_profile_id = _selected_binding_or_none()
+    instances = list_runtime_instances()
+    profiles = list_profiles()
+    for profile in profiles:
+        running = instances.get(profile["profile_id"])
+        profile["running"] = bool(running)
+        profile["runtime_port"] = running["port"] if running and running["ready"] else None
+        profile["runtime_ready"] = bool(running and running["ready"])
     return {
         "runtime_profile_id": runtime_profile_id,
         "active_profile_id": active_profile_id,
         "restart_required": bool(
-            runtime_profile_id and active_profile_id and active_profile_id != runtime_profile_id
+            os.environ.get(RUNTIME_PRIMARY_ENV, "1") == "1"
+            and runtime_profile_id and active_profile_id and active_profile_id != runtime_profile_id
         ),
         "data_root": str(get_data_root()),
-        "profiles": list_profiles(),
+        "profiles": profiles,
     }
+
+
+@app.get("/api/runtime/ready", tags=["stable"])
+def api_runtime_ready() -> dict[str, Any]:
+    from os import environ
+    from src.dashboard_server import get_dashboard_port
+
+    return {
+        "ready": True,
+        "profile_id": _runtime_binding_or_none(),
+        "instance_id": environ.get(RUNTIME_INSTANCE_ENV, ""),
+        "port": get_dashboard_port(),
+    }
+
+
+@app.post("/api/profiles/{profile_id}/launch", tags=["stable"])
+def api_launch_profile(profile_id: str, request: Request) -> dict[str, Any]:
+    # LocalControlPlaneGuard rejects non-loopback Host/Origin. This high-impact
+    # route additionally rejects browser requests from another localhost port.
+    origin = request.headers.get("origin")
+    if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "仅允许当前 Binggo 页面启动账号。", status_code=403)
+    length = request.headers.get("content-length", "0")
+    if length != "0" or request.headers.get("transfer-encoding"):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "新窗口运行只接受 URL 中的 Profile ID，不接受请求参数。")
+    if profile_id == _runtime_binding_or_none():
+        raise AppError(ErrorCode.VALIDATION_ERROR, "当前账号已在此窗口运行。")
+    try:
+        with restart_control.new_work_guard():
+            result = launch_existing_profile(profile_id)
+    except RestartPendingError:
+        _raise_restart_pending()
+    except (RuntimeBusyError, ValueError) as exc:
+        raise AppError(ErrorCode.JOB_BUSY, str(exc)) from exc
+    except RuntimeError as exc:
+        raise AppError(ErrorCode.INTERNAL, str(exc)) from exc
+    except OSError as exc:
+        raise AppError(ErrorCode.INTERNAL, f"启动账号失败：{exc}") from exc
+    return {"ok": True, **result}
 
 
 @app.post("/api/profiles", tags=["stable"])
@@ -421,6 +473,9 @@ def api_switch_profile(profile_id: str, background_tasks: BackgroundTasks) -> di
 
     def transition() -> dict[str, str]:
         _require_profile_operations_idle(switching=True)
+        existing = get_runtime_instance(profile_id)
+        if existing:
+            raise ValueError("目标账号已在其它窗口运行，请使用“打开窗口”。")
         return set_active_profile(profile_id)
 
     try:

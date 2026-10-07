@@ -374,7 +374,15 @@ def get_runtime_profile_id() -> str:
     global _runtime_profile_id, _runtime_data_root
     root = get_data_root().resolve(strict=False)
     if _runtime_profile_id is None:
-        selected = get_selected_profile_id()  # 可能抛 ActiveProfileStateError
+        # The supervisor passes this only to its own service child, before any
+        # Profile-local module is imported. A running process never re-reads it.
+        explicit = os.environ.get("BINGGO_RUNTIME_PROFILE_ID", "").strip()
+        if explicit:
+            selected = validate_profile_id(explicit)
+            if not (get_profiles_dir() / selected).is_dir():
+                raise ActiveProfileStateError(f"显式运行 Profile 不存在：{selected}")
+        else:
+            selected = get_selected_profile_id()  # 可能抛 ActiveProfileStateError
         _runtime_profile_id = selected
         _runtime_data_root = root
     elif _runtime_data_root != root:
@@ -631,17 +639,21 @@ def initialize_data_layout() -> str:
             selected = pointer_pid  # type: ignore[assignment]
         elif kind == "missing":
             selected = get_selected_profile_id()
+        elif os.environ.get("BINGGO_RUNTIME_PROFILE_ID", "").strip():
+            # An explicit runtime is independent of the default-start pointer.
+            # Do not repair a corrupt pointer here; simply leave it untouched.
+            selected = None
         else:
             raise ActiveProfileStateError(
                 f"active_profile.json 状态异常（{kind}），已拒绝隐式选择与自动改写；"
                 "请通过界面重新选择账号后重启 Binggo"
             )
-        if selected not in existing:
+        if selected is not None and selected not in existing:
             raise ActiveProfileStateError(
                 f"active_profile.json 指向的 Profile 不存在（{selected}），"
                 "请通过界面重新选择账号后重启 Binggo"
             )
-        if _read_json(active_path).get("profile_id") != selected:
+        if selected is not None and _read_json(active_path).get("profile_id") != selected:
             _write_json_atomic(active_path, {"profile_id": selected})
 
     # 运行时快照若已在导入期确定，必须与迁移的确定性初始 ID 一致。

@@ -211,4 +211,59 @@ describe("profiles", () => {
       ),
     ).toHaveLength(1);
   });
+
+  it("V109 renders current, idle, and other-running Profile actions distinctly", async () => {
+    const { loadProfiles } = await import("./index");
+    await loadProfiles();
+    expect(document.querySelector('[data-profile-launch="account-1"]')).toBeNull();
+    expect(document.querySelector('[data-profile-launch="account-2"]')).not.toBeNull();
+    expect(document.querySelector('[data-profile-activate="account-2"]')).not.toBeNull();
+
+    fetchJSONMock.mockResolvedValueOnce({
+      ...payload,
+      profiles: [payload.profiles[0], {
+        ...payload.profiles[1], running: true, runtime_ready: true, runtime_port: 8182,
+      }],
+    });
+    await loadProfiles();
+    expect(document.querySelector('[data-profile-launch="account-2"]')).toBeNull();
+    expect(document.querySelector('[data-profile-open="account-2"]')).not.toBeNull();
+    expect((document.querySelector('[data-profile-delete="account-2"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("V109 opens an already-running Profile without launching a third instance", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    fetchJSONMock.mockResolvedValueOnce({
+      ...payload,
+      profiles: [payload.profiles[0], {
+        ...payload.profiles[1], running: true, runtime_ready: true, runtime_port: 8182,
+      }],
+    });
+    const { bindProfiles, loadProfiles } = await import("./index");
+    bindProfiles();
+    await loadProfiles();
+    (document.querySelector('[data-profile-open="account-2"]') as HTMLButtonElement).click();
+    expect(open).toHaveBeenCalledWith("http://127.0.0.1:8182/", "_blank");
+    expect(fetchJSONMock.mock.calls.some(([url]) => String(url).endsWith("/launch"))).toBe(false);
+    open.mockRestore();
+  });
+
+  it("V109 blocks duplicate new-window clicks while the launch is pending", async () => {
+    let resolveLaunch: ((value: unknown) => void) | undefined;
+    fetchJSONMock.mockImplementation((url: string) => {
+      if (url === "/api/profiles/account-2/launch") {
+        return new Promise((resolve) => { resolveLaunch = resolve; });
+      }
+      return Promise.resolve(payload);
+    });
+    const { bindProfiles, loadProfiles } = await import("./index");
+    bindProfiles();
+    await loadProfiles();
+    const button = document.querySelector('[data-profile-launch="account-2"]') as HTMLButtonElement;
+    button.click();
+    button.click();
+    expect(fetchJSONMock.mock.calls.filter(([url]) => url === "/api/profiles/account-2/launch")).toHaveLength(1);
+    resolveLaunch?.({ already_running: false, ready: true, browser_opened: true, url: "http://127.0.0.1:8182/" });
+    await vi.waitFor(() => expect(showToastMock).toHaveBeenCalledWith("账号已在新窗口启动。", "success"));
+  });
 });

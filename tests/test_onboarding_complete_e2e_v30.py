@@ -168,7 +168,7 @@ def test_new_uid_complete_creates_profile_and_switch_succeeds(
     assert result["profile_id"] == "account-2"
     assert result["created_new"] is True
     assert result["reused_existing"] is False
-    assert result["restart_required"] is True
+    assert result["restart_required"] is False
     assert "uid" not in result
     # V31：complete 后全部 onboarding secret 清理，receipt sanitized
     assert not (secrets_dir / f"{onboarding_id}.cookie").exists()
@@ -185,7 +185,7 @@ def test_new_uid_complete_creates_profile_and_switch_succeeds(
     assert _db_integrity(db) == "ok"
 
     pointer = json.loads((root / "active_profile.json").read_text(encoding="utf-8"))
-    assert pointer["profile_id"] == "account-2"
+    assert pointer["profile_id"] == "account-1"
 
     profiles = client.get("/api/profiles")
     assert profiles.status_code == 200
@@ -206,6 +206,9 @@ def test_existing_uid_reuses_profile_without_duplicate(
     (root / "profiles" / "account-1" / "profile.json").write_text(
         json.dumps({"profile_id": "account-1", "mid": "90001", "nickname": "same"}),
         encoding="utf-8",
+    )
+    (root / "profiles" / "account-1" / "cookies.txt").write_text(
+        "SESSDATA=old;DedeUserID=90001", encoding="utf-8"
     )
     onboarding_id = _scan_to_staged(root, monkeypatch, dede_user_id="90001")
 
@@ -249,14 +252,14 @@ def test_complete_switch_failure_keeps_pointer_for_manual_restart(
     complete = client.post(COMPLETE_PATH, json={"onboarding_id": onboarding_id})
     assert complete.status_code == 200
 
-    # switch 不可用（未启用 supervised restart）→ 503，但 active pointer 已由 complete 写好
+    # switch 不可用（未启用 supervised restart）→ 503；扫码本身不改默认指针。
     _patch_idle(monkeypatch)
     switch = client.post("/api/profiles/account-2/switch")
     assert switch.status_code == 503
 
     pointer = json.loads((root / "active_profile.json").read_text(encoding="utf-8"))
-    assert pointer["profile_id"] == "account-2"
-    # 下一次启动/读取 pointer 即绑定 account-2
+    assert pointer["profile_id"] == "account-1"
+    # 下一次普通启动仍绑定原账号，除非用户主动切换。
     from src.profile_manager import get_active_profile
 
-    assert get_active_profile()["profile_id"] == "account-2"
+    assert get_active_profile()["profile_id"] == "account-1"
