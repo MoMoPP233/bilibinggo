@@ -73,15 +73,35 @@ function buildActivityActions(item) {
   return `<div class="activity-row-actions">${buildActivityParticipateBtn(item)}${renderActivityDeleteButton(item)}</div>`;
 }
 
+const deletingFailureIds = new Set();
+
 async function deleteActivityFailure(dynamicId) {
-  if (!dynamicId) return;
+  if (!dynamicId || deletingFailureIds.has(dynamicId)) return;
   if (!window.confirm("只删除本地失败记录，不会操作 B 站内容。")) return;
+  deletingFailureIds.add(dynamicId);
   try {
-    await fetchJSON(`/api/activity-failures/${encodeURIComponent(dynamicId)}`, { method: "DELETE" });
-    await loadActivities();
-    showToast("失败记录已删除", "success");
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : "删除失败记录失败", "error");
+    let result;
+    try {
+      result = await fetchJSON(`/api/activity-failures/${encodeURIComponent(dynamicId)}`, { method: "DELETE" });
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "删除失败记录失败", "error");
+      return;
+    }
+    let refreshFailed = false;
+    try {
+      await loadActivities();
+    } catch {
+      refreshFailed = true;
+    }
+    if (result?.deleted === true) {
+      showToast(refreshFailed ? "失败记录已删除，但列表刷新失败" : "失败记录已删除", refreshFailed ? "info" : "success");
+    } else if (result?.deleted === false) {
+      showToast(refreshFailed ? "失败记录已不存在，列表刷新失败" : "失败记录已不存在", "info");
+    } else {
+      showToast("删除结果无法确认，请刷新列表核实", "info");
+    }
+  } finally {
+    deletingFailureIds.delete(dynamicId);
   }
 }
 
