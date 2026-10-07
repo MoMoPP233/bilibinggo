@@ -127,6 +127,14 @@ def test_unknown_mutation_keeps_friendly_barrier(monkeypatch, isolated_home):
     _setup(monkeypatch, isolated_home)
     client = ReadClient()
 
+    def successful_pre_repost_post(url, data, **kwargs):
+        client.posts.append(url)
+        # This case tests an unknown repost. Keep the preceding favorite
+        # explicitly confirmed so V98 does not stop at an uncertain favorite.
+        return {"code": 75008} if url == action_mod.COSMO_SIMPLE_ACTION_URL else {"code": 0}
+
+    client.post_json = successful_pre_repost_post
+
     def fail_post(url, data, **kwargs):
         client.posts.append(url)
         if url == action_mod.REPOST_URL:

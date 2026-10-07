@@ -24,6 +24,11 @@ from src.comment_confirmation import (
     confirm_comment,
     get_comment_status,
 )
+from src.favorite_confirmation import (
+    _get_favorite_status_unlocked,
+    _set_favorite_status_unlocked,
+    favorite_mutation_gate,
+)
 from src.invalid_activities import is_self_follow_failure
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
 from src.platform_risk import API_RISK_CODES, risk_code_of as _risk_code_of
@@ -530,9 +535,11 @@ def _opus_favorite_status(client: BilibiliClient, *, dynamic_id: str, referer: s
             referer=referer,
             retries=0,
         )
-    except (RuntimeError, httpx.HTTPError, json.JSONDecodeError):
+    except (RuntimeError, httpx.HTTPError, json.JSONDecodeError) as exc:
+        _raise_exc_risk(exc)
         return None
     if _api_code(payload) != 0:
+        _raise_payload_risk(payload, "收藏状态读取")
         return None
     item = (payload.get("data") or {}).get("item") or {}
     return _stat_flag(_extract_module_stat(item), "favorite")
@@ -646,45 +653,93 @@ def favorite_dynamic(
     known_status: bool | None | object = _UNSET,
 ) -> ActionResult:
     client = client.raw_client if isinstance(client, ParticipationReadClient) else client
-    status = (
-        is_favorited(client, dynamic_id=dynamic_id, referer=referer)
-        if known_status is _UNSET else known_status
-    )
-    if status is True:
-        return ActionResult("favorite", True, "已收藏，跳过")
-    if status is not False:
-        raise ParticipationReadError("当前目标的收藏状态未知，未执行收藏")
+    # The API target is the dynamic ID itself (entity.object_id_str), never
+    # comment_rid or a guessed opus/article ID. Validate before any POST.
+    with favorite_mutation_gate():
+        _, my_uid = require_login()
+        guard = _get_favorite_status_unlocked(dynamic_id, uid=my_uid)
+        if guard == "confirmed":
+            logger.info("收藏防重：已确认，跳过 dynamic_id=%s", dynamic_id)
+            return ActionResult("favorite", True, "本地已确认收藏，跳过")
+        if guard in {"pending", "unknown"}:
+            logger.warning("收藏防重阻止重复请求 status=%s dynamic_id=%s", guard, dynamic_id)
+            raise RuntimeError("收藏结果未知，已阻止自动重试，需人工确认")
 
-    payload = client.post_json(
-        COSMO_SIMPLE_ACTION_URL,
-        {
-            "meta": {
-                "spmid": "444.42.0.0",
-                "from_spmid": "333.1365.0.0",
-                "from": "unknown",
-            },
-            "entity": {
-                "object_id_str": dynamic_id,
-                "type": {"biz": 2},
-            },
-            "action": 3,
-        },
-        params={"csrf": csrf},
-        referer=referer,
-        raise_on_code=False,
-        retries=0,
-    )
-    code = _api_code(payload)
-    message = _api_message(payload)
-    if code == 0:
-        if is_favorited(client, dynamic_id=dynamic_id, referer=referer) is True:
-            return ActionResult("favorite", True, "")
-        return ActionResult("favorite", False, message or "收藏状态未确认，未继续查询")
-    if code in (65006, 75008):
-        return ActionResult("favorite", True, message or "已收藏")
-    _raise_payload_auth(payload, "收藏")
-    _raise_payload_risk(payload, "收藏")
-    return ActionResult("favorite", False, f"code={code} {message}".strip())
+        status = (
+            is_favorited(client, dynamic_id=dynamic_id, referer=referer)
+            if known_status is _UNSET else known_status
+        )
+        if status is True:
+            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="confirmed")
+            return ActionResult("favorite", True, "已收藏，跳过")
+        if status is not False:
+            raise ParticipationReadError("当前目标的收藏状态未知，未执行收藏")
+
+        _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="pending")
+        logger.info("收藏请求已准备，pending 已持久化 dynamic_id=%s", dynamic_id)
+        try:
+            payload = client.post_json(
+                COSMO_SIMPLE_ACTION_URL,
+                {
+                    "meta": {
+                        "spmid": "444.42.0.0",
+                        "from_spmid": "333.1365.0.0",
+                        "from": "unknown",
+                    },
+                    "entity": {
+                        "object_id_str": dynamic_id,
+                        "type": {"biz": 2},
+                    },
+                    "action": 3,
+                },
+                params={"csrf": csrf},
+                referer=referer,
+                raise_on_code=False,
+                retries=0,
+            )
+        except Exception as exc:
+            logger.warning("收藏请求异常 category=%s dynamic_id=%s", type(exc).__name__, dynamic_id)
+            try:
+                _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="unknown")
+            except Exception:
+                logger.exception("收藏 unknown 写入失败，保留 pending 阻止重发 dynamic_id=%s", dynamic_id)
+            _raise_exc_risk(exc)
+            raise
+
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if type(code) is not int:
+            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="unknown")
+            logger.warning("收藏响应缺少可靠 code，已保留防重 dynamic_id=%s", dynamic_id)
+            raise RuntimeError("收藏结果未知：响应缺少有效 code，已阻止自动重试")
+        message = _api_message(payload)
+        if code == 0:
+            try:
+                confirmed = is_favorited(client, dynamic_id=dynamic_id, referer=referer)
+            except Exception as exc:
+                try:
+                    _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="unknown")
+                except Exception:
+                    logger.exception("收藏复核异常且 unknown 写入失败，保留 pending dynamic_id=%s", dynamic_id)
+                _raise_exc_risk(exc)
+                raise
+            if confirmed is True:
+                _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="confirmed")
+                return ActionResult("favorite", True, "")
+            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="unknown")
+            logger.warning("收藏响应成功但远端状态未确认，已保留防重 dynamic_id=%s", dynamic_id)
+            raise RuntimeError("收藏结果未知：远端状态未确认，已阻止自动重试")
+        if code in (65006, 75008):
+            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="confirmed")
+            return ActionResult("favorite", True, message or "已收藏")
+        if code in {-101, 401, -352, -509}:
+            # Structured authentication/risk responses explicitly reject the
+            # request; preserve their established propagation semantics.
+            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="failed")
+            _raise_payload_auth(payload, "收藏")
+            _raise_payload_risk(payload, "收藏")
+        # Unknown business codes do not prove that no favorite was performed.
+        _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="unknown")
+        raise RuntimeError(f"收藏结果未知，已阻止自动重试：code={code} {message}".strip())
 
 
 def repost_dynamic(

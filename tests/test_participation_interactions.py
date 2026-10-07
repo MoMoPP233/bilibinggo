@@ -304,7 +304,8 @@ def test_confirmation_write_failure_leaves_pending(isolated_home, monkeypatch):
     raw.post_form.assert_called_once()
 
 
-def test_favorite_uses_snapshot_before_post_and_one_fresh_after_read():
+def test_favorite_uses_snapshot_before_post_and_one_fresh_after_read(isolated_home, monkeypatch):
+    monkeypatch.setattr(actions, "require_login", lambda: ("test", UID))
     raw = Mock()
     raw.post_json.return_value = {"code": 0}
     raw.get_json.return_value = {"code": 0, "data": {"item": _detail(favorite=True)}}
@@ -318,7 +319,8 @@ def test_favorite_uses_snapshot_before_post_and_one_fresh_after_read():
     assert raw.get_json.call_args.kwargs["retries"] == 0
 
 
-def test_unknown_favorite_state_never_posts():
+def test_unknown_favorite_state_never_posts(isolated_home, monkeypatch):
+    monkeypatch.setattr(actions, "require_login", lambda: ("test", UID))
     raw = Mock()
     with pytest.raises(actions.ParticipationReadError, match="收藏状态未知"):
         actions.favorite_dynamic(

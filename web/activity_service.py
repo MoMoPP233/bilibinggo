@@ -25,6 +25,7 @@ from src.participation_log import (
 from src.participation_store import ParticipationRecord, load_participations
 from src.comment_breaker import comment_breaker_snapshot, is_comment_breaker_active
 from src.comment_confirmation import is_comment_confirmed, load_comment_statuses
+from src.favorite_confirmation import FavoriteGuardStateError, load_favorite_statuses
 from src.invalid_activities import invalid_activity_ids
 from src.manual_ignored_activities import manual_ignore_ids
 from src.participation_guard import load_blocked_guard_ids
@@ -423,6 +424,8 @@ def _pick_triple_from_rows(
     comment_breaker_active = is_comment_breaker_active()
     comment_statuses: dict[str, str] | None = None
     comment_guard_unavailable = False
+    favorite_statuses: dict[str, str] | None = None
+    favorite_guard_unavailable = False
     for row in rows:
         if str(row.get("activity_status") or "") != "未参加":
             continue
@@ -454,6 +457,20 @@ def _pick_triple_from_rows(
         if row_lottery_type not in PARTICIPATABLE_TYPES:
             continue
         if row_lottery_type in {"互动抽奖", "转发抽奖"}:
+            if favorite_statuses is None and not favorite_guard_unavailable:
+                candidate_uid = participation_uid()
+                if candidate_uid.isascii() and candidate_uid.isdigit() and int(candidate_uid) > 0:
+                    try:
+                        favorite_statuses = load_favorite_statuses(uid=candidate_uid)
+                    except (FavoriteGuardStateError, OSError) as exc:
+                        favorite_guard_unavailable = True
+                        logging.getLogger(__name__).warning("收藏防重记录不可用，已暂停收藏型候选：%s", exc)
+                else:
+                    # Preview may be opened before login; the mutation entry
+                    # still requires a real UID and cannot send a favorite.
+                    favorite_statuses = {}
+            if favorite_guard_unavailable or (favorite_statuses or {}).get(dynamic_id) in {"pending", "unknown"}:
+                continue
             if comment_statuses is None and not comment_guard_unavailable:
                 try:
                     comment_statuses = load_comment_statuses(uid=participation_uid())

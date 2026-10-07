@@ -14,6 +14,7 @@ from src.bilibili_client import BilibiliClient
 from src.bilibili_request_budget import RequestBudgetExhausted
 from src.comment_breaker import CommentLimitActive, is_comment_breaker_active
 from src.comment_confirmation import get_comment_status
+from src.favorite_confirmation import get_favorite_status
 from src.lottery_actions import (
     ACTION_INTERVAL_SEC,
     DEFAULT_PARTICIPATE_TEXT,
@@ -590,6 +591,10 @@ def participate_five_action_lottery(
                 mutation_action[0] == "comment"
                 and get_comment_status(dynamic_id, uid=uid) in {"pending", "unknown"}
             )
+            or (
+                mutation_action[0] == "favorite"
+                and get_favorite_status(dynamic_id, uid=uid) in {"pending", "unknown"}
+            )
         )
         if unknown:
             action_label = {
@@ -1165,6 +1170,12 @@ def participate_activity(
                         f"{labels[guard.repost_status]}，禁止自动重发，需人工确认",
                     )
                 if lottery_type in {"互动抽奖", "转发抽奖"}:
+                    favorite_status = get_favorite_status(dynamic_id, uid=uid)
+                    if favorite_status in {"pending", "unknown"}:
+                        return _dedup_skip(
+                            dynamic_id, lottery_type, f"favorite_{favorite_status}",
+                            "收藏结果未知，已阻止自动重试，需人工确认",
+                        )
                     comment_status = get_comment_status(dynamic_id, uid=uid)
                     if comment_status in {"pending", "unknown"}:
                         return _dedup_skip(
