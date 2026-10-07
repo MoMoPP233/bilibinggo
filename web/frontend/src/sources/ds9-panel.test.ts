@@ -74,68 +74,68 @@ describe("DS9 topic cards", () => {
     expect(startJobMock).toHaveBeenCalledWith("refresh_source", { source_id: "DS-9" });
   });
 
-  it("renders local rejection samples and clears only the audit endpoint", async () => {
+  it("shows per-topic unique totals and stable-ID delta without standalone audit sections", async () => {
     fetchJSONMock
       .mockResolvedValueOnce({
-        topics: [{ topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true }],
-        summary: { builtin_count: 1, custom_count: 0 },
+        topics: [
+          { topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true, last_unique_added: 2 },
+          { topic_id: "1261901", name: "抽奖！！！", kind: "built-in", enabled: true, last_unique_added: 0 },
+        ],
+        summary: { builtin_count: 2, custom_count: 0 },
       })
       .mockResolvedValueOnce({
-        samples: [{
-          dynamic_id: "100000000000000001",
-          canonical_url: "https://www.bilibili.com/opus/100000000000000001",
-          source_topic_id: "47801",
-          source_topic_name: "抽奖号的日常",
-          classifier_text: "分类器实际看到的最终文本",
-          last_seen_at: 1_758_600_000,
-        }],
+        records: [
+          { topic_id: "47801", dynamic_id: "100000000000000001" },
+          { topic_id: "47801", dynamic_id: "100000000000000002" },
+          { topic_id: "47801", dynamic_id: "100000000000000001" },
+        ],
       });
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const module = await import("./ds9-panel");
     module.bindDs9Panel();
-    await vi.waitFor(() => expect(document.querySelector(".ds9-audit-item")).not.toBeNull());
+    await vi.waitFor(() => expect(document.querySelector("[data-topic-id='47801'] .ds9-topic-unique-summary")?.textContent).toContain("独有抽奖 2 条"));
     const panel = document.getElementById("ds9-topic-panel")!;
-    expect(panel.textContent).toContain("47801");
-    expect(panel.textContent).toContain("分类器实际看到的最终文本");
-    expect(panel.querySelector(".ds9-audit-link")?.getAttribute("href")).toContain("100000000000000001");
-    (panel.querySelector("[data-ds9-audit-clear]") as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(fetchJSONMock).toHaveBeenCalledWith(
-      "/api/ds9/rejection-audit",
-      expect.objectContaining({ method: "DELETE" }),
-    ));
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("仅清空本地"));
-    confirm.mockRestore();
+    expect(panel.querySelector("[data-topic-id='47801'] .ds9-topic-unique-summary")?.textContent).toContain("较上次扫描新增 2 条");
+    expect(panel.querySelector("[data-topic-id='1261901'] .ds9-topic-unique-summary")?.textContent).toContain("独有抽奖 0 条");
+    expect(panel.querySelector("[data-topic-id='1261901'] .ds9-topic-unique-summary")?.textContent).toContain("较上次扫描新增 0 条");
+    expect(panel.querySelectorAll("[data-topic-id='47801'] .ds9-unique-item")).toHaveLength(2);
+    expect(panel.querySelector("[data-ds9-unique]")).toBeNull();
+    expect(panel.querySelector("[data-ds9-audit]")).toBeNull();
+    expect(panel.textContent).not.toContain("非抽奖审计样本");
+    expect(fetchJSONMock).not.toHaveBeenCalledWith("/api/ds9/rejection-audit");
   });
 
-  it("exports the current local topic filter as CSV", async () => {
+  it("shows first-scan state with old topic data and keeps an empty topic usable", async () => {
     fetchJSONMock
       .mockResolvedValueOnce({
         topics: [{ topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true }],
         summary: { builtin_count: 1, custom_count: 0 },
       })
-      .mockResolvedValueOnce({ samples: [] });
-    const clicked: string[] = [];
-    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
-      clicked.push(this.href);
-    });
+      .mockResolvedValueOnce({ records: [] });
     const module = await import("./ds9-panel");
     module.bindDs9Panel();
-    await vi.waitFor(() => expect(document.querySelector("[data-ds9-audit-export]")).not.toBeNull());
-    const panel = document.getElementById("ds9-topic-panel")!;
-    const select = panel.querySelector("[data-ds9-audit-filter]") as HTMLSelectElement;
-    select.value = "47801";
-    (panel.querySelector("[data-ds9-audit-export]") as HTMLButtonElement).click();
-    expect(clicked).toEqual([expect.stringContaining("/api/ds9/rejection-audit.csv?topic_id=47801")]);
-    click.mockRestore();
+    await vi.waitFor(() => expect(document.querySelector(".ds9-topic-unique-summary")?.textContent).toContain("首次扫描"));
+    expect(document.querySelector(".ds9-topic-unique-summary")?.textContent).toContain("独有抽奖 0 条");
+    expect(document.querySelector(".ds9-topic-unique-details")).toBeNull();
   });
 
-  it("keeps DS9 unique records collapsed by default and toggles without changing export", async () => {
+  it("renders an empty topic list without a standalone unique or rejection section", async () => {
+    fetchJSONMock
+      .mockResolvedValueOnce({ topics: [], summary: { builtin_count: 0, custom_count: 0 } })
+      .mockResolvedValueOnce({ records: [] });
+    const module = await import("./ds9-panel");
+    module.bindDs9Panel();
+    await vi.waitFor(() => expect(document.querySelector("#ds9-topic-panel .ds9-status-pill")?.textContent).toBe("已暂停"));
+    expect(document.querySelectorAll(".ds9-topic-card")).toHaveLength(0);
+    expect(document.querySelector("[data-ds9-unique]")).toBeNull();
+    expect(document.querySelector("[data-ds9-audit]")).toBeNull();
+  });
+
+  it("keeps unique details inside their topic, collapsed by default, and preserves CSV export", async () => {
     fetchJSONMock
       .mockResolvedValueOnce({
         topics: [{ topic_id: "47801", name: "抽奖号的日常", kind: "built-in", enabled: true }],
         summary: { builtin_count: 1, custom_count: 0 },
       })
-      .mockResolvedValueOnce({ samples: [] })
       .mockResolvedValueOnce({ records: [{ topic_id: "47801", topic_name: "抽奖号的日常", dynamic_id: "123" }] });
     const clicked: string[] = [];
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
@@ -143,22 +143,12 @@ describe("DS9 topic cards", () => {
     });
     const module = await import("./ds9-panel");
     module.bindDs9Panel();
-    await vi.waitFor(() => expect(document.querySelector("[data-ds9-unique-title-count]")?.textContent).toBe("1"));
-    const section = document.querySelector("[data-ds9-unique]")!;
-    const rows = section.querySelector("[data-ds9-unique-rows]")!;
-    const toggle = section.querySelector("[data-ds9-unique-toggle]") as HTMLButtonElement;
-    expect(section.classList.contains("is-collapsed")).toBe(true);
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(rows.textContent).toContain("DS9 独有");
-    toggle.click();
-    expect(section.classList.contains("is-collapsed")).toBe(false);
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(toggle.textContent).toBe("收起");
-    toggle.click();
-    expect(section.classList.contains("is-collapsed")).toBe(true);
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(toggle.textContent).toBe("展开");
-    (section.querySelector("[data-ds9-contribution-export]") as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(document.querySelector(".ds9-topic-unique-details")).not.toBeNull());
+    const details = document.querySelector("[data-topic-id='47801'] .ds9-topic-unique-details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    expect(details.textContent).toContain("DS9 独有");
+    expect(details.querySelector(".ds9-audit-link")?.getAttribute("href")).toContain("123");
+    (document.querySelector("[data-ds9-contribution-export]") as HTMLButtonElement).click();
     expect(clicked).toEqual([expect.stringContaining("/api/ds9/contribution.csv")]);
     click.mockRestore();
   });

@@ -674,6 +674,22 @@ def _format_source_scan_counts(counts: Mapping[str, Any]) -> str:
     return "，".join(parts)
 
 
+def _commit_ds9_unchanged_stats(check_result: CheckResult) -> None:
+    """Commit DS9 display baseline after a successful no-change scan only.
+
+    This does not touch source checkpoints; the normal updated-source commit
+    hook still runs through commit_source_checkpoint after pipeline success.
+    """
+    if check_result.source_id != "DS-9" or check_result.updated or not check_result.source_complete:
+        return
+    hook = getattr(check_result, "ds9_topic_commit", None)
+    if callable(hook):
+        try:
+            hook()
+        except Exception:
+            logger.exception("DS9 未变化话题统计提交失败")
+
+
 def _run_source_refresh(
     source_id: str,
     check_update: Callable[..., Any],
@@ -720,6 +736,7 @@ def _run_source_refresh(
     )
 
     if not check_result.updated:
+        _commit_ds9_unchanged_stats(check_result)
         skip_line = f"【跳过流水线】{source_id} 为同一专栏，跳过后续步骤"
         log_lines.append(skip_line)
         progress(
@@ -1368,6 +1385,8 @@ def _run_action_impl(
             )
 
         if sources_updated == 0:
+            for check_result in ds_check_results:
+                _commit_ds9_unchanged_stats(check_result)
             skip_line = f"【跳过流水线】{len(DS_HANDLERS)} 个数据源均为同一专栏，跳过后续步骤"
             log_lines.append(skip_line)
             progress(
@@ -1423,6 +1442,7 @@ def _run_action_impl(
             for check_result in ds_check_results:
                 if check_result.source_complete:
                     commit_source_checkpoint(check_result)
+                    _commit_ds9_unchanged_stats(check_result)
                 else:
                     log_lines.append(
                         "【部分完成】DS-3 合集尚未全部读取；已保存成功结果，下次将继续补读"

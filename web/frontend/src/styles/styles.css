@@ -3495,6 +3495,32 @@ html.sidebar-init-collapsed .system-btn {
   font-size: 12px;
 }
 
+.ds9-topic-unique-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 12px;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ds9-topic-unique-details {
+  min-width: 0;
+}
+
+.ds9-topic-unique-details summary {
+  width: fit-content;
+  color: var(--accent-hover);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.ds9-topic-unique-details .ds9-audit-rows {
+  max-height: 260px;
+  overflow: auto;
+}
+
 .ds9-topic-actions {
   display: flex;
   justify-content: flex-end;
@@ -3504,39 +3530,6 @@ html.sidebar-init-collapsed .system-btn {
 [data-theme="dark"] .ds9-topic-card {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.07);
-}
-
-.ds9-audit-section {
-  margin-top: 22px;
-  padding-top: 18px;
-  border-top: 1px solid var(--border-soft);
-}
-
-.ds9-audit-section.is-collapsed .ds9-audit-rows {
-  display: none;
-}
-
-.ds9-unique-section {
-  border-top: 0;
-  margin-top: 18px;
-  padding-top: 0;
-}
-
-.ds9-audit-section-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 14px;
-}
-
-.ds9-audit-section h3 {
-  margin: 0;
-  color: var(--foreground);
-  font-size: 15px;
-}
-
-.ds9-audit-section .section-desc {
-  margin: 4px 0 0;
 }
 
 .ds9-audit-rows {
@@ -3575,39 +3568,9 @@ html.sidebar-init-collapsed .system-btn {
   color: var(--accent-hover);
 }
 
-.ds9-audit-label {
-  margin-top: 10px;
-}
-
-.ds9-audit-text {
-  max-height: 180px;
-  margin: 5px 0 0;
-  padding: 9px 10px;
-  overflow: auto;
-  border-radius: 8px;
-  background: var(--surface-soft);
-  color: var(--foreground);
-  font: inherit;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.ds9-audit-empty {
-  padding: 18px 12px;
-  color: var(--foreground-muted);
-  text-align: center;
-}
-
 [data-theme="dark"] .ds9-audit-item {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.07);
-}
-
-@media (max-width: 720px) {
-  .ds9-audit-section-head {
-    flex-direction: column;
-  }
 }
 
 .source-row--watch {

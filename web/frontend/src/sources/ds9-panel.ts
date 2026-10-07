@@ -45,10 +45,14 @@ function renderStatusPill(status) {
   return `<span class="ds9-status-pill is-${escapeHtml(status)}">${STATUS_LABELS[status] || status}</span>`;
 }
 
-function topicCardHtml(topic) {
+function topicCardHtml(topic, uniqueRecords) {
   const kind = topic?.kind === "built-in" ? "内置" : "自定义";
   const enabled = Boolean(topic?.enabled);
   const processed = topic?.fp ? "已推送数据库" : "未处理";
+  const added = topic?.last_unique_added;
+  const addedText = Number.isInteger(added) && added >= 0
+    ? `较上次扫描新增 ${added} 条`
+    : "首次扫描";
   return `
     <li class="ds9-topic-card" data-topic-id="${escapeHtml(String(topic?.topic_id || ""))}">
       <div class="ds9-topic-card-head">
@@ -62,64 +66,30 @@ function topicCardHtml(topic) {
         ${Number(topic?.incomplete_count) > 0 ? `<span class="caption" title="等待下轮重新解析的条目数">待解析：${Number(topic?.incomplete_count)} 条</span>` : ""}
         ${topic?.last_error ? `<span class="caption is-error" title="${escapeHtml(String(topic.last_error))}">最近错误</span>` : ""}
       </div>
+      <div class="ds9-topic-unique-summary">
+        <span>独有抽奖 ${uniqueRecords.length} 条</span>
+        <span class="caption">${addedText}</span>
+      </div>
+      ${uniqueRecords.length ? `<details class="ds9-topic-unique-details"><summary>查看独有活动</summary><ul class="ds9-audit-rows">${uniqueRecords.map(uniqueRecordHtml).join("")}</ul></details>` : ""}
       <div class="ds9-topic-actions">
         ${topic?.kind === "custom" ? `<button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-delete>删除</button>` : ""}
       </div>
     </li>`;
 }
 
-function auditSampleHtml(sample) {
-  const topic = `${String(sample?.source_topic_name || sample?.source_topic_id || "未知话题")} · ${String(sample?.source_topic_id || "")}`;
-  const url = String(sample?.canonical_url || "");
-  return `
-    <li class="ds9-audit-item">
-      <div class="ds9-audit-head">
-        <strong>${escapeHtml(topic)}</strong>
-        <span class="caption">${escapeHtml(timeText(sample?.last_seen_at))}</span>
-      </div>
-      <div class="ds9-audit-meta">动态 ID：${escapeHtml(String(sample?.dynamic_id || ""))}</div>
-      ${url ? `<a class="ds9-audit-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">打开原动态</a>` : ""}
-      <div class="ds9-audit-label">分类文本</div>
-      <pre class="ds9-audit-text">${escapeHtml(String(sample?.classifier_text || "(无正文)"))}</pre>
-    </li>`;
-}
-
-function renderAudit(samples, topicId = "") {
-  const panel = document.getElementById(PANEL_ID);
-  if (!panel) return;
-  const rows = Array.isArray(samples) ? samples : [];
-  const visible = topicId ? rows.filter((item) => String(item?.source_topic_id || "") === topicId) : rows;
-  panel.querySelector("[data-ds9-audit-count]").textContent = String(visible.length);
-  panel.querySelector("[data-ds9-audit-rows]").innerHTML = visible.length
-    ? visible.map(auditSampleHtml).join("")
-    : '<li class="ds9-audit-empty">暂无非抽奖审计样本</li>';
-}
-
 function uniqueRecordHtml(record) {
-  const topic = `${String(record?.topic_name || record?.topic_id || "未知话题")} · ${String(record?.topic_id || "")}`;
   const dynamicId = String(record?.dynamic_id || record?.canonical_dynamic_id || "");
   const url = String(record?.canonical_url || (dynamicId ? `https://www.bilibili.com/opus/${dynamicId}` : ""));
   return `
     <li class="ds9-audit-item ds9-unique-item">
-      <div class="ds9-audit-head"><strong>${escapeHtml(topic)}</strong><span class="ds9-status-pill is-ok">DS9 独有</span></div>
+      <div class="ds9-audit-head"><strong>动态 ID：${escapeHtml(dynamicId)}</strong><span class="ds9-status-pill is-ok">DS9 独有</span></div>
       <div class="ds9-audit-meta">第 ${Number(record?.page_index) || "—"} 页 · 动态 ID：${escapeHtml(dynamicId)}</div>
       ${url ? `<a class="ds9-audit-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">打开原动态</a>` : ""}
       <div class="ds9-audit-meta">发现时间：${escapeHtml(timeText(record?.scanned_at))}</div>
     </li>`;
 }
 
-function renderUnique(records) {
-  const panel = document.getElementById(PANEL_ID);
-  if (!panel) return;
-  const rows = Array.isArray(records) ? records : [];
-  panel.querySelector("[data-ds9-unique-count]").textContent = String(rows.length);
-  panel.querySelector("[data-ds9-unique-title-count]").textContent = String(rows.length);
-  panel.querySelector("[data-ds9-unique-rows]").innerHTML = rows.length
-    ? rows.map(uniqueRecordHtml).join("")
-    : '<li class="ds9-audit-empty">暂无 DS9 独有有效抽奖记录</li>';
-}
-
-function render(state) {
+function render(state, uniqueRecords) {
   const topics = Array.isArray(state?.topics) ? state.topics : [];
   const summary = state?.summary || {};
   const builtin = Number(summary.builtin_count) || topics.filter((t) => t?.kind === "built-in").length;
@@ -133,21 +103,26 @@ function render(state) {
   panel.querySelector("[data-ds9-builtin]").textContent = String(builtin);
   panel.querySelector("[data-ds9-custom]").textContent = String(custom);
   panel.querySelector("[data-ds9-last-scan]").textContent = timeText(latest || null);
-  panel.querySelector("[data-ds9-rows]").innerHTML = topics.map(topicCardHtml).join("");
+  const byTopic = new Map();
+  for (const record of Array.isArray(uniqueRecords) ? uniqueRecords : []) {
+    const topicId = String(record?.topic_id || "");
+    const dynamicId = String(record?.dynamic_id || record?.canonical_dynamic_id || "");
+    if (!topicId || !dynamicId) continue;
+    if (!byTopic.has(topicId)) byTopic.set(topicId, new Map());
+    byTopic.get(topicId).set(dynamicId, record);
+  }
+  panel.querySelector("[data-ds9-rows]").innerHTML = topics
+    .map((topic) => topicCardHtml(topic, [...(byTopic.get(String(topic?.topic_id || ""))?.values() || [])]))
+    .join("");
 }
 
 async function refreshView() {
   try {
-    const [state, audit, unique] = await Promise.all([
+    const [state, unique] = await Promise.all([
       fetchJSON("/api/ds9"),
-      fetchJSON("/api/ds9/rejection-audit"),
       fetchJSON("/api/ds9/contribution/unique"),
     ]);
-    render(state);
-    const panel = document.getElementById(PANEL_ID);
-    if (panel) panel._ds9AuditSamples = Array.isArray(audit?.samples) ? audit.samples : [];
-    renderAudit(audit?.samples);
-    renderUnique(unique?.records);
+    render(state, unique?.records);
   } catch (error) {
     showToast(String(error?.message || error), "error", "DS9 状态读取失败");
   }
@@ -201,50 +176,6 @@ function handleAddTopic(event) {
     .catch((error) => showToast(String(error?.message || error), "error"));
 }
 
-function handleAuditAction(event) {
-  const uniqueToggle = event.target.closest("[data-ds9-unique-toggle]");
-  if (uniqueToggle) {
-    const section = uniqueToggle.closest("[data-ds9-unique]");
-    const collapsed = section?.classList.toggle("is-collapsed");
-    uniqueToggle.textContent = collapsed ? "展开" : "收起";
-    uniqueToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
-    return;
-  }
-  const toggle = event.target.closest("[data-ds9-audit-toggle]");
-  if (toggle) {
-    const section = toggle.closest("[data-ds9-audit]");
-    const collapsed = section?.classList.toggle("is-collapsed");
-    toggle.textContent = collapsed ? "展开" : "收起";
-    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
-    return;
-  }
-  const select = event.target.closest("[data-ds9-audit-filter]");
-  if (select) {
-    const panel = document.getElementById(PANEL_ID);
-    const samples = panel?._ds9AuditSamples || [];
-    renderAudit(samples, String(select.value || ""));
-    return;
-  }
-  const exportButton = event.target.closest("[data-ds9-audit-export]");
-  if (exportButton) {
-    const panel = document.getElementById(PANEL_ID);
-    const select = panel?.querySelector("[data-ds9-audit-filter]");
-    const topicId = String(select?.value || "");
-    const query = topicId ? `?topic_id=${encodeURIComponent(topicId)}` : "";
-    const link = document.createElement("a");
-    link.href = `/api/ds9/rejection-audit.csv${query}`;
-    link.download = "";
-    link.click();
-    return;
-  }
-  const button = event.target.closest("[data-ds9-audit-clear]");
-  if (!button) return;
-  if (!window.confirm("仅清空本地 DS9 非抽奖审计记录，不会删除活动，也不会操作 B 站内容。")) return;
-  fetchJSON("/api/ds9/rejection-audit", { method: "DELETE" })
-    .then(() => refreshView())
-    .catch((error) => showToast(String(error?.message || error), "error"));
-}
-
 function ensurePanel() {
   const anchor = document.getElementById("watch-panel");
   if (!anchor || document.getElementById(PANEL_ID)) return;
@@ -267,6 +198,7 @@ function ensurePanel() {
       <span class="caption">默认话题：<b data-ds9-builtin>3</b></span>
       <span class="caption">自定义话题：<b data-ds9-custom>0</b></span>
       <span class="caption">最近扫描：<span data-ds9-last-scan>—</span></span>
+      <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-contribution-export>导出统计 CSV</button>
     </div>
     <form class="ds9-add-form action-row" data-ds9-add>
       <input class="form-control" data-ds9-name placeholder="话题名称（可选）" />
@@ -274,34 +206,6 @@ function ensurePanel() {
       <button type="submit" class="btn btn-secondary btn-compact btn-pill">添加话题</button>
     </form>
     <ul class="ds9-topic-rows" data-ds9-rows></ul>
-    <section class="ds9-audit-section ds9-unique-section is-collapsed" data-ds9-unique>
-      <div class="ds9-audit-section-head">
-        <div><h3>DS9 独有有效抽奖记录（<span data-ds9-unique-title-count>0</span>）</h3><p class="section-desc">其他正式数据源尚未发现的有效抽奖。</p></div>
-        <div class="action-row"><button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-unique-toggle aria-expanded="false">展开</button><span class="caption">共 <b data-ds9-unique-count>0</b> 条</span><button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-contribution-export>导出统计 CSV</button></div>
-      </div>
-      <ul class="ds9-audit-rows" data-ds9-unique-rows></ul>
-    </section>
-    <section class="ds9-audit-section ds9-rejection-section is-collapsed" data-ds9-audit>
-      <div class="ds9-audit-section-head">
-        <div>
-          <h3>非抽奖审计样本</h3>
-          <p class="section-desc">仅保存本地最近 100 条分类为非抽奖活动的样本。</p>
-        </div>
-        <div class="action-row">
-          <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-toggle aria-expanded="false">展开</button>
-          <select class="form-control" data-ds9-audit-filter aria-label="按话题筛选">
-            <option value="">全部话题</option>
-            <option value="1261901">抽奖！！！ · 1261901</option>
-            <option value="1055656">转发动态抽奖！ · 1055656</option>
-            <option value="47801">抽奖号的日常 · 47801</option>
-          </select>
-          <span class="caption">共 <b data-ds9-audit-count>0</b> 条</span>
-          <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-export>导出 CSV（当前筛选）</button>
-          <button type="button" class="btn btn-ghost btn-compact btn-pill" data-ds9-audit-clear>清空审计样本</button>
-        </div>
-      </div>
-      <ul class="ds9-audit-rows" data-ds9-audit-rows></ul>
-    </section>
   `;
   anchor.insertAdjacentElement("afterend", panel);
 }
@@ -318,9 +222,6 @@ export function bindDs9Panel() {
   });
   panel.querySelector("[data-ds9-add]")?.addEventListener("submit", handleAddTopic);
   panel.querySelector("[data-ds9-rows]")?.addEventListener("click", handleTopicAction);
-  panel.querySelector("[data-ds9-unique]")?.addEventListener("click", handleAuditAction);
-  panel.querySelector("[data-ds9-audit]")?.addEventListener("click", handleAuditAction);
-  panel.querySelector("[data-ds9-audit]")?.addEventListener("change", handleAuditAction);
   panel.querySelector("[data-ds9-contribution-export]")?.addEventListener("click", () => {
     const link = document.createElement("a");
     link.href = "/api/ds9/contribution.csv";

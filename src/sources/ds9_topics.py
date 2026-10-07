@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -44,6 +45,7 @@ _TOPIC_ID_RE = re.compile(r"^\d{1,12}$")
 _URL_TOPIC_ID_RE = re.compile(r"topic_id=(\d{1,12})")
 
 _STATE_FILE = "ds9_topics.json"
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,8 @@ def _default_topic_records() -> list[dict[str, Any]]:
             "last_scan_at": None,
             "last_found": 0,
             "last_error": "",
+            "last_success_unique_ids": None,
+            "last_unique_added": None,
         }
         for topic in BUILTIN_TOPICS
     ]
@@ -149,6 +153,8 @@ def _topic_records(state: dict[str, Any]) -> list[dict[str, Any]]:
                 "last_scan_at": item.get("last_scan_at"),
                 "last_found": int(item.get("last_found") or 0),
                 "last_error": str(item.get("last_error") or ""),
+                "last_success_unique_ids": item.get("last_success_unique_ids"),
+                "last_unique_added": item.get("last_unique_added"),
             }
         )
     return merged
@@ -213,6 +219,8 @@ def add_topic(name: str, topic_id_value: str) -> dict[str, Any]:
             "last_scan_at": None,
             "last_found": 0,
             "last_error": "",
+            "last_success_unique_ids": None,
+            "last_unique_added": None,
         }
     )
     _save_topic_records(records)
@@ -498,12 +506,47 @@ def _commit_topic_meta_now(records: list[dict[str, Any]], *, now: int) -> None:
         _save_topic_records(stored)
 
 
-def _apply_topic_commits(pending: list[dict[str, Any]]) -> None:
+def _apply_topic_commits(
+    pending: list[dict[str, Any]], nochange_topic_ids: list[str] | None = None,
+) -> None:
     """流水线成功后的唯一 checkpoint 提交点：per-topic fp/incomplete/成功元数据。"""
-    if not pending:
+    if not pending and not nochange_topic_ids:
         return
+    # Contribution observations are written by the completed pipeline before
+    # this checkpoint hook. Keep the same seven-day/exclusive definition as
+    # /api/ds9/contribution/unique; never classify or fetch again here.
+    unique_by_topic: dict[str, set[str]] | None = None
+    try:
+        from src.ds9_contribution_audit import list_unique_valid
+
+        snapshot: dict[str, set[str]] = {}
+        for row in list_unique_valid():
+            topic_id = str(row.get("topic_id") or "")
+            dynamic_id = str(row.get("dynamic_id") or "")
+            if topic_id and dynamic_id:
+                snapshot.setdefault(topic_id, set()).add(dynamic_id)
+        unique_by_topic = snapshot
+    except Exception:  # noqa: BLE001 - optional audit must not block checkpoint
+        _logger.exception("DS9 独有抽奖基线读取失败，保留既有基线")
     stored = _topic_records(_read_state())
     by_id = {str(item.get("topic_id")): item for item in stored}
+
+    def update_unique_baseline(target: dict[str, Any], topic_id: str) -> None:
+        if unique_by_topic is None:
+            return
+        current_ids = unique_by_topic.get(topic_id, set())
+        previous_ids = target.get("last_success_unique_ids")
+        previous = (
+            {item for item in previous_ids if isinstance(item, str)}
+            if isinstance(previous_ids, list) else None
+        )
+        target["last_unique_added"] = (
+            len(current_ids - previous) if previous is not None else None
+        )
+        # Replaces the previous rolling seven-day snapshot; never accumulates
+        # all historical IDs in this Profile-local JSON.
+        target["last_success_unique_ids"] = sorted(current_ids)
+
     for update in pending:
         target = by_id.get(str(update.get("topic_id")))
         if target is None:
@@ -514,6 +557,14 @@ def _apply_topic_commits(pending: list[dict[str, Any]]) -> None:
         target["last_found"] = int(update.get("last_found") or 0)
         target["last_error"] = ""
         target["last_scan_at"] = update.get("last_scan_at")
+        # A topic with unresolved outer/orig relationships has not completed
+        # its candidate window. Preserve the previous comparison baseline.
+        if not update.get("incomplete"):
+            update_unique_baseline(target, str(update.get("topic_id")))
+    for topic_id in nochange_topic_ids or []:
+        target = by_id.get(topic_id)
+        if target is not None:
+            update_unique_baseline(target, topic_id)
     _save_topic_records(stored)
 
 
@@ -670,7 +721,7 @@ def check_update(*, force: bool = False) -> CheckResult:
     )
     # 提交钩子：公共流水线成功（common.commit_source_checkpoint）后执行。
     result.ds9_summary = summary  # type: ignore[attr-defined]
-    result.ds9_topic_commit = lambda: _apply_topic_commits(pending)  # type: ignore[attr-defined]
+    result.ds9_topic_commit = lambda: _apply_topic_commits(pending, nochange_topic_ids)  # type: ignore[attr-defined]
     return result
 
 
