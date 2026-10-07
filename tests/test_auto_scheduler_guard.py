@@ -29,7 +29,9 @@ def state_path(tmp_path: Path, monkeypatch) -> Path:
 
 
 def _scheduler_with_fake_click(fake):
-    scheduler = AutoScheduler(job_runner=MagicMock(), clock=daytime_cn_clock)
+    runner = MagicMock()
+    runner.is_running.return_value = False
+    scheduler = AutoScheduler(job_runner=runner, clock=daytime_cn_clock)
     scheduler._click_and_wait = fake
     return scheduler
 

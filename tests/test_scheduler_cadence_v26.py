@@ -41,6 +41,7 @@ def _scheduler() -> tuple[object, MagicMock]:
     from web.auto_scheduler import AutoScheduler
 
     runner = MagicMock()
+    runner.is_running.return_value = False
     scheduler = AutoScheduler(job_runner=runner, clock=daytime_cn_clock)
     scheduler._status.state = "running"
     return scheduler, runner

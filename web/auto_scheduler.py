@@ -1041,6 +1041,11 @@ class AutoScheduler:
         self._set_task_status("participate", "running", "三连参与开始")
         self._log("info", f"三连参与刻度 {key}")
         try:
+            # 评论恢复探测会先读取目标动态并准备评论，随后才 claim / POST。
+            # 必须在调用 helper 前检查当前 Profile 的 Job 槽位；扫描等 Job
+            # 占用期间不得发生探测请求，也不得消耗评论恢复的持久化机会。
+            if self._runner.is_running():
+                raise CollisionError("评论恢复探测延后：已有任务正在运行")
             from src.comment_probe import run_comment_recovery_probe
 
             probe = run_comment_recovery_probe()
