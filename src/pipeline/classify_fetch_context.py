@@ -34,6 +34,7 @@ class ClassifyFetchContext:
     client: BilibiliClient
     dynamic_id: str
     retries: int | None = None
+    outer_only_content: bool = False
     _additional: Any = field(default=_UNSET, repr=False)
     _detail_api_item: Any = field(default=_UNSET, repr=False)
     _detail_api_code: Any = field(default=_UNSET, repr=False)
@@ -239,6 +240,18 @@ class ClassifyFetchContext:
         """优先复用已拉取的 dynamic/detail 正文，避免分类阶段二次抓取。"""
         if self._resolved_content:
             return self._resolved_content
+        if self.outer_only_content:
+            # V107 source-scoped wrapper candidate: the embedded orig is a
+            # separate candidate. Its text must not make the wrapper appear
+            # to be a lottery, and HTML fallback cannot safely separate it.
+            item = self.get_detail_item()
+            if item is None:
+                raise RuntimeError(f"无法获取动态正文: {self.dynamic_id} 外层详情不可读取")
+            from src.repost_origin_discovery import is_forward_item
+
+            if is_forward_item(item):
+                self._resolved_content = _extract_from_detail_item({**item, "orig": None}).strip()
+                return self._resolved_content
         cached = self._extract_cached_classify_content()
         if cached:
             self._resolved_content = cached

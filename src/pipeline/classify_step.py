@@ -125,6 +125,10 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
 
     _raise_if_platform_risk(ctx, dynamic_id)
     content = ctx.resolve_classify_content()
+    if ctx.outer_only_content and not content:
+        return _outcome_with_api_cache(
+            ClassifyOutcome(dynamic_id, "非抽奖活动", True, "非抽奖活动"), ctx,
+        )
 
     parsed = classify_forward_lottery(dynamic_id, content)
     if parsed.get("error"):
@@ -155,7 +159,9 @@ def classify_with_context(ctx: ClassifyFetchContext) -> ClassifyOutcome:
     )
 
 
-def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcome:
+def classify_new_link(
+    client: BilibiliClient, dynamic_id: str, *, outer_only_content: bool = False,
+) -> ClassifyOutcome:
     """API 优先分类；其余由 LLM 判断是否为转发抽奖。skipped 不落库。
 
     分类期间若命中明确平台风控（结构化 code -352/-509/429），立即向上抛出，
@@ -163,7 +169,7 @@ def classify_new_link(client: BilibiliClient, dynamic_id: str) -> ClassifyOutcom
     """
     from src.platform_risk import is_platform_risk_code
 
-    ctx = ClassifyFetchContext(client, dynamic_id)
+    ctx = ClassifyFetchContext(client, dynamic_id, outer_only_content=outer_only_content)
     outcome = classify_with_context(ctx)
     code = ctx.risk_control_code()
     if is_platform_risk_code(code):

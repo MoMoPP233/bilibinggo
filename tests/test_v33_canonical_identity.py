@@ -50,6 +50,12 @@ class _FeedClient:
     def get_json(self, *args, **kwargs):
         return self.payload
 
+    def request_json(self, _url, params=None, **_kwargs):
+        return {
+            "code": 0,
+            "data": {"item": {"id_str": str((params or {}).get("id") or ""), "type": "DYNAMIC_TYPE_FORWARD"}},
+        }
+
 
 @pytest.fixture
 def feed_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -136,30 +142,30 @@ def test_followed_original_is_accepted(feed_state, monkeypatch) -> None:
     assert result["accepted"] == 1
 
 
-def test_any_friend_repost_is_skipped_without_following_lookup(feed_state, monkeypatch) -> None:
+def test_friend_repost_adds_one_level_without_following_lookup(feed_state, monkeypatch) -> None:
     original = _item(ORIGINAL, ORIGINAL_AUTHOR, following=False)
     result, captured = _run_feed(
         [_item(WRAPPER_A, FRIEND, orig=original, item_type="DYNAMIC_TYPE_FORWARD")],
         monkeypatch,
         uid=int(CURRENT),
     )
-    assert captured["urls"] == []
-    assert result["forward_skipped"] == 1
+    assert captured["urls"] == [f"https://www.bilibili.com/opus/{WRAPPER_A}", f"https://www.bilibili.com/opus/{ORIGINAL}"]
+    assert result["forward_skipped"] == 0
 
 
-def test_following_feed_does_not_accept_friend_reposts(feed_state, monkeypatch) -> None:
+def test_following_feed_accepts_wrapper_and_origin(feed_state, monkeypatch) -> None:
     original = _item(ORIGINAL, ORIGINAL_AUTHOR, following=True)
     result, captured = _run_feed(
         [_item(WRAPPER_A, FRIEND, orig=original, item_type="DYNAMIC_TYPE_FORWARD")],
         monkeypatch,
         uid=int(CURRENT),
     )
-    assert result["added"] == 0
-    assert result["forward_skipped"] == 1
-    assert captured["urls"] == []
+    assert result["added"] == 2
+    assert result["forward_skipped"] == 0
+    assert captured["urls"] == [f"https://www.bilibili.com/opus/{WRAPPER_A}", f"https://www.bilibili.com/opus/{ORIGINAL}"]
 
 
-def test_same_original_and_two_wrappers_are_one_feed_candidate(feed_state, monkeypatch) -> None:
+def test_same_original_and_two_wrappers_have_three_distinct_candidates(feed_state, monkeypatch) -> None:
     original = _item(ORIGINAL, ORIGINAL_AUTHOR, following=True)
     items = [
         original,
@@ -167,9 +173,13 @@ def test_same_original_and_two_wrappers_are_one_feed_candidate(feed_state, monke
         _item(WRAPPER_B, FRIEND, orig=original, item_type="DYNAMIC_TYPE_FORWARD"),
     ]
     result, captured = _run_feed(items, monkeypatch, uid=int(CURRENT))
-    assert captured["urls"] == [f"https://www.bilibili.com/opus/{ORIGINAL}"]
-    assert result["canonical_duplicate_skipped"] == 0
-    assert result["forward_skipped"] == 2
+    assert captured["urls"] == [
+        f"https://www.bilibili.com/opus/{ORIGINAL}",
+        f"https://www.bilibili.com/opus/{WRAPPER_A}",
+        f"https://www.bilibili.com/opus/{WRAPPER_B}",
+    ]
+    assert result["canonical_duplicate_skipped"] == 2
+    assert result["forward_skipped"] == 0
 
 
 def test_following_feed_uses_one_feed_request_for_many_authors(feed_state, monkeypatch) -> None:
@@ -210,8 +220,8 @@ def test_following_feed_uses_one_feed_request_for_many_authors(feed_state, monke
         client_factory=factory
     )
     assert requests == 1
-    assert result["forward_skipped"] == 1
-    assert len(captured["urls"]) == 1
+    assert result["forward_skipped"] == 0
+    assert len(captured["urls"]) == 2
 
 
 def test_malformed_forward_is_fail_closed_but_later_item_continues(feed_state, monkeypatch) -> None:
@@ -222,8 +232,8 @@ def test_malformed_forward_is_fail_closed_but_later_item_continues(feed_state, m
         uid=int(CURRENT),
     )
     assert result["forward_unresolved_skipped"] == 1
-    assert result["forward_skipped"] == 1
-    assert captured["urls"] == [f"https://www.bilibili.com/opus/{ORIGINAL}"]
+    assert result["forward_skipped"] == 0
+    assert captured["urls"] == [f"https://www.bilibili.com/opus/{WRAPPER_A}", f"https://www.bilibili.com/opus/{ORIGINAL}"]
 
 
 def test_pipeline_canonicalizes_cross_source_wrappers(monkeypatch) -> None:

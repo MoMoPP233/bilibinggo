@@ -103,20 +103,20 @@ def test_f2_non_forward_original_does_not_use_followed_membership(feed_state, mo
     assert result["accepted"] == 1
 
 
-def test_f3_friend_repost_is_skipped_even_when_friend_is_followed(feed_state, monkeypatch):
+def test_f3_friend_repost_adds_wrapper_and_origin(feed_state, monkeypatch):
     original = _original(ORIGINAL_A, AUTHOR_A)
     result, urls = _run(monkeypatch, [_item(WRAPPER_A, FRIEND, orig=original)])
     assert result["status"] == "success"
-    assert urls == []
-    assert result["forward_skipped"] == 1
+    assert urls == [f"https://www.bilibili.com/opus/{WRAPPER_A}", f"https://www.bilibili.com/opus/{ORIGINAL_A}"]
+    assert result["forward_skipped"] == 0
 
 
-def test_f4_friend_repost_is_skipped_even_when_original_author_is_followed(feed_state, monkeypatch):
+def test_f4_repost_origin_discovery_does_not_depend_on_relationship(feed_state, monkeypatch):
     original = _original(ORIGINAL_A, AUTHOR_A)
     result, urls = _run(monkeypatch, [_item(WRAPPER_A, FRIEND, orig=original)])
     assert result["status"] == "success"
-    assert urls == []
-    assert result["forward_skipped"] == 1
+    assert urls == [f"https://www.bilibili.com/opus/{WRAPPER_A}", f"https://www.bilibili.com/opus/{ORIGINAL_A}"]
+    assert result["forward_skipped"] == 0
 
 
 def test_f5_direct_original_relationship_true_is_accepted(feed_state, monkeypatch):

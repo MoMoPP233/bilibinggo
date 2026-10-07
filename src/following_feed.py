@@ -7,7 +7,7 @@
 - 风控（-352/-509/429/rate-limit/risk-control/风控/限流）向上抛，由 AutoScheduler 走全局 6h 冷却；
   不把风控当成“空 Feed / 0 条”。
 - 复用现有 run_new_links_pipeline（含去重、分类、详情、明确已结束过滤、入库），不另造分类器。
-- Following Feed 只补当前账号关注 Feed 中的非 forward 原创动态；自身动态与所有转发动态均跳过。
+- Following Feed 跳过自身动态；V107 对转发外层和直接 orig 分别形成候选，只展开一层。
 - checkpoint 推进语义（V16）：只要本轮存在“仍需要以后重试的未完成候选”
   （正文不可读取），就保留进入本轮前的旧 checkpoint，让该候选下一轮可再次进入流水线；
   终态安全项（404 链接失效、充电/非抽奖等 skip、详情提取失败、扫描开始前已结束过滤、
@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import json
 import inspect
+import logging
 import os
 import re
 import tempfile
 import time
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -33,6 +35,7 @@ from src.bilibili_auth import get_login_uid
 from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
 from src.observability import current_metrics
 from src.platform_risk import risk_code_of
+from src.repost_origin_discovery import OriginDiscovery, discover_origin, is_forward_item
 from src.pipeline.refresh_all_pipeline import run_new_links_pipeline
 from src.sources.common import opus_link
 from src.watch_feed import extract_feed_pub_ts
@@ -55,6 +58,7 @@ CN_TZ = timezone(timedelta(hours=8))
 _VALID_DYNAMIC_ID = re.compile(r"^\d{18,19}$")
 
 _FILE_NAME = "following_feed_state.json"
+_logger = logging.getLogger(__name__)
 
 
 def _cn_now_ts() -> int:
@@ -370,6 +374,17 @@ def _pipeline_accepts_source_observations() -> bool:
     )
 
 
+def _pipeline_accepts_parameter(name: str) -> bool:
+    try:
+        signature = inspect.signature(run_new_links_pipeline)
+    except (TypeError, ValueError):
+        return False
+    return name in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 def _slice_before_checkpoint(ids: list[str], checkpoint: str | None) -> list[str]:
     """在 checkpoint（含）之前截断，只留下“尚未推进到 checkpoint”的新动态。"""
     if not checkpoint:
@@ -419,23 +434,26 @@ def following_feed_summary(now_ts: int | None = None) -> dict[str, Any]:
     return info
 
 
-def _run_candidate_batch(
+class _MissingLoginUidError(RuntimeError):
+    """No Profile-local UID is available for this feed scan."""
+
+
+def _select_following_candidates(
     ids: list[str],
     *,
     item_by_id: dict[str, dict[str, Any] | None],
-    page_by_id: dict[str, int],
-    on_progress: Callable[[int, int, str], None] | None,
-) -> dict[str, Any]:
-    """Filter one fetched batch and run the existing shared pipeline."""
+    client_factory: Callable[[], BilibiliClient],
+    detail_cache: dict[str, OriginDiscovery],
+) -> tuple[list[str], dict[str, CanonicalIdentity], dict[str, dict[str, str]], set[str], dict[str, int], int]:
+    """Keep feed wrappers and add only their immediate orig once per batch."""
     current_uid = get_login_uid()
-    identity_by_raw: dict[str, CanonicalIdentity] = {}
+    identities: dict[str, CanonicalIdentity] = {}
     for dynamic_id in ids:
         item = item_by_id.get(dynamic_id)
-        if not isinstance(item, dict) or not ("type" in item or "modules" in item):
-            continue
-        identity_by_raw[dynamic_id] = resolve_dynamic_identity(item, dynamic_id)
-    if identity_by_raw and current_uid is None:
-        raise RuntimeError("无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint")
+        if isinstance(item, dict) and ("type" in item or "modules" in item):
+            identities[dynamic_id] = resolve_dynamic_identity(item, dynamic_id)
+    if identities and current_uid is None:
+        raise _MissingLoginUidError("无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint")
 
     counters = {
         "self_skipped": 0,
@@ -443,32 +461,75 @@ def _run_candidate_batch(
         "forward_skipped": 0,
         "canonical_duplicate_skipped": 0,
     }
-    accepted_ids: list[str] = []
+    accepted: list[str] = []
     accepted_identities: dict[str, CanonicalIdentity] = {}
-    canonical_seen: set[str] = set()
-    for dynamic_id in ids:
-        identity = identity_by_raw.get(dynamic_id)
-        if identity is None:
-            accepted_ids.append(dynamic_id)
-            continue
-        if current_uid is not None and identity.wrapper_author_uid == str(current_uid):
-            counters["self_skipped"] += 1
-            if identity.is_forward:
-                counters["forward_skipped"] += 1
-            continue
-        if identity.is_forward:
-            counters["forward_skipped"] += 1
-            if identity.unresolved_reason:
+    provenance: dict[str, dict[str, str]] = {}
+    preserve_ids: set[str] = set()
+    seen: set[str] = set()
+    blocking = 0
+    with ExitStack() as stack:
+        detail_client: BilibiliClient | None = None
+        for dynamic_id in ids:
+            identity = identities.get(dynamic_id)
+            if identity and current_uid is not None and identity.wrapper_author_uid == str(current_uid):
+                counters["self_skipped"] += 1
+                if identity.is_forward:
+                    counters["forward_skipped"] += 1
+                continue
+            if dynamic_id not in seen:
+                seen.add(dynamic_id)
+                accepted.append(dynamic_id)
+                provenance[dynamic_id] = {
+                    "source_id": "following_feed", "discovery_kind": "direct", "via_dynamic_id": "",
+                }
+                if identity is not None:
+                    accepted_identities[dynamic_id] = identity
+            else:
+                counters["canonical_duplicate_skipped"] += 1
+            item = item_by_id.get(dynamic_id)
+            if not is_forward_item(item):
+                continue
+            preserve_ids.add(dynamic_id)
+            origin = discover_origin(item, dynamic_id, cache=detail_cache)
+            if origin.retryable and origin.reason == "origin_detail_pending":
+                if detail_client is None:
+                    detail_client = stack.enter_context(client_factory())
+                origin = discover_origin(item, dynamic_id, client=detail_client, cache=detail_cache)
+            if origin.original_id and origin.original_id != dynamic_id:
+                preserve_ids.add(origin.original_id)
+                if origin.original_id not in seen:
+                    seen.add(origin.original_id)
+                    accepted.append(origin.original_id)
+                    provenance[origin.original_id] = {
+                        "source_id": "following_feed",
+                        "discovery_kind": "repost_origin",
+                        "via_dynamic_id": dynamic_id,
+                    }
+                else:
+                    counters["canonical_duplicate_skipped"] += 1
+            elif origin.retryable:
+                blocking += 1
                 counters["forward_unresolved_skipped"] += 1
-            continue
-        canonical_id = identity.canonical_dynamic_id
-        if canonical_id and canonical_id in canonical_seen:
-            counters["canonical_duplicate_skipped"] += 1
-            continue
-        if canonical_id:
-            canonical_seen.add(canonical_id)
-        accepted_ids.append(dynamic_id)
-        accepted_identities[dynamic_id] = identity
+                _logger.warning("Following 原动态待补读 outer=%s reason=%s", dynamic_id, origin.reason)
+            elif origin.reason:
+                counters["forward_unresolved_skipped"] += 1
+                _logger.info("Following 原动态不可用 outer=%s reason=%s", dynamic_id, origin.reason)
+    return accepted, accepted_identities, provenance, preserve_ids, counters, blocking
+
+
+def _run_candidate_batch(
+    ids: list[str],
+    *,
+    item_by_id: dict[str, dict[str, Any] | None],
+    page_by_id: dict[str, int],
+    on_progress: Callable[[int, int, str], None] | None,
+    client_factory: Callable[[], BilibiliClient],
+    detail_cache: dict[str, OriginDiscovery],
+) -> dict[str, Any]:
+    """Filter one fetched batch and run the existing shared pipeline."""
+    accepted_ids, accepted_identities, provenance, preserve_ids, counters, origin_blocking = _select_following_candidates(
+        ids, item_by_id=item_by_id, client_factory=client_factory, detail_cache=detail_cache,
+    )
 
     urls = [opus_link(dynamic_id) for dynamic_id in accepted_ids]
     if on_progress is not None:
@@ -484,20 +545,25 @@ def _run_candidate_batch(
                 "source_id": "following_feed",
                 "dynamic_id": dynamic_id,
                 "page_index": page_by_id.get(dynamic_id),
+                **provenance.get(dynamic_id, {}),
             }
             for dynamic_id in accepted_ids
         ]
     if accepted_identities and _pipeline_accepts_identity_map():
         pipeline_kwargs["identity_by_raw"] = accepted_identities
+    if preserve_ids and _pipeline_accepts_parameter("preserve_forward_raw_ids"):
+        pipeline_kwargs["preserve_forward_raw_ids"] = preserve_ids
+    if accepted_ids and _pipeline_accepts_parameter("source_context_by_dynamic_id"):
+        pipeline_kwargs["source_context_by_dynamic_id"] = provenance
     pipeline_started = time.perf_counter()
     pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
     metrics = current_metrics()
     if metrics is not None:
         metrics.record_stage_duration("分类中", (time.perf_counter() - pipeline_started) * 1000)
-    blocking_count = 0
+    blocking_count = origin_blocking
     skip_reasons = getattr(pipeline, "skip_reasons", None)
     if isinstance(skip_reasons, dict):
-        blocking_count = sum(
+        blocking_count += sum(
             int(skip_reasons.get(reason, 0) or 0)
             for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
         )
@@ -749,23 +815,23 @@ def scan_following_feed(
     else:
         processed = all_ids[:boundary_index]
 
-    # Following Feed is already scoped by the platform to the current account's
-    # followed-feed.  V33 deliberately does not inspect relationship fields or
-    # chase repost originals: only non-forward originals are in this source's
-    # scope.
-    current_uid = get_login_uid()
-    identity_by_raw: dict[str, CanonicalIdentity] = {}
-    for dynamic_id in processed:
-        item = item_by_id.get(dynamic_id)
-        if not isinstance(item, dict) or not ("type" in item or "modules" in item):
-            continue
-        identity = resolve_dynamic_identity(item, dynamic_id)
-        identity_by_raw[dynamic_id] = identity
-    if identity_by_raw and current_uid is None:
+    # Cursor/anchors remain keyed to the feed's observed outer IDs. The
+    # immediate orig is an additional candidate, never another cursor item.
+    detail_cache: dict[str, OriginDiscovery] = {}
+    try:
+        accepted_ids, accepted_identities, provenance, preserve_ids, counters, origin_blocking = _select_following_candidates(
+            processed,
+            item_by_id=item_by_id,
+            client_factory=client_factory,
+            detail_cache=detail_cache,
+        )
+    except RuntimeError as exc:
+        if risk_code_of(exc) is not None:
+            raise
         return record_diagnostic(
             status="failed",
-            message="无法确认当前账号 UID，已安全跳过本轮且未推进 checkpoint",
-            stop_reason="missing_login_uid",
+            message=str(exc),
+            stop_reason="missing_login_uid" if isinstance(exc, _MissingLoginUidError) else "origin_unavailable",
             pages_fetched=pages_fetched,
             items_seen=items_seen,
             unique_items=len(all_ids),
@@ -773,40 +839,10 @@ def scan_following_feed(
             catch_up_complete=catch_up_complete,
         )
 
-    self_skipped = 0
-    forward_unresolved_skipped = 0
-    forward_skipped = 0
-    canonical_duplicate_skipped = 0
-    accepted_ids: list[str] = []
-    accepted_identities: dict[str, CanonicalIdentity] = {}
-    canonical_seen: set[str] = set()
-    for dynamic_id in processed:
-        identity = identity_by_raw.get(dynamic_id)
-        # Older feed fixtures only contain id_str.  Keep their legacy input
-        # shape; detailed pipeline resolution still applies to those IDs.
-        if identity is None:
-            accepted_ids.append(dynamic_id)
-            continue
-        if current_uid is not None and identity.wrapper_author_uid == str(current_uid):
-            self_skipped += 1
-            if identity.is_forward:
-                forward_skipped += 1
-            continue
-        if identity.is_forward:
-            forward_skipped += 1
-            if identity.unresolved_reason:
-                forward_unresolved_skipped += 1
-            continue
-        canonical_id = identity.canonical_dynamic_id
-        if canonical_id and canonical_id in canonical_seen:
-            # The public pipeline also dedupes after resolution; this local
-            # check avoids a needless classification request for the wrapper.
-            canonical_duplicate_skipped += 1
-            continue
-        if canonical_id:
-            canonical_seen.add(canonical_id)
-        accepted_ids.append(dynamic_id)
-        accepted_identities[dynamic_id] = identity
+    self_skipped = counters["self_skipped"]
+    forward_unresolved_skipped = counters["forward_unresolved_skipped"]
+    forward_skipped = counters["forward_skipped"]
+    canonical_duplicate_skipped = counters["canonical_duplicate_skipped"]
 
     scan_started_at = int(time.time())
     urls = [opus_link(dynamic_id) for dynamic_id in accepted_ids]
@@ -824,11 +860,16 @@ def scan_following_feed(
                 "source_id": "following_feed",
                 "dynamic_id": dynamic_id,
                 "page_index": page_by_id.get(dynamic_id),
+                **provenance.get(dynamic_id, {}),
             }
             for dynamic_id in accepted_ids
         ]
     if accepted_identities and _pipeline_accepts_identity_map():
         pipeline_kwargs["identity_by_raw"] = accepted_identities
+    if preserve_ids and _pipeline_accepts_parameter("preserve_forward_raw_ids"):
+        pipeline_kwargs["preserve_forward_raw_ids"] = preserve_ids
+    if accepted_ids and _pipeline_accepts_parameter("source_context_by_dynamic_id"):
+        pipeline_kwargs["source_context_by_dynamic_id"] = provenance
     pipeline_started = time.perf_counter()
     pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
     metrics = current_metrics()
@@ -848,10 +889,10 @@ def scan_following_feed(
     # 3) pipeline 抛异常 / feed 请求失败 / risk 都发生在写 checkpoint 之前（直接上抛）。
     #    终态安全 skip（404 链接失效、充电/非抽奖、详情提取失败、已结束过滤、去重命中）
     #    不阻塞推进，避免坏动态卡死整轮扫描。
-    blocking_count = 0
+    blocking_count = origin_blocking
     skip_reasons = getattr(pipeline, "skip_reasons", None)
     if isinstance(skip_reasons, dict):
-        blocking_count = sum(
+        blocking_count += sum(
             int(skip_reasons.get(reason, 0) or 0)
             for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
         )
@@ -1108,6 +1149,8 @@ def scan_following_feed(
                     item_by_id=recent_item_by_id,
                     page_by_id=recent_page_by_id,
                     on_progress=on_progress,
+                    client_factory=client_factory,
+                    detail_cache=detail_cache,
                 )
             except RuntimeError as exc:
                 if risk_code_of(exc) is not None:
@@ -1283,6 +1326,8 @@ def scan_following_feed(
                     item_by_id=history_item_by_id,
                     page_by_id=history_page_by_id,
                     on_progress=on_progress,
+                    client_factory=client_factory,
+                    detail_cache=detail_cache,
                 )
             except RuntimeError as exc:
                 if risk_code_of(exc) is not None:
@@ -1369,9 +1414,11 @@ def scan_following_feed(
     # Preserve V16's retryable-pipeline result contract: the Job completes and
     # the message/state explain that candidates remain retryable.  Coverage
     # incompleteness is surfaced as ``incomplete`` when the pipeline itself did
-    # not request a retry.
+    # not request a retry. V107 origin discovery is a source-stage partial, so
+    # expose it as incomplete even though older pipeline-body retries keep
+    # their V16 Job-terminal-success contract.
     overall_incomplete = bool(
-        not blocking_count and not coverage_complete
+        origin_blocking or (not blocking_count and not coverage_complete)
     )
     if blocking_count:
         coverage_message = "部分候选需要后续重试"

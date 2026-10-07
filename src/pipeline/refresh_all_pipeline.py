@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+import inspect
 import time
 from typing import Any, Callable, Literal, Mapping
 
@@ -225,16 +226,17 @@ def _collect_source_context(
         for dynamic_id, metadata in (result.activity_source_context or {}).items():
             if not isinstance(metadata, Mapping):
                 continue
-            topic_id = str(metadata.get("topic_id") or "").strip()
-            if not topic_id:
-                continue
             # Preserve the first source context, matching DS9's existing
             # first-seen cross-topic dedup behavior.
+            topic_id = str(metadata.get("topic_id") or "").strip()
             context.setdefault(
                 str(dynamic_id),
                 {
                     "topic_id": topic_id,
                     "topic_name": str(metadata.get("topic_name") or topic_id),
+                    "source_id": str(metadata.get("source_id") or result.source_id),
+                    "discovery_kind": str(metadata.get("discovery_kind") or "direct"),
+                    "via_dynamic_id": str(metadata.get("via_dynamic_id") or ""),
                 },
             )
     return context
@@ -380,6 +382,7 @@ def run_new_links_pipeline(
     source_context_by_dynamic_id: Mapping[str, Mapping[str, str]] | None = None,
     source_observations: list[Mapping[str, object]] | None = None,
     source_page_stats: list[Mapping[str, object]] | None = None,
+    preserve_forward_raw_ids: set[str] | None = None,
 ) -> PipelineResult:
     """Step 2～5：仅处理新链接（内存流转，末步落库）。
 
@@ -397,6 +400,7 @@ def run_new_links_pipeline(
 
     source_observations = list(source_observations or [])
     source_page_stats = list(source_page_stats or [])
+    preserve_forward_raw_ids = set(preserve_forward_raw_ids or ())
     status_by_raw: dict[str, str] = {}
     canonical_by_raw: dict[str, str] = {}
     for raw_url in raw_urls:
@@ -449,6 +453,10 @@ def run_new_links_pipeline(
     if identity_by_raw and dynamic_ids:
         preclassified_ignored: set[str] = set()
         for dynamic_id in dynamic_ids:
+            if dynamic_id in preserve_forward_raw_ids:
+                # A and its immediate B are independent V107 candidates.
+                # Ignoring B must not silently suppress A before classification.
+                continue
             identity = identity_by_raw.get(dynamic_id)
             canonical = identity.canonical_dynamic_id if identity is not None else ""
             if canonical and canonical in ignored_ids:
@@ -530,7 +538,18 @@ def run_new_links_pipeline(
                 if breaker.opened:
                     break
                 try:
-                    outcome = classify_new_link(shared_client, dynamic_id)
+                    if dynamic_id in preserve_forward_raw_ids:
+                        signature = inspect.signature(classify_new_link)
+                        accepts_outer_only = "outer_only_content" in signature.parameters or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in signature.parameters.values()
+                        )
+                        outcome = (
+                            classify_new_link(shared_client, dynamic_id, outer_only_content=True)
+                            if accepts_outer_only else classify_new_link(shared_client, dynamic_id)
+                        )
+                    else:
+                        outcome = classify_new_link(shared_client, dynamic_id)
 
                 except Exception as exc:
                     # 明确的 404 / Not Found：
@@ -686,12 +705,13 @@ def run_new_links_pipeline(
         identity = (identity_by_raw or {}).get(raw_dynamic_id)
         if identity is None:
             identity = resolve_dynamic_identity(outcome.detail_item, raw_dynamic_id)
-        if identity.is_forward and identity.unresolved_reason:
+        preserve_wrapper = raw_dynamic_id in preserve_forward_raw_ids
+        if identity.is_forward and identity.unresolved_reason and not preserve_wrapper:
             skip_reasons[identity.unresolved_reason] = (
                 skip_reasons.get(identity.unresolved_reason, 0) + 1
             )
             continue
-        canonical_id = identity.canonical_dynamic_id or raw_dynamic_id
+        canonical_id = raw_dynamic_id if preserve_wrapper else (identity.canonical_dynamic_id or raw_dynamic_id)
         canonical_by_raw[raw_dynamic_id] = canonical_id
         if not canonical_id:
             skip_reasons["forward_identity_unresolved"] = (
@@ -716,7 +736,16 @@ def run_new_links_pipeline(
             continue
         canonical_seen.add(canonical_id)
         outcome.dynamic_id = canonical_id
-        if identity.canonical_item is not None:
+        if preserve_wrapper:
+            identity = CanonicalIdentity(
+                raw_dynamic_id=raw_dynamic_id,
+                canonical_dynamic_id=raw_dynamic_id,
+                wrapper_author_uid=identity.wrapper_author_uid,
+                canonical_author_uid=identity.wrapper_author_uid,
+                is_forward=identity.is_forward,
+                canonical_item=outcome.detail_item,
+            )
+        elif identity.canonical_item is not None:
             outcome.detail_item = identity.canonical_item
         if canonical_id != raw_dynamic_id:
             # A notice keyed by the wrapper cannot safely be reused for the
@@ -920,6 +949,12 @@ def run_new_links_pipeline(
                                 identity.observed_wrapper_dynamic_id
                             )
                             row["observed_wrapper_author_uid"] = identity.wrapper_author_uid
+                    source_context = (source_context_by_dynamic_id or {}).get(activity.dynamic_id)
+                    if source_context:
+                        row["source_discovery"] = {
+                            key: str(source_context.get(key) or "")
+                            for key in ("source_id", "topic_id", "discovery_kind", "via_dynamic_id")
+                        }
                     enriched_rows.append(row)
                     done += 1
 
@@ -1034,6 +1069,12 @@ def run_refresh_all_pipeline(
     raw_links = _collect_updated_links(ds_results)
     source_context = _collect_source_context(ds_results)
     source_observations, source_page_stats = _collect_source_observations(ds_results)
+    preserve_forward_ids = {
+        dynamic_id
+        for result in ds_results if result.updated
+        for dynamic_id in (result.activity_preserve_forward_ids or [])
+    }
+    pipeline_kwargs = {"preserve_forward_raw_ids": preserve_forward_ids} if preserve_forward_ids else {}
     return run_new_links_pipeline(
         raw_links,
         workers=workers,
@@ -1042,4 +1083,5 @@ def run_refresh_all_pipeline(
         source_context_by_dynamic_id=source_context,
         source_observations=source_observations,
         source_page_stats=source_page_stats,
+        **pipeline_kwargs,
     )

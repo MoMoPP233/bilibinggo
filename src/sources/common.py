@@ -44,6 +44,10 @@ class CheckResult:
     # Optional source metadata used by diagnostic side channels.  Business
     # deduplication and activity persistence continue to use activity_links.
     activity_source_context: dict[str, dict[str, str]] = field(default_factory=dict)
+    # V107: source-scoped opt-in for classifying a repost wrapper under its
+    # own ID while its immediate orig is a separate candidate. Other sources
+    # keep the existing canonicalize-to-orig behavior.
+    activity_preserve_forward_ids: list[str] = field(default_factory=list)
     # One entry per source observation.  Unlike activity_source_context this
     # intentionally preserves cross-topic/page duplicates for audit only.
     activity_source_observations: list[dict[str, str]] = field(default_factory=list)

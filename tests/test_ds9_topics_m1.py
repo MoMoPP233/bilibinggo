@@ -63,10 +63,12 @@ def _entry(outer: str, *, orig: str | None = None, dtype: int = 0) -> dict:
 class _FakeTopicClient:
     """可编程 fake：每话题现代 feed/topic 数据 + 可选异常/offset 页。"""
 
-    def __init__(self, *, data_by_topic=None, errors_by_topic=None, history_by_topic=None):
+    def __init__(self, *, data_by_topic=None, errors_by_topic=None, history_by_topic=None, detail_by_id=None):
         self.data_by_topic = dict(data_by_topic or {})
         self.errors_by_topic = dict(errors_by_topic or {})
         self.history_by_topic = dict(history_by_topic or {})
+        self.detail_by_id = dict(detail_by_id or {})
+        self.detail_calls: list[str] = []
         self.calls: list[tuple[str, str, str]] = []
         self.history_calls: list[tuple[str, str]] = []
 
@@ -98,6 +100,17 @@ class _FakeTopicClient:
         else:
             payload = self.data_by_topic.get(topic_id, {"code": 0, "data": {}})
         return payload
+
+    def request_json(self, _url, params=None, **_kwargs):
+        dynamic_id = str((params or {}).get("id") or "")
+        self.detail_calls.append(dynamic_id)
+        response = self.detail_by_id.get(dynamic_id)
+        if isinstance(response, Exception):
+            raise response
+        return response if response is not None else {
+            "code": 0,
+            "data": {"item": {"id_str": dynamic_id, "type": "DYNAMIC_TYPE_FORWARD"}},
+        }
 
 
 def _original_payload(outer: str) -> dict:
@@ -297,7 +310,7 @@ def test_original_dynamic_goes_to_pipeline_then_checkpoint(state_path: Path, mon
     assert record[TOPIC_A]["last_error"] == ""
 
 
-# ---------- E：转发动态 canonical=orig ----------
+# ---------- E：转发动态外层与直接 orig 分别作为候选 ----------
 
 
 def test_repost_canonical_is_orig_not_outer(state_path: Path, monkeypatch) -> None:
@@ -308,27 +321,35 @@ def test_repost_canonical_is_orig_not_outer(state_path: Path, monkeypatch) -> No
     client = _FakeTopicClient(data_by_topic={TOPIC_A: payload})
     _install_client(monkeypatch, client)
     result = ds9.check_update()
-    assert f"opus/{DID3}" not in result.activity_links  # outer 不进参与链
-    assert result.activity_links == [f"https://www.bilibili.com/opus/{DID1}"]
+    assert result.activity_links == [
+        f"https://www.bilibili.com/opus/{DID3}",
+        f"https://www.bilibili.com/opus/{DID1}",
+    ]
+    assert result.activity_preserve_forward_ids == [DID1, DID3]
+    assert client.detail_calls == []
     commit_source_checkpoint(result)
     record = {t["topic_id"]: t for t in ds9.list_topics()}
     assert record[TOPIC_A]["incomplete"] == []
 
 
-# ---------- F：转发缺 orig → incomplete，绝不拿 outer 顶替 ----------
+# ---------- F：转发缺 orig 且补读网络失败 → 外层保留、来源 partial ----------
 
 
 def test_repost_without_orig_is_incomplete_retryable(state_path: Path, monkeypatch) -> None:
     payload = {"code": 0, "data": {"hot_list": [_entry(DID3, dtype=1)]}}
-    client = _FakeTopicClient(data_by_topic={TOPIC_A: payload})
+    client = _FakeTopicClient(
+        data_by_topic={TOPIC_A: payload},
+        detail_by_id={DID3: RuntimeError("网络请求失败: timeout")},
+    )
     _install_client(monkeypatch, client)
     result = ds9.check_update()
-    assert result.activity_links == []  # outer 不入参与链
+    assert result.activity_links == [f"https://www.bilibili.com/opus/{DID3}"]
     assert result.updated is True  # 有状态变化需要提交
+    assert result.source_complete is False
     commit_source_checkpoint(result)
     record = {t["topic_id"]: t for t in ds9.list_topics()}
-    assert record[TOPIC_A]["incomplete"] == [DID3]
-    assert record[TOPIC_A]["fp"] is not None
+    assert record[TOPIC_A]["fp"] is None
+    assert client.detail_calls == [DID3]
 
 
 # ---------- G：两话题发现同一动态，batch 内只产生一个链接 ----------
@@ -345,10 +366,8 @@ def test_same_dynamic_from_two_topics_deduplicated(state_path: Path, monkeypatch
     result = ds9.check_update()
     assert result.activity_links == [f"https://www.bilibili.com/opus/{DID1}"]
     assert len(result.activity_links) == 1
-    assert result.activity_source_context[DID1] == {
-        "topic_id": TOPIC_A,
-        "topic_name": "抽奖！！！",
-    }
+    assert result.activity_source_context[DID1]["topic_id"] == TOPIC_A
+    assert result.activity_source_context[DID1]["topic_name"] == "抽奖！！！"
     # 最终活动库去重由公共 run_new_links_pipeline 的 known_activity_ids 兜底。
 
 
@@ -467,6 +486,7 @@ def test_fingerprint_same_with_unresolved_still_retries(state_path: Path, monkey
     client = _FakeTopicClient(
         data_by_topic={TOPIC_A: payload_outer},
         history_by_topic={TOPIC_A: empty_history},
+        detail_by_id={DID3: RuntimeError("网络请求失败: timeout")},
     )
     _install_client(monkeypatch, client)
     result = ds9.check_update()
@@ -477,6 +497,7 @@ def test_fingerprint_same_with_unresolved_still_retries(state_path: Path, monkey
     client2 = _FakeTopicClient(
         data_by_topic={TOPIC_A: payload_outer},
         history_by_topic={TOPIC_A: empty_history},
+        detail_by_id={DID3: RuntimeError("网络请求失败: timeout")},
     )
     _install_client(monkeypatch, client2)
     result2 = ds9.check_update()
@@ -589,6 +610,7 @@ def test_modern_topic_offset_pagination_is_bounded(state_path: Path, monkeypatch
 
     assert result.activity_links == [
         f"https://www.bilibili.com/opus/{DID1}",
+        f"https://www.bilibili.com/opus/{DID3}",
         f"https://www.bilibili.com/opus/{DID2}",
     ]
     assert client.history_calls == [(TOPIC_A, "page-2")]

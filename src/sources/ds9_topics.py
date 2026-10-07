@@ -6,9 +6,8 @@
 - 同一 Profile 内：每个 topic_id 独立配置、启用状态、checkpoint/fingerprint、
   incomplete（转发关系不完整）列表、最近成功/错误——状态文件按 Profile 存放，
   绝不跨 Profile 共享。
-- 候选经 outer/orig 规范化后交给现有公共活动流水线（run_new_links_pipeline 等
-  现有链路）；活动主键必须是真正目标抽奖动态（转发取 orig.id_str；取不到可靠
-  orig 的转发标记 incomplete 并保持 retryable，绝不拿 outer 当原动态）。
+- V107 转发的 outer 与直接 orig 分别作为候选交给现有公共流水线；只展开一层。
+  orig 补读暂时失败时保留 outer 并标记来源 incomplete，不提前推进 checkpoint。
 - 先处理后提交：per-topic fingerprint/checkpoint 只在公共流水线成功后的
   commit 钩子（挂到 CheckResult.ds9_topic_commit，由 sources.common.
   commit_source_checkpoint 在流水线成功后调用）里落盘；获取或流水线失败都
@@ -35,6 +34,7 @@ from typing import Any
 from src.bilibili_client import BilibiliClient
 from src.data_paths import get_atomic_path_lock, get_profile_dir
 from src.platform_risk import risk_code_of
+from src.repost_origin_discovery import OriginDiscovery, discover_origin, is_forward_item
 from src.sources.common import CheckResult, is_valid_dynamic_id, opus_link
 
 SOURCE_ID = "DS-9"
@@ -322,6 +322,44 @@ def normalize_topic_entries(entries: list[dict]) -> tuple[list[str], list[str], 
     return resolved, incomplete, outers
 
 
+def _expand_topic_entries(
+    entries: list[dict],
+    client: BilibiliClient,
+    detail_cache: dict[str, OriginDiscovery],
+) -> tuple[list[str], list[str], list[str], dict[str, dict[str, str]], set[str]]:
+    """Keep each outer and add its immediate orig as one extra candidate."""
+    candidates: list[str] = []
+    incomplete: list[str] = []
+    outers: list[str] = []
+    provenance: dict[str, dict[str, str]] = {}
+    preserve_ids: set[str] = set()
+    for entry in entries:
+        desc = entry.get("desc") if isinstance(entry.get("desc"), dict) else {}
+        outer = _entry_dynamic_id(desc, entry)
+        if outer is None:
+            continue
+        outers.append(outer)
+        candidates.append(outer)
+        provenance.setdefault(outer, {"discovery_kind": "direct", "via_dynamic_id": ""})
+        if not is_forward_item(entry):
+            continue
+        preserve_ids.add(outer)
+        origin = discover_origin(entry, outer, client=client, cache=detail_cache)
+        if origin.original_id and origin.original_id != outer:
+            preserve_ids.add(origin.original_id)
+            candidates.append(origin.original_id)
+            provenance.setdefault(
+                origin.original_id,
+                {"discovery_kind": "repost_origin", "via_dynamic_id": outer},
+            )
+        elif origin.retryable:
+            incomplete.append(outer)
+            _logger.warning("DS9 话题原动态待补读 outer=%s reason=%s", outer, origin.reason)
+        elif origin.reason:
+            _logger.info("DS9 话题原动态不可用 outer=%s reason=%s", outer, origin.reason)
+    return list(dict.fromkeys(candidates)), list(dict.fromkeys(incomplete)), list(dict.fromkeys(outers)), provenance, preserve_ids
+
+
 def fingerprint_of_topic(outer_ids: list[str]) -> str:
     """只基于稳定动态 ID 顺序集合；不含任何持续波动的统计字段。"""
     digest = hashlib.sha256()
@@ -579,7 +617,11 @@ def check_update(*, force: bool = False) -> CheckResult:
     activity_source_observations: list[dict[str, str]] = []
     source_page_stats: list[dict[str, object]] = []
     failed_topic_ids: list[str] = []
+    incomplete_origin_topics: list[str] = []
+    origin_retryable_outers: list[str] = []
     nochange_topic_ids: list[str] = []
+    preserve_forward_ids: set[str] = set()
+    detail_cache: dict[str, OriginDiscovery] = {}
 
     with BilibiliClient() as client:
         for record in records:
@@ -590,7 +632,12 @@ def check_update(*, force: bool = False) -> CheckResult:
             prev_incomplete = list(record.get("incomplete") or [])
             try:
                 new_entries, first_offset, first_has_more = _fetch_topic_page(client, topic_id)
-                resolved, incomplete, outers = normalize_topic_entries(new_entries)
+                outers = list(dict.fromkeys(
+                    outer for entry in new_entries
+                    if (outer := _entry_dynamic_id(
+                        entry.get("desc") if isinstance(entry.get("desc"), dict) else {}, entry,
+                    )) is not None
+                ))
                 fp = fingerprint_of_topic(outers)
                 needs = force or fp != prev_fp or bool(prev_incomplete)
                 page_entries: list[tuple[int, list[dict]]] = [(1, new_entries)]
@@ -603,25 +650,6 @@ def check_update(*, force: bool = False) -> CheckResult:
                         first_has_more=first_has_more,
                     )
                     page_entries.extend(history_pages)
-                    history = [entry for _, page in history_pages for entry in page]
-                    resolved_h, incomplete_h, outers_h = normalize_topic_entries(history)
-                    for item in incomplete_h:
-                        if item not in incomplete:
-                            incomplete.append(item)
-                    seen_outer: set[str] = set()
-                    for item in outers_h:
-                        if item not in seen_outer:
-                            seen_outer.add(item)
-                            outers.append(item)
-                    for item in resolved_h:
-                        if item not in resolved:
-                            resolved.append(item)
-                    # 旧 incomplete 若已不在有限窗口内，继续保留；若本轮重新看到且
-                    # 已得到结构化 orig，则自然移除，避免因滑出三页窗口永久丢失。
-                    visible_outers = set(outers)
-                    for item in prev_incomplete:
-                        if item not in visible_outers and item not in incomplete:
-                            incomplete.append(item)
                 if not needs:
                     # 无变化且无未完成项：本轮无产出。last_scan_at 是纯观察字段
                     # （不参与 fp/checkpoint/去重/是否扫描），仍然持久化以便重启后可读。
@@ -629,9 +657,26 @@ def check_update(*, force: bool = False) -> CheckResult:
                     nochange_topic_ids.append(topic_id)
                     continue
 
+                resolved: list[str] = []
+                incomplete: list[str] = []
+                topic_retryable = False
+                provenance: dict[str, dict[str, str]] = {}
+                topic_preserve_ids: set[str] = set()
+                visible_outers: set[str] = set()
                 seen_page_ids: set[str] = set()
                 for page_index, entries in page_entries:
-                    page_resolved, _page_incomplete, _page_outers = normalize_topic_entries(entries)
+                    page_resolved, page_incomplete, page_outers, page_provenance, page_preserve_ids = _expand_topic_entries(
+                        entries, client, detail_cache,
+                    )
+                    topic_preserve_ids.update(page_preserve_ids)
+                    resolved.extend(page_resolved)
+                    incomplete.extend(page_incomplete)
+                    if page_incomplete:
+                        topic_retryable = True
+                        origin_retryable_outers.extend(page_incomplete)
+                    visible_outers.update(page_outers)
+                    for candidate, metadata in page_provenance.items():
+                        provenance.setdefault(candidate, metadata)
                     duplicate_count = 0
                     for canonical in page_resolved:
                         if canonical in seen_page_ids:
@@ -657,6 +702,15 @@ def check_update(*, force: bool = False) -> CheckResult:
                             "batch_duplicate_count": duplicate_count,
                         }
                     )
+                resolved = list(dict.fromkeys(resolved))
+                incomplete = list(dict.fromkeys(incomplete))
+                # Older unresolved wrappers outside the bounded visible window
+                # remain retryable, as before. A visible resolved wrapper clears.
+                for outer in prev_incomplete:
+                    if outer not in visible_outers and outer not in incomplete:
+                        incomplete.append(outer)
+                if topic_retryable:
+                    incomplete_origin_topics.append(topic_id)
             except Exception as exc:  # noqa: BLE001 - 普通失败按话题隔离；风险继续上抛
                 if risk_code_of(exc) is not None:
                     raise
@@ -666,6 +720,7 @@ def check_update(*, force: bool = False) -> CheckResult:
                 continue
 
             # 本轮该话题产生产出（或空批次变化）：提交计划挂在流水线成功之后。
+            preserve_forward_ids.update(topic_preserve_ids)
             for canonical in resolved:
                 if canonical not in seen_links:
                     seen_links.add(canonical)
@@ -673,6 +728,8 @@ def check_update(*, force: bool = False) -> CheckResult:
                     activity_source_context[canonical] = {
                         "topic_id": topic_id,
                         "topic_name": str(record.get("name") or topic_id),
+                        "source_id": SOURCE_ID,
+                        **provenance.get(canonical, {}),
                     }
             pending.append(
                 {
@@ -701,8 +758,9 @@ def check_update(*, force: bool = False) -> CheckResult:
 
     updated = bool(pending)
     summary = {
-        "partial": bool(failed_topic_ids),
+        "partial": bool(failed_topic_ids or incomplete_origin_topics),
         "failed_topics": failed_topic_ids,
+        "incomplete_origin_topics": incomplete_origin_topics,
         "pending_commit": len(pending),
     }
     result = CheckResult(
@@ -716,8 +774,11 @@ def check_update(*, force: bool = False) -> CheckResult:
         activity_links=links,
         checked_at=now,
         activity_source_context=activity_source_context,
+        activity_preserve_forward_ids=sorted(preserve_forward_ids),
         activity_source_observations=activity_source_observations,
         source_page_stats=source_page_stats,
+        source_complete=not bool(incomplete_origin_topics),
+        source_incomplete_containers=[opus_link(outer) for outer in dict.fromkeys(origin_retryable_outers)],
     )
     # 提交钩子：公共流水线成功（common.commit_source_checkpoint）后执行。
     result.ds9_summary = summary  # type: ignore[attr-defined]
