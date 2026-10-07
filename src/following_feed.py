@@ -97,12 +97,31 @@ def _initialize_v74_state(state: dict[str, Any], now: int) -> bool:
         "history_target_checkpoint": None,
         "history_target_anchors": [],
         "history_seen_anchors": [],
+        # A hard-capped live window may create a newer gap while the older
+        # history cursor is already in flight.  Keep that gap independent.
+        "recent_offset": None,
+        "recent_next_page": None,
+        "recent_target_checkpoint": None,
+        "recent_target_anchors": [],
+        "recent_seen_anchors": [],
+        "recent_stop_reason": None,
     }
     for key, value in defaults.items():
         if key not in state:
             state[key] = value
             changed = True
     return changed
+
+
+def _clear_recent_state(state: dict[str, Any]) -> None:
+    state.update(
+        recent_offset=None,
+        recent_next_page=None,
+        recent_target_checkpoint=None,
+        recent_target_anchors=[],
+        recent_seen_anchors=[],
+        recent_stop_reason="recent_complete",
+    )
 
 # 仍需以后重试的失败：动态仍可能存在，只是本轮未能成功处理完毕。
 # checkpoint 不得越过这类候选。其余 pipeline skip 均属终态安全项，不阻塞推进。
@@ -171,6 +190,7 @@ def _read_state_checked() -> tuple[dict[str, Any], bool, str]:
         "history_items_seen",
         "history_oldest_seen_at",
         "gap_cutoff_at",
+        "recent_next_page",
     ):
         value = raw.get(key)
         if value is not None and (not isinstance(value, int) or value < 0):
@@ -189,13 +209,29 @@ def _read_state_checked() -> tuple[dict[str, Any], bool, str]:
     history_offset = raw.get("history_offset")
     if history_offset is not None and not isinstance(history_offset, str):
         return {}, False, "following_feed_state_corrupt"
+    recent_offset = raw.get("recent_offset")
+    if recent_offset is not None and not isinstance(recent_offset, str):
+        return {}, False, "following_feed_state_corrupt"
+    if bool(recent_offset) != bool(raw.get("recent_next_page")):
+        return {}, False, "following_feed_state_corrupt"
+    recent_target_checkpoint = raw.get("recent_target_checkpoint")
+    if recent_target_checkpoint is not None and (
+        not isinstance(recent_target_checkpoint, str)
+        or not _VALID_DYNAMIC_ID.fullmatch(recent_target_checkpoint)
+    ):
+        return {}, False, "following_feed_state_corrupt"
+    if raw.get("recent_stop_reason") is not None and not isinstance(raw["recent_stop_reason"], str):
+        return {}, False, "following_feed_state_corrupt"
     history_target_checkpoint = raw.get("history_target_checkpoint")
     if history_target_checkpoint is not None and (
         not isinstance(history_target_checkpoint, str)
         or not _VALID_DYNAMIC_ID.fullmatch(history_target_checkpoint)
     ):
         return {}, False, "following_feed_state_corrupt"
-    for key in ("history_target_anchors", "history_seen_anchors"):
+    for key in (
+        "history_target_anchors", "history_seen_anchors",
+        "recent_target_anchors", "recent_seen_anchors",
+    ):
         values = raw.get(key)
         if values is not None and (
             not isinstance(values, list)
@@ -278,6 +314,8 @@ def following_feed_info() -> dict[str, Any]:
         "history_items_seen": int(state.get("history_items_seen") or 0),
         "history_oldest_seen_at": state.get("history_oldest_seen_at"),
         "history_stop_reason": state.get("history_stop_reason"),
+        "recent_pending": bool(state.get("recent_offset")),
+        "recent_stop_reason": state.get("recent_stop_reason"),
         "coverage_gap": bool(state.get("coverage_gap")),
         "last_processed": int(state.get("last_processed") or 0),
     }
@@ -507,6 +545,7 @@ def scan_following_feed(
         and state.get("history_offset")
         and state.get("history_next_page")
     )
+    recent_ready_before_live = bool(state.get("recent_offset") and state.get("recent_next_page"))
     history_was_complete = state.get("history_status") == "complete"
 
     checkpoint = str(state.get("last_seen_dynamic_id") or "") or None
@@ -872,14 +911,19 @@ def scan_following_feed(
         and not catch_up_complete
         and not blocking_count
         and offset
+        and history_ready_before_live
     ):
-        # A new live gap supersedes an older cursor chain.  Restart history at
-        # the end of the newly processed live window so the interval between
-        # that window and the prior backfill cannot be skipped.
-        state["history_offset"] = offset
-        state["history_next_page"] = pages_fetched + 1
-        state["history_stop_reason"] = "history_cursor_reset_for_live_gap"
-        history_ready_before_live = False
+        # The new live gap is newer than the already advancing old history.
+        # Re-seek the recent gap from this live window, retaining its original
+        # target across further hard caps.  Never replace the old cursor.
+        if not state.get("recent_offset"):
+            state["recent_target_checkpoint"] = checkpoint
+            state["recent_target_anchors"] = list(old_anchors)
+            state["recent_seen_anchors"] = []
+        state["recent_offset"] = offset
+        state["recent_next_page"] = pages_fetched + 1
+        state["recent_stop_reason"] = "recent_cursor_seeded"
+        state["recent_seen_anchors"] = []
     if state.get("history_status") == "pending" and not blocking_count:
         if not has_more:
             state.update(
@@ -892,6 +936,7 @@ def scan_following_feed(
                     "history_stop_reason": "has_more_false",
                 }
             )
+            _clear_recent_state(state)
         elif cutoff_reached:
             state.update(
                 {
@@ -903,6 +948,7 @@ def scan_following_feed(
                     "history_stop_reason": "history_cutoff_reached",
                 }
             )
+            _clear_recent_state(state)
         elif not history_ready_before_live and offset:
             state["history_offset"] = offset
             state["history_next_page"] = pages_fetched + 1
@@ -947,8 +993,162 @@ def scan_following_feed(
     state["last_catch_up_complete"] = catch_up_complete
     state["coverage_gap"] = bool(
         not catch_up_complete or state.get("history_status") != "complete"
+        or state.get("recent_offset")
     )
     _write_state(state)
+
+    recent_pages_this_run = 0
+    recent_batch: dict[str, Any] | None = None
+    recent_attempted = False
+    if recent_ready_before_live and state.get("recent_offset") and not blocking_count:
+        recent_attempted = True
+        recent_ids: list[str] = []
+        recent_item_by_id: dict[str, dict[str, Any] | None] = {}
+        recent_page_by_id: dict[str, int] = {}
+        # Live may have fetched IDs *after* its checkpoint on the boundary
+        # page without processing them.  Only processed IDs are safe to skip.
+        recent_seen_ids = set(processed)
+        recent_seen_offsets: set[str] = set()
+        recent_boundary_index: int | None = None
+        recent_complete = False
+        recent_error = ""
+        recent_stop_reason = "recent_page_budget_reached"
+        recent_next_offset = str(state["recent_offset"])
+        recent_next_page = int(state["recent_next_page"])
+        recent_next_page_after = recent_next_page
+        recent_target = str(state.get("recent_target_checkpoint") or "")
+        recent_anchors = set(state.get("recent_target_anchors") or [])
+        recent_seen_anchors = set(state.get("recent_seen_anchors") or [])
+        recent_anchor_positions: list[int] = []
+        recent_items_this_run = 0
+
+        with client_factory() as client:
+            for _ in range(FOLLOW_FEED_HISTORY_PAGES_PER_RUN):
+                payload = client.get_json(
+                    FOLLOW_FEED_URL,
+                    {"type": "all", "page": recent_next_page, "offset": recent_next_offset},
+                    referer=FOLLOW_FEED_REFERER,
+                    retries=0,
+                )
+                recent_pages_this_run += 1
+                try:
+                    data, page_items, offset, has_more = validate_page(payload, recent_next_page)
+                except ValueError as exc:
+                    recent_error = str(exc)
+                    recent_stop_reason = "recent_response_invalid"
+                    break
+                recent_items_this_run += len(data.get("items") or [])
+                page_times: list[int] = []
+                for dynamic_id, item in page_items:
+                    # A target can also have appeared in the live window.  It
+                    # still closes this contiguous recent walk at this point.
+                    if recent_target and dynamic_id == recent_target:
+                        recent_boundary_index = len(recent_ids)
+                        recent_complete = True
+                        recent_stop_reason = "recent_checkpoint_reached"
+                        break
+                    if dynamic_id in recent_seen_ids:
+                        continue
+                    recent_seen_ids.add(dynamic_id)
+                    recent_ids.append(dynamic_id)
+                    recent_item_by_id[dynamic_id] = item
+                    recent_page_by_id[dynamic_id] = recent_next_page
+                    if dynamic_id in recent_anchors:
+                        recent_seen_anchors.add(dynamic_id)
+                        recent_anchor_positions.append(len(recent_ids) - 1)
+                    if isinstance(item, dict):
+                        timestamp = extract_feed_pub_ts(item)
+                        if timestamp is not None:
+                            page_times.append(timestamp)
+                if recent_complete:
+                    break
+                required_hits = min(3, len(recent_anchors))
+                if required_hits and len(recent_seen_anchors) >= required_hits:
+                    recent_boundary_index = min(recent_anchor_positions, default=len(recent_ids))
+                    recent_complete = True
+                    recent_stop_reason = "recent_anchor_reached"
+                elif page_times and max(page_times) <= int(
+                    state.get("gap_cutoff_at")
+                    if state.get("history_mode") == "gap" and state.get("gap_cutoff_at")
+                    else state["history_cutoff_at"]
+                ):
+                    recent_complete = True
+                    recent_stop_reason = "recent_cutoff_reached"
+                elif not has_more:
+                    recent_complete = True
+                    recent_stop_reason = "recent_has_more_false"
+                elif not offset:
+                    recent_error = "近期追赶响应缺少下一页 offset"
+                    recent_stop_reason = "recent_missing_next_offset"
+                elif offset == recent_next_offset or offset in recent_seen_offsets:
+                    recent_error = "近期追赶响应返回重复 offset"
+                    recent_stop_reason = "recent_repeated_offset"
+                else:
+                    recent_seen_offsets.add(offset)
+                    recent_next_offset = offset
+                    recent_next_page += 1
+                    recent_next_page_after = recent_next_page
+                    continue
+                break
+
+        if recent_error:
+            state["recent_stop_reason"] = recent_stop_reason
+            state["last_scan_status"] = "incomplete"
+            state["last_error"] = recent_error
+            state["coverage_gap"] = True
+            _write_state(state)
+        else:
+            recent_candidates = (
+                recent_ids if recent_boundary_index is None
+                else recent_ids[:recent_boundary_index]
+            )
+            try:
+                recent_batch = _run_candidate_batch(
+                    recent_candidates,
+                    item_by_id=recent_item_by_id,
+                    page_by_id=recent_page_by_id,
+                    on_progress=on_progress,
+                )
+            except RuntimeError as exc:
+                if risk_code_of(exc) is not None:
+                    raise
+                state["recent_stop_reason"] = "recent_pipeline_error"
+                state["last_scan_status"] = "incomplete"
+                state["last_error"] = str(exc)
+                state["coverage_gap"] = True
+                _write_state(state)
+            else:
+                recent_blocking = int(recent_batch["blocking_count"])
+                if recent_blocking:
+                    state["recent_stop_reason"] = "recent_pipeline_partial"
+                elif recent_complete:
+                    _clear_recent_state(state)
+                else:
+                    state["recent_offset"] = recent_next_offset
+                    state["recent_next_page"] = recent_next_page_after
+                    state["recent_seen_anchors"] = sorted(recent_seen_anchors)
+                    state["recent_stop_reason"] = recent_stop_reason
+                found += len(recent_candidates)
+                added += int(recent_batch["added"])
+                state["last_found"] = found
+                state["last_added"] = added
+                state["accepted"] = int(state.get("accepted") or 0) + int(recent_batch["accepted"])
+                state["inserted"] = added
+                for key in (
+                    "self_skipped", "forward_unresolved_skipped", "forward_skipped",
+                    "canonical_duplicate_skipped",
+                ):
+                    state[key] = int(state.get(key) or 0) + int(recent_batch[key])
+                state["last_pages_fetched"] = pages_fetched + recent_pages_this_run
+                state["last_items_seen"] = items_seen + recent_items_this_run
+                state["last_unique_items"] = len(set(all_ids) | set(recent_ids))
+                state["last_new_items"] = found
+                state["last_processed"] = found
+                state["last_scan_status"] = "incomplete"
+                state["last_status"] = "success" if not recent_blocking else "incomplete"
+                state["last_error"] = "" if not recent_blocking else "近期追赶 pipeline 未完整"
+                state["coverage_gap"] = True
+                _write_state(state)
 
     history_pages_this_run = 0
     history_items_this_run = 0
@@ -958,6 +1158,8 @@ def scan_following_feed(
         history_ready_before_live
         and state.get("history_status") == "pending"
         and not blocking_count
+        and not recent_attempted
+        and not state.get("recent_offset")
     ):
         history_ids: list[str] = []
         history_item_by_id: dict[str, dict[str, Any] | None] = {}
@@ -1162,7 +1364,8 @@ def scan_following_feed(
                 _write_state(state)
 
     history_pending = state.get("history_status") != "complete"
-    coverage_complete = bool(catch_up_complete and not history_pending)
+    recent_pending = bool(state.get("recent_offset"))
+    coverage_complete = bool(catch_up_complete and not recent_pending and not history_pending)
     # Preserve V16's retryable-pipeline result contract: the Job completes and
     # the message/state explain that candidates remain retryable.  Coverage
     # incompleteness is surfaced as ``incomplete`` when the pipeline itself did
@@ -1172,6 +1375,8 @@ def scan_following_feed(
     )
     if blocking_count:
         coverage_message = "部分候选需要后续重试"
+    elif recent_pending:
+        coverage_message = f"近期追赶尚未完成（{state.get('recent_stop_reason') or stop_reason}）"
     elif history_pending:
         coverage_message = f"历史追赶尚未完成（{state.get('history_stop_reason') or stop_reason}）"
     elif not catch_up_complete:
@@ -1193,6 +1398,7 @@ def scan_following_feed(
         "added": added,
         "inserted": added,
         "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0)
+        + int((recent_batch or {}).get("new_link_count") or 0)
         + int((history_batch or {}).get("new_link_count") or 0),
         "self_skipped": int(state.get("self_skipped") or 0),
         "forward_unresolved_skipped": int(state.get("forward_unresolved_skipped") or 0),
@@ -1201,6 +1407,8 @@ def scan_following_feed(
         "pages_fetched": int(state.get("last_pages_fetched") or pages_fetched),
         "live_pages_fetched": pages_fetched,
         "history_pages_fetched": history_pages_this_run,
+        "recent_pages_fetched": recent_pages_this_run,
+        "recent_stop_reason": state.get("recent_stop_reason"),
         "catch_up_complete": coverage_complete,
         "live_catch_up_complete": catch_up_complete,
         "history_status": state.get("history_status"),
