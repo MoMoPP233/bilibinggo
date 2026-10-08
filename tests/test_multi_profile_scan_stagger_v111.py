@@ -79,11 +79,11 @@ def test_refresh_due_is_base_plus_offset(monkeypatch, offset, expected):
     assert due(scheduler, "refresh", at(12, 40), at(12, 30)) == expected
 
 
-def test_all_three_heavy_scan_kinds_shift_and_keep_own_base(monkeypatch):
+def test_only_refresh_and_following_shift_while_winner_keeps_base(monkeypatch):
     scheduler = AutoScheduler()
     monkeypatch.setattr(scheduler, "_scan_offset_minutes", lambda: 15)
     now = at(11, 50)
-    assert due(scheduler, "winner", at(12, 10), now) == at(12, 25)
+    assert due(scheduler, "winner", at(12, 10), now) == at(12, 10)
     assert due(scheduler, "refresh", at(12, 40), now) == at(12, 55)
     assert due(scheduler, "following", at(14, 0), now) == at(14, 15)
 

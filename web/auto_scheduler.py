@@ -420,7 +420,10 @@ class AutoScheduler:
                 day = (now + timedelta(days=base_day)).date()
                 for kind, base in _scan_bases_on_day(day):
                     key = (kind, base.isoformat())
-                    desired = _shift_scan_due(base, offset, night_continue=night_continue)
+                    # Only the refresh batch and Following feed use V111's
+                    # multi-Profile offset. Winner keeps its original slot.
+                    kind_offset = offset if kind in {"refresh", "following"} else 0
+                    desired = _shift_scan_due(base, kind_offset, night_continue=night_continue)
                     previous = self._scan_plans.get(key)
                     # Leaving a higher rank after the base minute must not
                     # turn a still-pending scan into an immediate catch-up.
