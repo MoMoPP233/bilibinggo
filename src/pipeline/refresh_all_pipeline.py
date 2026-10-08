@@ -85,6 +85,19 @@ class PipelineResult:
         return self.new_link_count
 
 
+@dataclass
+class PipelineBatchContext:
+    """Preserve one source run's dedupe and LLM budget across durable batches.
+
+    Only Following opts in. Ordinary pipeline callers retain their original
+    per-call snapshots and breaker lifetime.
+    """
+
+    breaker: LlmProviderBreaker = field(default_factory=LlmProviderBreaker)
+    known_ids: set[str] | None = None
+    canonical_seen: set[str] = field(default_factory=set)
+
+
 @dataclass(frozen=True)
 class _DedupeResult:
     dynamic_ids: list[str]
@@ -383,6 +396,7 @@ def run_new_links_pipeline(
     source_observations: list[Mapping[str, object]] | None = None,
     source_page_stats: list[Mapping[str, object]] | None = None,
     preserve_forward_raw_ids: set[str] | None = None,
+    batch_context: PipelineBatchContext | None = None,
 ) -> PipelineResult:
     """Step 2～5：仅处理新链接（内存流转，末步落库）。
 
@@ -409,7 +423,10 @@ def run_new_links_pipeline(
             canonical_by_raw.setdefault(raw_id, raw_id)
     # 分类前去重与来源审计使用同一阶段的 Profile-local DB 快照。
     # 分类后和最终写入前的重新检查必须保持独立，防止中途并发插入。
-    known_ids = known_activity_ids()
+    if batch_context is not None and batch_context.known_ids is None:
+        batch_context.known_ids = known_activity_ids()
+    known_ids = batch_context.known_ids if batch_context is not None else known_activity_ids()
+    assert known_ids is not None
     dedupe = _dedupe_new_dynamic_ids(raw_urls, known_ids)
     failure_source_urls = _failure_url_by_dynamic_id(raw_urls)
     dynamic_ids = dedupe.dynamic_ids
@@ -519,7 +536,7 @@ def run_new_links_pipeline(
 
     # V21：单候选 LLM 异常隔离 + provider breaker。作用域=当前 pipeline execution，
     # 不写全局状态、不触发 Bilibili 风控/冷却；下一次 Job 重新创建 breaker。
-    breaker = LlmProviderBreaker()
+    breaker = batch_context.breaker if batch_context is not None else LlmProviderBreaker()
     provider_failed_count = 0
     completed_count = 0
     partial_reason = ""
@@ -689,7 +706,7 @@ def run_new_links_pipeline(
     canonical_tasks: list[tuple[str, LotteryType]] = []
     canonical_outcomes: dict[str, ClassifyOutcome] = {}
     canonical_identity_by_id: dict[str, CanonicalIdentity] = {}
-    canonical_seen: set[str] = set()
+    canonical_seen: set[str] = batch_context.canonical_seen if batch_context is not None else set()
     canonical_duplicate_count = 0
     known_after_classification = known_activity_ids()
     legacy_alias_ids: set[str] = set()

@@ -36,7 +36,7 @@ from src.canonical_identity import CanonicalIdentity, resolve_dynamic_identity
 from src.observability import current_metrics
 from src.platform_risk import risk_code_of
 from src.repost_origin_discovery import OriginDiscovery, discover_origin, is_forward_item
-from src.pipeline.refresh_all_pipeline import run_new_links_pipeline
+from src.pipeline.refresh_all_pipeline import PipelineBatchContext, run_new_links_pipeline
 from src.sources.common import opus_link
 from src.watch_feed import extract_feed_pub_ts
 
@@ -51,6 +51,7 @@ FOLLOW_FEED_HISTORY_DAYS = 15
 # fields.  Real pagination responses carry ``has_more``/``offset`` and are
 # collected across the full page window.
 FOLLOW_FEED_MAX_ITEMS = 30
+FOLLOW_FEED_PIPELINE_BATCH_SIZE = 25
 ANCHOR_LIMIT = 50
 STATE_VERSION = 2
 CN_TZ = timezone(timedelta(hours=8))
@@ -531,51 +532,91 @@ def _run_candidate_batch(
         ids, item_by_id=item_by_id, client_factory=client_factory, detail_cache=detail_cache,
     )
 
-    urls = [opus_link(dynamic_id) for dynamic_id in accepted_ids]
-    if on_progress is not None:
-        on_progress(0, max(1, len(urls)), f"关注动态共 {len(urls)} 条候选，正在复用公共流水线…")
-    pipeline_kwargs: dict[str, Any] = {
-        "workers": 1,
-        "scan_started_at": int(time.time()),
-        "on_progress": on_progress,
-    }
-    if _pipeline_accepts_source_observations():
-        pipeline_kwargs["source_observations"] = [
-            {
-                "source_id": "following_feed",
-                "dynamic_id": dynamic_id,
-                "page_index": page_by_id.get(dynamic_id),
-                **provenance.get(dynamic_id, {}),
-            }
-            for dynamic_id in accepted_ids
-        ]
-    if accepted_identities and _pipeline_accepts_identity_map():
-        pipeline_kwargs["identity_by_raw"] = accepted_identities
-    if preserve_ids and _pipeline_accepts_parameter("preserve_forward_raw_ids"):
-        pipeline_kwargs["preserve_forward_raw_ids"] = preserve_ids
-    if accepted_ids and _pipeline_accepts_parameter("source_context_by_dynamic_id"):
-        pipeline_kwargs["source_context_by_dynamic_id"] = provenance
-    pipeline_started = time.perf_counter()
-    pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
-    metrics = current_metrics()
-    if metrics is not None:
-        metrics.record_stage_duration("分类中", (time.perf_counter() - pipeline_started) * 1000)
+    pipeline = _run_pipeline_batches(
+        accepted_ids,
+        identities=accepted_identities,
+        provenance=provenance,
+        preserve_ids=preserve_ids,
+        page_by_id=page_by_id,
+        on_progress=on_progress,
+        scan_started_at=int(time.time()),
+    )
     blocking_count = origin_blocking
-    skip_reasons = getattr(pipeline, "skip_reasons", None)
-    if isinstance(skip_reasons, dict):
-        blocking_count += sum(
-            int(skip_reasons.get(reason, 0) or 0)
-            for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
-        )
-    if bool(getattr(pipeline, "partial", False)):
-        blocking_count += 1
+    blocking_count += pipeline["blocking_count"]
     return {
         "accepted": len(accepted_ids),
-        "added": int(getattr(pipeline, "persisted_count", 0) or 0),
-        "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0),
+        "added": pipeline["persisted_count"],
+        "new_link_count": pipeline["new_link_count"],
         "blocking_count": blocking_count,
         **counters,
     }
+
+
+def _run_pipeline_batches(
+    accepted_ids: list[str],
+    *,
+    identities: dict[str, CanonicalIdentity],
+    provenance: dict[str, dict[str, str]],
+    preserve_ids: set[str],
+    page_by_id: dict[str, int],
+    on_progress: Callable[[int, int, str], None] | None,
+    scan_started_at: int,
+) -> dict[str, int]:
+    """Persist each completed Following batch; leave every cursor to its caller.
+
+    A batch_context keeps the monolithic pipeline's initial known-ID snapshot,
+    canonical dedupe and provider breaker across calls. An exception leaves
+    earlier committed batches intact and prevents the caller's cursor commit.
+    """
+    context = PipelineBatchContext()
+    chunks = [accepted_ids[i:i + FOLLOW_FEED_PIPELINE_BATCH_SIZE]
+              for i in range(0, len(accepted_ids), FOLLOW_FEED_PIPELINE_BATCH_SIZE)] or [[]]
+    totals = {"persisted_count": 0, "new_link_count": 0, "blocking_count": 0}
+    partial = False
+    for index, chunk in enumerate(chunks, 1):
+        if on_progress is not None and len(chunks) > 1:
+            on_progress(0, max(1, len(chunk)), f"关注动态分类批次 {index}/{len(chunks)}（{len(chunk)} 条）…")
+        kwargs: dict[str, Any] = {
+            "workers": 1,
+            "scan_started_at": scan_started_at,
+            "on_progress": on_progress,
+        }
+        if _pipeline_accepts_source_observations():
+            kwargs["source_observations"] = [
+                {
+                    "source_id": "following_feed", "dynamic_id": dynamic_id,
+                    "page_index": page_by_id.get(dynamic_id),
+                    **provenance.get(dynamic_id, {}),
+                }
+                for dynamic_id in chunk
+            ]
+        if identities and _pipeline_accepts_identity_map():
+            kwargs["identity_by_raw"] = {did: identities[did] for did in chunk if did in identities}
+        if preserve_ids and _pipeline_accepts_parameter("preserve_forward_raw_ids"):
+            kwargs["preserve_forward_raw_ids"] = preserve_ids.intersection(chunk)
+        if chunk and _pipeline_accepts_parameter("source_context_by_dynamic_id"):
+            kwargs["source_context_by_dynamic_id"] = {did: provenance[did] for did in chunk if did in provenance}
+        if _pipeline_accepts_parameter("batch_context"):
+            kwargs["batch_context"] = context
+        pipeline_started = time.perf_counter()
+        pipeline = run_new_links_pipeline([opus_link(did) for did in chunk], **kwargs)
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.record_stage_duration("分类中", (time.perf_counter() - pipeline_started) * 1000)
+        totals["persisted_count"] += int(getattr(pipeline, "persisted_count", 0) or 0)
+        totals["new_link_count"] += int(getattr(pipeline, "new_link_count", 0) or 0)
+        reasons = getattr(pipeline, "skip_reasons", None)
+        if isinstance(reasons, dict):
+            totals["blocking_count"] += sum(
+                int(reasons.get(reason, 0) or 0) for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
+            )
+        partial = partial or bool(getattr(pipeline, "partial", False))
+        # Keep accounting for later raw candidates even if the shared breaker
+        # opened: the pipeline's own check performs zero further provider calls.
+        # This preserves the monolithic new_link_count/unprocessed semantics.
+    if partial:
+        totals["blocking_count"] += 1
+    return totals
 
 
 def scan_following_feed(
@@ -845,39 +886,20 @@ def scan_following_feed(
     canonical_duplicate_skipped = counters["canonical_duplicate_skipped"]
 
     scan_started_at = int(time.time())
-    urls = [opus_link(dynamic_id) for dynamic_id in accepted_ids]
     if on_progress is not None:
-        on_progress(0, max(1, len(urls)), f"关注动态共 {len(urls)} 条新候选，正在复用公共流水线…")
-
-    pipeline_kwargs: dict[str, Any] = {
-        "workers": 1,
-        "scan_started_at": scan_started_at,
-        "on_progress": on_progress,
-    }
-    if _pipeline_accepts_source_observations():
-        pipeline_kwargs["source_observations"] = [
-            {
-                "source_id": "following_feed",
-                "dynamic_id": dynamic_id,
-                "page_index": page_by_id.get(dynamic_id),
-                **provenance.get(dynamic_id, {}),
-            }
-            for dynamic_id in accepted_ids
-        ]
-    if accepted_identities and _pipeline_accepts_identity_map():
-        pipeline_kwargs["identity_by_raw"] = accepted_identities
-    if preserve_ids and _pipeline_accepts_parameter("preserve_forward_raw_ids"):
-        pipeline_kwargs["preserve_forward_raw_ids"] = preserve_ids
-    if accepted_ids and _pipeline_accepts_parameter("source_context_by_dynamic_id"):
-        pipeline_kwargs["source_context_by_dynamic_id"] = provenance
-    pipeline_started = time.perf_counter()
-    pipeline = run_new_links_pipeline(urls, **pipeline_kwargs)
-    metrics = current_metrics()
-    if metrics is not None:
-        metrics.record_stage_duration("分类中", (time.perf_counter() - pipeline_started) * 1000)
+        on_progress(0, max(1, len(accepted_ids)), f"关注动态共 {len(accepted_ids)} 条新候选，正在复用公共流水线…")
+    pipeline = _run_pipeline_batches(
+        accepted_ids,
+        identities=accepted_identities,
+        provenance=provenance,
+        preserve_ids=preserve_ids,
+        page_by_id=page_by_id,
+        on_progress=on_progress,
+        scan_started_at=scan_started_at,
+    )
 
     found = len(processed)
-    added = int(getattr(pipeline, "persisted_count", 0) or 0)
+    added = pipeline["persisted_count"]
     now = int(time.time())
 
     # checkpoint 语义（V16）：
@@ -890,15 +912,8 @@ def scan_following_feed(
     #    终态安全 skip（404 链接失效、充电/非抽奖、详情提取失败、已结束过滤、去重命中）
     #    不阻塞推进，避免坏动态卡死整轮扫描。
     blocking_count = origin_blocking
-    skip_reasons = getattr(pipeline, "skip_reasons", None)
-    if isinstance(skip_reasons, dict):
-        blocking_count += sum(
-            int(skip_reasons.get(reason, 0) or 0)
-            for reason in CHECKPOINT_BLOCKING_SKIP_REASONS
-        )
-    # V21：LLM provider partial/breaker 时保留旧 checkpoint，未完成候选下一轮继续。
-    if bool(getattr(pipeline, "partial", False)):
-        blocking_count += 1
+    # V21：任一批存在 retryable/partial 时保留旧 checkpoint。
+    blocking_count += pipeline["blocking_count"]
 
     if blocking_count > 0:
         # 保守语义：只保留进入本轮前 checkpoint 的值；不先写新值再 rollback。
@@ -1444,7 +1459,7 @@ def scan_following_feed(
         "accepted": int(state.get("accepted") or 0),
         "added": added,
         "inserted": added,
-        "new_link_count": int(getattr(pipeline, "new_link_count", 0) or 0)
+        "new_link_count": pipeline["new_link_count"]
         + int((recent_batch or {}).get("new_link_count") or 0)
         + int((history_batch or {}).get("new_link_count") or 0),
         "self_skipped": int(state.get("self_skipped") or 0),

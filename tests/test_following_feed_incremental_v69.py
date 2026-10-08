@@ -90,9 +90,8 @@ def test_page_offset_chain_collects_all_pages_and_observations(state_path, monke
         {"type": "all", "page": 3, "offset": "o2"},
         {"type": "all", "page": 4, "offset": "o3"},
     ]
-    assert len(calls) == 1
-    assert len(calls[0][0]) == 80
-    observations = calls[0][1]["source_observations"]
+    assert [len(urls) for urls, _kwargs in calls] == [25, 25, 25, 5]
+    observations = [observation for _urls, kwargs in calls for observation in kwargs["source_observations"]]
     assert observations[0]["page_index"] == 1
     assert observations[20]["page_index"] == 2
     assert observations[-1]["page_index"] == 4
@@ -172,4 +171,3 @@ def test_malformed_state_makes_zero_requests_and_preserves_bytes(state_path, mon
     assert result["message"] == "following_feed_state_corrupt"
     assert client.calls == []
     assert state_path.read_bytes() == b"{broken"
-
