@@ -233,3 +233,114 @@ def test_formal_risk_from_later_batch_propagates_without_cursor_commit(harness, 
         feed.scan_following_feed(client_factory=lambda: FeedClient(IDS))
     assert known_activity_ids() == set(IDS[:25])
     assert json.loads(state_path.read_text(encoding="utf-8")).get("last_seen_dynamic_id") == OLD_CHECKPOINT
+
+
+def test_whole_pipeline_and_following_batches_keep_same_classification(monkeypatch, isolated_home):
+    """Compare the old single call with V115 using identical V107 source evidence."""
+    from src import data_paths
+    from src.activity_store import load_activities
+    from src.canonical_identity import CanonicalIdentity
+    from src.db.engine import reset_engine_for_tests
+    from src.db.schema import init_db
+    from src.sources.common import opus_link
+
+    source_ids = IDS[:55]
+    origin_id = IDS[90]
+    wrapper_ids = {IDS[24], IDS[25]}
+    ordinary = lambda did: {
+        "id_str": did, "type": "DYNAMIC_TYPE_DRAW",
+        "modules": {"module_author": {"mid": 888}},
+    }
+    items = {did: ordinary(did) for did in source_ids}
+    for did in wrapper_ids:
+        items[did] = {
+            "id_str": did, "type": "DYNAMIC_TYPE_FORWARD",
+            "modules": {"module_author": {"mid": 888}},
+            "orig": ordinary(origin_id),
+        }
+    monkeypatch.setattr(feed, "get_login_uid", lambda: 999)
+    accepted, identities, provenance, preserve, _counters, blocking = feed._select_following_candidates(
+        source_ids, item_by_id=items, client_factory=lambda: NoNetworkClient(), detail_cache={},
+    )
+    assert blocking == 0
+    assert accepted[24:27] == [IDS[24], origin_id, IDS[25]]
+    assert preserve == wrapper_ids | {origin_id}
+    # A pre-resolved alias after the batch boundary exercises canonical dedupe.
+    identities[IDS[40]] = CanonicalIdentity(
+        raw_dynamic_id=IDS[40], canonical_dynamic_id=origin_id,
+        wrapper_author_uid="888", canonical_author_uid="888", is_forward=False,
+        canonical_item=ordinary(origin_id),
+    )
+    non_lottery = {IDS[5], IDS[35]}
+    kind_by_id = {did: ("互动抽奖" if did in {IDS[12], IDS[44]} else "转发抽奖") for did in accepted}
+    classified: list[str] = []
+
+    def classify(_client, dynamic_id, **_kwargs):
+        classified.append(dynamic_id)
+        detail = items.get(dynamic_id, ordinary(dynamic_id))
+        if dynamic_id in non_lottery:
+            return ClassifyOutcome(dynamic_id, "非抽奖活动", True, "非抽奖活动", detail_item=detail)
+        return ClassifyOutcome(dynamic_id, kind_by_id[dynamic_id], False, detail_item=detail)
+
+    class Activity:
+        skipped = False
+
+        def __init__(self, dynamic_id, lottery_type):
+            self.dynamic_id = dynamic_id
+            self.lottery_type = lottery_type
+
+        def to_dict(self):
+            return {"dynamic_id": self.dynamic_id, "lottery_type": self.lottery_type,
+                    "draw_status": "active", "activity_status": "未参加"}
+
+    monkeypatch.setattr(pipeline, "BilibiliClient", NoNetworkClient)
+    monkeypatch.setattr(pipeline, "load_participations", lambda: {})
+    monkeypatch.setattr(pipeline, "apply_initial_status", lambda row: row)
+    monkeypatch.setattr(pipeline, "classify_new_link", classify)
+    monkeypatch.setattr(pipeline, "enrich_activity", lambda _client, *, dynamic_id, lottery_type, **_kw:
+                        Activity(dynamic_id, lottery_type))
+    selected = ["whole"]
+    monkeypatch.setattr(data_paths, "get_database_path", lambda profile_id=None:
+                        isolated_home / selected[0] / "binggo.db")
+    page_by_id = {did: index // 20 + 1 for index, did in enumerate(source_ids)}
+    observations = [{"source_id": "following_feed", "dynamic_id": did,
+                     "page_index": page_by_id.get(did), **provenance.get(did, {})} for did in accepted]
+
+    reset_engine_for_tests()
+    init_db()
+    whole = pipeline.run_new_links_pipeline(
+        [opus_link(did) for did in accepted], workers=1, scan_started_at=123,
+        identity_by_raw=identities, preserve_forward_raw_ids=preserve,
+        source_context_by_dynamic_id=provenance, source_observations=observations,
+    )
+    whole_rows = {row["dynamic_id"]: row["lottery_type"] for row in load_activities()}
+    whole_classified = list(classified)
+
+    selected[0] = "batched"
+    reset_engine_for_tests()
+    init_db()
+    classified.clear()
+    per_batch = []
+    original = feed.run_new_links_pipeline
+
+    def capture(urls, **kwargs):
+        result = original(urls, **kwargs)
+        per_batch.append(result)
+        return result
+
+    monkeypatch.setattr(feed, "run_new_links_pipeline", capture)
+    batched = feed._run_pipeline_batches(
+        accepted, identities=identities, provenance=provenance, preserve_ids=preserve,
+        page_by_id=page_by_id, on_progress=None, scan_started_at=123,
+    )
+    batched_rows = {row["dynamic_id"]: row["lottery_type"] for row in load_activities()}
+    assert len(per_batch) == 3
+    assert batched_rows == whole_rows
+    assert classified == whole_classified
+    assert set(wrapper_ids | {origin_id}).issubset(batched_rows)
+    assert IDS[40] not in batched_rows
+    assert batched["persisted_count"] == whole.persisted_count == len(whole_rows)
+    assert batched["new_link_count"] == whole.new_link_count
+    assert sum(result.classified_count for result in per_batch) == whole.classified_count
+    assert sum(result.non_lottery_count for result in per_batch) == whole.non_lottery_count == 2
+    assert sum(result.duplicate_link_count for result in per_batch) == whole.duplicate_link_count
