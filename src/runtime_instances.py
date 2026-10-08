@@ -231,6 +231,7 @@ def list_runtime_instances() -> dict[str, dict[str, Any]]:
             "profile_id": profile_id,
             "port": int(entry["port"]),
             "instance_id": str(entry["instance_id"]),
+            "started_at": float(entry["started_at"]),
             "ready": ready,
             "running": True,
         }

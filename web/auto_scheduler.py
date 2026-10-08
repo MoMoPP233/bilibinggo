@@ -69,6 +69,9 @@ REFRESH_STEPS = (
 )
 _AUTO_SNAPSHOT_MIN_INTERVAL_SEC = 0.5
 _AUTO_SNAPSHOT_LOG_LIMIT = 100
+SCAN_STAGGER_MINUTES = 15
+_SCAN_RANK_CACHE_SECONDS = 15.0
+_SCAN_LABELS = {"refresh": "刷新批次", "winner": "中奖深探", "following": "关注补漏"}
 
 _SLOT_STATE_FILE = "scheduler_slots.json"
 _SLOT_STATE_MAX_TASKS = 8
@@ -267,7 +270,7 @@ class SchedulerStatus:
     night_continue_enabled: bool = False
     night_quiet: bool = False
 
-    def to_dict(self, now: datetime | None = None) -> dict[str, Any]:
+    def to_dict(self, now: datetime | None = None, *, next_task_override: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
             "state": self.state,
             "state_label": STATE_LABELS.get(self.state, self.state),
@@ -290,7 +293,7 @@ class SchedulerStatus:
             "tasks": {key: dict(value) for key, value in self.tasks.items()},
             "night_continue_enabled": self.night_continue_enabled,
             "night_quiet": self.night_quiet,
-            "next_task": next_auto_task(now),
+            "next_task": next_task_override if next_task_override is not None else next_auto_task(now),
             "schedule": {
                 "refresh_hours": sorted(REFRESH_HOURS),
                 "refresh_slots": [f"{hour:02d}:{minute:02d}" for hour, minute in REFRESH_SLOTS],
@@ -353,6 +356,99 @@ class AutoScheduler:
         self._last_remote_stage_finished_mono = 0.0
         # 夜间提示只随当前进程中的 quiet period 状态变化记录一次。
         self._last_night_quiet_notice: str | None = None
+        # Only shifted runtimes need a pending logical-slot plan. A singleton
+        # continues through the original exact-minute path without any delay.
+        self._scan_plan_lock = threading.Lock()
+        self._scan_plans: dict[tuple[str, str], datetime] = {}
+        self._scan_rank_checked_at = 0.0
+        self._scan_offset_cached = 0
+
+    def _scan_offset_minutes(self) -> int:
+        from src.runtime_instances import RUNTIME_INSTANCE_ENV, RUNTIME_PROFILE_ENV, list_runtime_instances
+
+        profile_id = os.environ.get(RUNTIME_PROFILE_ENV, "")
+        instance_id = os.environ.get(RUNTIME_INSTANCE_ENV, "")
+        if not profile_id or not instance_id:
+            return 0
+        current = time.monotonic()
+        if self._scan_rank_checked_at > 0 and current - self._scan_rank_checked_at < _SCAN_RANK_CACHE_SECONDS:
+            return self._scan_offset_cached
+        ready = sorted(
+            (entry for entry in list_runtime_instances().values() if entry.get("ready")),
+            key=lambda entry: (float(entry.get("started_at") or 0), str(entry["profile_id"])),
+        )
+        rank = next(
+            (index for index, entry in enumerate(ready)
+             if entry["profile_id"] == profile_id and entry["instance_id"] == instance_id),
+            len(ready),
+        )
+        # A starting instance absent from the ready roster is conservatively
+        # placed after known runtimes; do not cache that transient observation.
+        offset = rank * SCAN_STAGGER_MINUTES
+        if rank < len(ready):
+            self._scan_offset_cached = offset
+            self._scan_rank_checked_at = current
+        return offset
+
+    def _runtime_scan_slots(self, now: datetime) -> list[tuple[str, datetime, datetime]] | None:
+        """Return (kind, logical base, due); None preserves singleton cadence."""
+        offset = self._scan_offset_minutes()
+        with self._scan_plan_lock:
+            if offset == 0 and not self._scan_plans:
+                return None
+            night_continue = get_night_continue_enabled()
+            slots: list[tuple[str, datetime, datetime]] = []
+            live_keys: set[tuple[str, str]] = set()
+            # A large explicit-port roster can shift a logical slot into a
+            # later day; include enough prior bases to find its pending due.
+            lookback_days = max(2, offset // (24 * 60) + 2)
+            for base_day in range(-lookback_days, 3):
+                day = (now + timedelta(days=base_day)).date()
+                for kind, base in _scan_bases_on_day(day):
+                    key = (kind, base.isoformat())
+                    desired = _shift_scan_due(base, offset, night_continue=night_continue)
+                    previous = self._scan_plans.get(key)
+                    # Leaving a higher rank after the base minute must not
+                    # turn a still-pending scan into an immediate catch-up.
+                    due = (
+                        previous
+                        if previous is not None and desired <= now < previous + timedelta(minutes=1)
+                        else desired
+                    )
+                    if due < now - timedelta(minutes=1):
+                        continue
+                    self._scan_plans[key] = due
+                    live_keys.add(key)
+                    slots.append((kind, base, due))
+            for key in self._scan_plans.keys() - live_keys:
+                del self._scan_plans[key]
+            return slots
+
+    def _runtime_candidates(self, now: datetime) -> tuple[list[tuple[str, str, datetime]], list[tuple[str, datetime, datetime]] | None]:
+        slots = self._runtime_scan_slots(now)
+        if slots is None:
+            return _next_occurrence_candidates(now), None
+        try:
+            claimed = _read_slot_state(_slot_state_path())
+        except SlotStateError:
+            claimed = {}
+        candidates = [
+            (kind, _SCAN_LABELS[kind], due)
+            for kind, base, due in slots
+            if due >= now and not self._scan_slot_done(kind, base, claimed)
+        ]
+        candidates.extend(item for item in _next_occurrence_candidates(now) if item[0] == "participate")
+        return candidates, slots
+
+    def _scan_slot_done(self, kind: str, base: datetime, claimed: dict[str, str]) -> bool:
+        key = _scan_slot_key(kind, base)
+        done = {"refresh": self._done_refresh, "winner": self._done_winner, "following": self._done_following}[kind]
+        claim_name = "winner_scan" if kind == "winner" else kind
+        return key in done or claimed.get(claim_name) == key
+
+    def _runtime_next_task(self, now: datetime) -> tuple[dict[str, Any], list[tuple[str, str, datetime]], list[tuple[str, datetime, datetime]] | None]:
+        candidates, slots = self._runtime_candidates(now)
+        return _next_task_from_candidates(now, candidates), candidates, slots
 
     def _active_stop_event(self) -> threading.Event:
         """当前线程绑定的 stop Event；直接调用（无线程上下文，如单测）回退到实例当前 Event。"""
@@ -374,9 +470,10 @@ class AutoScheduler:
     def get_status(self) -> dict[str, Any]:
         now = self._clock()
         night_continue_enabled = get_night_continue_enabled()
-        slot = _next_slot(now)
+        next_task, candidates, _slots = self._runtime_next_task(now)
+        slot = _next_slot(now, task_override=next_task)
         probe = _probe_job(self._runner)
-        next_runs = _next_runs_by_task(now)
+        next_runs = _next_runs_by_task(now, candidates=candidates)
         risk_view = risk_pause_state()
         with self._lock:
             self._status.logs = [
@@ -402,7 +499,7 @@ class AutoScheduler:
                     task.pop("resume_at", None)
             if not self._status.refresh_pipeline:
                 self._status.refresh_pipeline = _idle_pipeline()
-            return self._status.to_dict(now)
+            return self._status.to_dict(now, next_task_override=next_task)
 
     def start(self) -> dict[str, Any]:
         # 在 restart gate 内先把调度器状态变为 running；Profile 切换随后
@@ -540,6 +637,9 @@ class AutoScheduler:
         # 旧代线程的过期阶段更新不得污染新一代调度器的状态展示。
         if self._is_stale():
             return
+        current = self._clock()
+        next_task, _candidates, _slots = self._runtime_next_task(current)
+        slot = _next_slot(current, task_override=next_task)
         with self._lock:
             prev = (
                 self._status.current_phase,
@@ -549,7 +649,6 @@ class AutoScheduler:
             self._status.current_phase = phase
             if message is not None:
                 self._status.message = message
-            slot = _next_slot(self._clock())
             self._status.next_slot = slot
             self._status.next_hint = slot.get("hint") or ""
             changed = prev != (
@@ -798,29 +897,47 @@ class AutoScheduler:
         try:
             while not self._is_stale():
                 now = self._clock()
+                next_task, _candidates, scan_slots = self._runtime_next_task(now)
                 with self._lock:
                     self._status.last_tick_at = _now_iso()
-                    slot = _next_slot(now)
+                    slot = _next_slot(now, task_override=next_task)
                     self._status.next_slot = slot
                     self._status.next_hint = slot.get("hint") or ""
 
-                if (now.hour, now.minute) in REFRESH_SLOTS:
-                    key = f"{now:%Y-%m-%d-%H}"
-                    if key not in self._done_refresh:
-                        self._run_refresh_batch(key)
-                        continue
-
-                # V70: 中奖深检每天 12:10、22:10；仍仅当前分钟触发，错过不补跑。
-                if now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS:
-                    key = f"winner-{now:%Y-%m-%d-%H-%M}"
-                    if key not in self._done_winner:
-                        self._run_winner_scan(key)
-                        continue
-
-                if now.minute == FOLLOWING_FEED_SCAN_MINUTE and now.hour in FOLLOWING_FEED_SCAN_HOURS:
-                    key = f"following-{now:%Y-%m-%d-%H}"
-                    if key not in self._done_following:
-                        self._run_following_scan(key)
+                if scan_slots is None:
+                    # A singleton keeps the exact V72 minutes and ordering.
+                    if (now.hour, now.minute) in REFRESH_SLOTS:
+                        key = f"{now:%Y-%m-%d-%H}"
+                        if key not in self._done_refresh:
+                            self._run_refresh_batch(key)
+                            continue
+                    if now.minute == WINNER_SCAN_MINUTE and now.hour in WINNER_SCAN_HOURS:
+                        key = f"winner-{now:%Y-%m-%d-%H-%M}"
+                        if key not in self._done_winner:
+                            self._run_winner_scan(key)
+                            continue
+                    if now.minute == FOLLOWING_FEED_SCAN_MINUTE and now.hour in FOLLOWING_FEED_SCAN_HOURS:
+                        key = f"following-{now:%Y-%m-%d-%H}"
+                        if key not in self._done_following:
+                            self._run_following_scan(key)
+                            continue
+                else:
+                    due_slots = sorted(
+                        ((kind, base) for kind, base, due in scan_slots
+                         if due <= now < due + timedelta(minutes=1)),
+                        key=lambda item: (_AUTO_TASK_ORDER[item[0]], item[1]),
+                    )
+                    dispatched = False
+                    for kind, base in due_slots:
+                        key = _scan_slot_key(kind, base)
+                        done = {"refresh": self._done_refresh, "winner": self._done_winner, "following": self._done_following}[kind]
+                        if key in done:
+                            continue
+                        {"refresh": self._run_refresh_batch, "winner": self._run_winner_scan,
+                         "following": self._run_following_scan}[kind](key)
+                        dispatched = True
+                        break
+                    if dispatched:
                         continue
 
                 self._tick_triple(now)
@@ -1326,6 +1443,47 @@ def _dedicated_minute(now: datetime) -> bool:
     )
 
 
+def _scan_bases_on_day(day) -> list[tuple[str, datetime]]:
+    bases = [
+        ("refresh", datetime(day.year, day.month, day.day, hour, minute, tzinfo=CN_TZ))
+        for hour, minute in REFRESH_SLOTS
+    ]
+    bases.extend(
+        ("winner", datetime(day.year, day.month, day.day, hour, WINNER_SCAN_MINUTE, tzinfo=CN_TZ))
+        for hour in sorted(WINNER_SCAN_HOURS)
+    )
+    bases.extend(
+        ("following", datetime(day.year, day.month, day.day, hour, FOLLOWING_FEED_SCAN_MINUTE, tzinfo=CN_TZ))
+        for hour in sorted(FOLLOWING_FEED_SCAN_HOURS)
+    )
+    return bases
+
+
+def _shift_scan_due(base: datetime, offset_minutes: int, *, night_continue: bool) -> datetime:
+    due = base + timedelta(minutes=offset_minutes)
+    if is_night_quiet(due, config=night_continue):
+        # For a large roster, late slots can cross midnight. Defer until after
+        # quiet hours without collapsing different ranks onto the same minute.
+        due = due.replace(hour=7, minute=0, second=0, microsecond=0) + timedelta(minutes=offset_minutes)
+    return due
+
+
+def _scan_slot_key(kind: str, base: datetime) -> str:
+    if kind == "refresh":
+        return f"{base:%Y-%m-%d-%H}"
+    if kind == "winner":
+        return f"winner-{base:%Y-%m-%d-%H-%M}"
+    return f"following-{base:%Y-%m-%d-%H}"
+
+
+def _next_task_from_candidates(now: datetime, candidates: list[tuple[str, str, datetime]]) -> dict[str, Any]:
+    if not candidates:
+        return {"label": "", "action": "", "minutes": None, "at_unix": None}
+    action, label, due = min(candidates, key=lambda item: (item[2], _AUTO_TASK_ORDER.get(item[0], 99)))
+    seconds = max(0, int((due - now).total_seconds()))
+    return {"label": label, "action": action, "minutes": (seconds + 59) // 60, "at_unix": int(due.timestamp())}
+
+
 def _next_occurrence_candidates(now: datetime) -> list[tuple[str, str, datetime]]:
     """按 ``_loop`` 的真实 cadence 枚举未来 24 小时任务（纯只读）。"""
     candidates: list[tuple[str, str, datetime]] = []
@@ -1355,19 +1513,7 @@ def next_auto_task(now: datetime | None = None) -> dict[str, Any]:
     """返回下一项自动任务（人话分钟数；纯本地，不改任何调度状态）。"""
     current = now or datetime.now(CN_TZ)
     candidates = _next_occurrence_candidates(current)
-    if not candidates:
-        return {"label": "", "action": "", "minutes": None, "at_unix": None}
-    # 按到期时间排序；同分保持循环判定顺序（刷新→中奖→关注→参与）。
-    candidates.sort(key=lambda item: (item[2], _AUTO_TASK_ORDER.get(item[0], 99)))
-    action, label, due = candidates[0]
-    seconds = max(0, int((due - current).total_seconds()))
-    minutes = (seconds + 59) // 60
-    return {
-        "label": label,
-        "action": action,
-        "minutes": minutes,
-        "at_unix": int(due.timestamp()),
-    }
+    return _next_task_from_candidates(current, candidates)
 
 
 _AUTO_TASK_ORDER = {
@@ -1378,17 +1524,17 @@ _AUTO_TASK_ORDER = {
 }
 
 
-def _next_runs_by_task(now: datetime) -> dict[str, int]:
+def _next_runs_by_task(now: datetime, *, candidates: list[tuple[str, str, datetime]] | None = None) -> dict[str, int]:
     result: dict[str, int] = {}
-    for task, _label, due in _next_occurrence_candidates(now):
+    for task, _label, due in sorted(candidates if candidates is not None else _next_occurrence_candidates(now), key=lambda item: item[2]):
         result.setdefault(task, int(due.timestamp()))
         if len(result) == len(_AUTO_TASK_ORDER):
             break
     return result
 
 
-def _next_slot(now: datetime) -> dict[str, Any]:
-    task = next_auto_task(now)
+def _next_slot(now: datetime, *, task_override: dict[str, Any] | None = None) -> dict[str, Any]:
+    task = task_override if task_override is not None else next_auto_task(now)
     at_unix = task.get("at_unix")
     if at_unix:
         candidate = datetime.fromtimestamp(int(at_unix), CN_TZ)
