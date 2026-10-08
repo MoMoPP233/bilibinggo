@@ -30,6 +30,9 @@ def _patch_service(monkeypatch, activities: list[dict], blocked: set[str]) -> No
     monkeypatch.setattr(activity_service, "_load_participation_actions", lambda: {})
     monkeypatch.setattr(activity_service, "load_participations", lambda: {})
     monkeypatch.setattr(activity_service, "_load_blocked_activity_ids", lambda: set(blocked))
+    # These V36 fixtures model non-retryable hidden guards. V112 exercises
+    # the new pending/unknown manual-only exception in its own regression.
+    monkeypatch.setattr(activity_service, "load_manual_retry_guard_ids", lambda _uid: set())
 
 
 def test_guarded_rows_are_removed_from_list_search_filters_and_page_total(monkeypatch) -> None:

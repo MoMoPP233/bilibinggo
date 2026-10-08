@@ -235,6 +235,10 @@ class JobRunner:
         label = _build_label(action, params)
         now = int(time.time())
         source_s = str(source or "ui")
+        if action == "manual_retry_unknown" and source_s != "ui":
+            return None
+        if action == "participate" and params.get("manual_unknown_retry") and source_s != "ui":
+            return None
 
         try:
             # 与 Profile restart transition 共用同一把 gate。只有在 gate 内

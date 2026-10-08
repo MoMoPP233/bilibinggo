@@ -21,6 +21,7 @@ JOB_ACTION_LABELS: dict[str, str] = {
     "update_all_datasources": "一键更新全部数据源",
     "refresh_status": "刷新任务状态",
     "participate": "参与活动",
+    "manual_retry_unknown": "重新参与活动",
     "participate_triple": "三连参与",
     "refresh_watch": "更新监控用户动态",
     "cleanup_auto_maintain": "清理数据自动维护",

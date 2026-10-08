@@ -249,15 +249,20 @@ def _participate_dynamic_payload(
     *,
     lottery_type_hint: str | None = None,
     client: BilibiliClient | None = None,
+    manual_retry_profile_id: str | None = None,
+    manual_retry_uid: str | None = None,
 ) -> dict[str, Any]:
     resolved_type = resolve_participate_lottery_type(dynamic_id, hint=lottery_type_hint)
     # Client creation and live preflight belong behind the shared local guard.
     # Do not redirect process-global stdout from parallel participation workers.
+    retry_kwargs = (
+        {"manual_retry_profile_id": manual_retry_profile_id,
+         "manual_retry_uid": manual_retry_uid}
+        if manual_retry_profile_id is not None else {}
+    )
     payload = _execute_participate(
-        dynamic_id,
-        on_step,
-        lottery_type=resolved_type,
-        client=client,
+        dynamic_id, on_step, lottery_type=resolved_type, client=client,
+        **retry_kwargs,
     )
     return _normalize_participate_payload(payload)
 
@@ -280,6 +285,8 @@ def _execute_participate(
     *,
     lottery_type: str | None = None,
     client: BilibiliClient | None = None,
+    manual_retry_profile_id: str | None = None,
+    manual_retry_uid: str | None = None,
 ) -> dict[str, Any]:
     dynamic_id = str(dynamic_id or "").strip()
     if not is_valid_dynamic_id(dynamic_id):
@@ -288,15 +295,19 @@ def _execute_participate(
     if resolved_type not in PARTICIPATABLE_TYPES:
         resolved_type = resolve_participate_lottery_type(dynamic_id)
 
-    result = participate_activity(
-        client,
-        dynamic_id=dynamic_id,
-        lottery_type=resolved_type,
-        dry_run=False,
-        persist=True,
-        preflight=True,
-        on_step=on_step,
-    )
+    if manual_retry_profile_id is not None:
+        from src.manual_participation_retry import retry_unknown_participation
+
+        result = retry_unknown_participation(
+            dynamic_id, resolved_type, expected_profile_id=manual_retry_profile_id,
+            expected_uid=str(manual_retry_uid or ""),
+            on_step=on_step, client=client,
+        )
+    else:
+        result = participate_activity(
+            client, dynamic_id=dynamic_id, lottery_type=resolved_type,
+            dry_run=False, persist=True, preflight=True, on_step=on_step,
+        )
     payload = result.to_dict()
     payload["lottery_type"] = resolved_type
     return payload
@@ -1192,6 +1203,7 @@ WRITER_LEASE_ACTIONS = frozenset({
     "update_all_datasources",
     "following_feed_scan",
     "participate",
+    "manual_retry_unknown",
     "participate_triple",
     "cleanup_auto_maintain",
     "scan_expired_reposts",
@@ -1961,7 +1973,7 @@ def _run_action_impl(
             "message": message, "result": result, "log": sanitize_log(message),
         }
 
-    if action == "participate":
+    if action in {"participate", "manual_retry_unknown"}:
         dynamic_id = str(params.get("dynamic_id") or "").strip()
         if not is_valid_dynamic_id(dynamic_id):
             raise ValueError("活动 ID 无效")
@@ -1986,6 +1998,14 @@ def _run_action_impl(
                 dynamic_id,
                 on_step,
                 lottery_type_hint=lottery_type,
+                manual_retry_profile_id=(
+                    str(params.get("runtime_profile_id") or "")
+                    if action == "manual_retry_unknown" or params.get("manual_unknown_retry") is True else None
+                ),
+                manual_retry_uid=(
+                    str(params.get("uid") or "")
+                    if action == "manual_retry_unknown" or params.get("manual_unknown_retry") is True else None
+                ),
             )
         finally:
             reset_participation_risk_breaker(_breaker_token)

@@ -5,6 +5,7 @@ import json
 import logging
 import socket
 import ssl
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -22,17 +23,21 @@ from src.comment_breaker import (
     is_comment_breaker_active,
 )
 from src.comment_confirmation import (
+    _claim_manual_comment_pending_unlocked,
     _get_comment_status_unlocked,
     _set_comment_status_unlocked,
     confirm_comment,
     get_comment_status,
 )
 from src.favorite_confirmation import (
+    _claim_manual_favorite_pending_unlocked,
     _get_favorite_status_unlocked,
     _set_favorite_status_unlocked,
     favorite_mutation_gate,
+    get_favorite_status,
 )
 from src.invalid_activities import is_self_follow_failure
+from src.manual_unknown_retry import assert_pending_attempt, begin_attempt, finish_attempt, generation
 from src.lottery_api import fetch_dynamic_detail, fetch_notice_for_interact, fetch_opus_detail_item
 from src.log_span import log_event
 from src.platform_risk import API_RISK_CODES, risk_code_of as _risk_code_of
@@ -43,6 +48,7 @@ from src.participation_guard import (
     confirm_repost,
     get_guard,
     mark_repost_unknown,
+    record_manual_retry_pending,
     record_pending,
 )
 
@@ -709,6 +715,7 @@ def favorite_dynamic(
     csrf: str,
     referer: str,
     known_status: bool | None | object = _UNSET,
+    manual_retry_attempt: str | None = None,
 ) -> ActionResult:
     client = client.raw_client if isinstance(client, ParticipationReadClient) else client
     # The API target is the dynamic ID itself (entity.object_id_str), never
@@ -716,10 +723,14 @@ def favorite_dynamic(
     with favorite_mutation_gate():
         _, my_uid = require_login()
         guard = _get_favorite_status_unlocked(dynamic_id, uid=my_uid)
+        if manual_retry_attempt is not None:
+            assert_pending_attempt(my_uid, dynamic_id, "favorite", manual_retry_attempt)
+            if guard not in {"pending", "unknown"}:
+                raise RuntimeError("收藏状态已变化，人工重试已取消")
         if guard == "confirmed":
             logger.info("收藏防重：已确认，跳过 dynamic_id=%s", dynamic_id)
             return ActionResult("favorite", True, "本地已确认收藏，跳过")
-        if guard in {"pending", "unknown"}:
+        if guard in {"pending", "unknown"} and manual_retry_attempt is None:
             logger.warning("收藏防重阻止重复请求 status=%s dynamic_id=%s", guard, dynamic_id)
             raise RuntimeError("收藏结果未知，已阻止自动重试，需人工确认")
 
@@ -728,12 +739,17 @@ def favorite_dynamic(
             if known_status is _UNSET else known_status
         )
         if status is True:
+            if manual_retry_attempt is not None:
+                _claim_manual_favorite_pending_unlocked(dynamic_id, uid=my_uid)
             _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="confirmed")
             return ActionResult("favorite", True, "已收藏，跳过")
         if status is not False:
             raise ParticipationReadError("当前目标的收藏状态未知，未执行收藏")
 
-        _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="pending")
+        if manual_retry_attempt is not None:
+            _claim_manual_favorite_pending_unlocked(dynamic_id, uid=my_uid)
+        else:
+            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="pending")
         logger.info("收藏请求已准备，pending 已持久化 dynamic_id=%s", dynamic_id)
         try:
             payload = client.post_json(
@@ -792,7 +808,11 @@ def favorite_dynamic(
         if code in {-101, 401, -352, -509}:
             # Structured authentication/risk responses explicitly reject the
             # request; preserve their established propagation semantics.
-            _set_favorite_status_unlocked(dynamic_id, uid=my_uid, status="failed")
+            # A rejected manual attempt cannot disprove the original UNKNOWN.
+            _set_favorite_status_unlocked(
+                dynamic_id, uid=my_uid,
+                status="unknown" if manual_retry_attempt is not None else "failed",
+            )
             _raise_payload_auth(payload, "收藏")
             _raise_payload_risk(payload, "收藏")
         # Unknown business codes do not prove that no favorite was performed.
@@ -808,16 +828,23 @@ def repost_dynamic(
     csrf: str,
     referer: str,
     content: str,
+    manual_retry_attempt: str | None = None,
 ) -> ActionResult:
     guard = get_guard(my_uid, dynamic_id)
-    if guard is not None:
-        if guard.repost_status == "confirmed":
-            return ActionResult("repost", True, "本地已确认转发，跳过")
-        return ActionResult("repost", False, "已有转发保护记录，未再次发送")
-    try:
-        record_pending(my_uid, dynamic_id)
-    except ParticipationGuardBlocked:
-        return ActionResult("repost", False, "已有转发保护记录，未再次发送")
+    if manual_retry_attempt is not None:
+        assert_pending_attempt(my_uid, dynamic_id, "repost", manual_retry_attempt)
+        if guard is None or guard.repost_status not in {"pending", "unknown"}:
+            raise RuntimeError("转发状态已变化，人工重试已取消")
+        record_manual_retry_pending(my_uid, dynamic_id)
+    else:
+        if guard is not None:
+            if guard.repost_status == "confirmed":
+                return ActionResult("repost", True, "本地已确认转发，跳过")
+            return ActionResult("repost", False, "已有转发保护记录，未再次发送")
+        try:
+            record_pending(my_uid, dynamic_id)
+        except ParticipationGuardBlocked:
+            return ActionResult("repost", False, "已有转发保护记录，未再次发送")
 
     client = client.raw_client if isinstance(client, ParticipationReadClient) else client
     try:
@@ -866,6 +893,7 @@ def comment_dynamic(
     referer: str,
     dynamic_id: str | None = None,
     uid: str | int | None = None,
+    manual_retry_attempt: str | None = None,
 ) -> ActionResult:
     # The dynamic is the existing business identity. A raw reply target may
     # instead be a video/article ID: never reinterpret its rid as a dynamic.
@@ -876,13 +904,22 @@ def comment_dynamic(
             raise RuntimeError("评论期间登录账号发生变化，已停止操作")
         uid = current_uid
         status = _get_comment_status_unlocked(target, uid=uid)
+        if manual_retry_attempt is not None:
+            if dynamic_id is None:
+                raise RuntimeError("人工重试必须指定动态 ID")
+            assert_pending_attempt(uid, dynamic_id, "comment", manual_retry_attempt)
+            if status not in {"pending", "unknown"}:
+                raise RuntimeError("评论状态已变化，人工重试已取消")
         if status == "confirmed":
             return ActionResult("comment", True, "已评论，跳过")
-        if status in {"pending", "unknown"}:
+        if status in {"pending", "unknown"} and manual_retry_attempt is None:
             return ActionResult("comment", False, "评论结果未知，已阻止自动重试")
         if is_comment_breaker_active():
             raise CommentLimitActive()
-        _set_comment_status_unlocked(target, uid=uid, status="pending")
+        if manual_retry_attempt is not None:
+            _claim_manual_comment_pending_unlocked(target, uid=uid)
+        else:
+            _set_comment_status_unlocked(target, uid=uid, status="pending")
         try:
             payload = client.post_form(
                 COMMENT_URL,
@@ -920,7 +957,12 @@ def comment_dynamic(
         # Only known explicit rejections release this attempt. An unfamiliar
         # server/internal error cannot prove the mutation never happened.
         rejected = code in {12014, 12078, -101, 401, -352, -509}
-        _set_comment_status_unlocked(target, uid=uid, status="failed" if rejected else "unknown")
+        # Even an explicit rejection of this attempt cannot prove that the
+        # original uncertain request did not succeed.
+        _set_comment_status_unlocked(
+            target, uid=uid,
+            status="failed" if rejected and manual_retry_attempt is None else "unknown",
+        )
         if not rejected:
             _log_comment_unknown(
                 stage="response_validate", error_domain="response",
@@ -990,6 +1032,7 @@ def execute_full_participation(
     on_action: Callable[[ActionResult], None] | None = None,
     on_mutation_start: Callable[[ActionName], None] | None = None,
     risk_breaker: ParticipationRiskBreaker | None = None,
+    manual_retry_actions: frozenset[str] = frozenset(),
 ) -> tuple[list[ActionResult], DynamicContext]:
     text = (action_text or DEFAULT_PARTICIPATE_TEXT).strip() or DEFAULT_PARTICIPATE_TEXT
     if context is None:
@@ -1047,7 +1090,7 @@ def execute_full_participation(
         if on_action is not None:
             on_action(action)
 
-    def mutation(action: Callable[[], ActionResult]) -> None:
+    def mutation(action: Callable[[str | None], ActionResult]) -> None:
         """执行单个远程参与动作：风控即触发 breaker 并立即停止当前目标。"""
         if risk_breaker is not None:
             risk_breaker.check()
@@ -1055,11 +1098,52 @@ def execute_full_participation(
             # This callback runs immediately before the non-idempotent request.
             # Callers use it to distinguish read failures from unknown writes.
             on_mutation_start(current_action[0])
+        action_name = current_action[0]
+        attempt_id = None
+        if action_name in manual_retry_actions:
+            if action_name == "favorite":
+                prior = get_favorite_status(dynamic_id, uid=my_uid)
+            elif action_name == "comment":
+                prior = get_comment_status(dynamic_id, uid=my_uid)
+            else:
+                guard = get_guard(my_uid, dynamic_id)
+                prior = guard.repost_status if guard else None
+            if prior not in {"pending", "unknown"}:
+                raise RuntimeError(f"{ACTION_LABELS[action_name]}状态已变化，人工重试已取消")
+            attempt_id = begin_attempt(
+                my_uid, dynamic_id, action_name,
+                expected_generation=generation(my_uid, dynamic_id, action_name),
+                prior_status=prior,
+            )
         try:
-            append_action(action())
+            result = action(attempt_id)
+            append_action(result)
+            if attempt_id is not None and not result.ok:
+                raise RuntimeError(result.detail or f"{ACTION_LABELS[action_name]}结果未确认")
         except Exception as exc:
             _raise_exc_risk(exc, risk_breaker)
             raise
+        finally:
+            active_error = sys.exc_info()[0]
+            # A process death leaves both durable barriers pending. A failed
+            # audit-finalization write must not mask a structured risk error.
+            if attempt_id is not None and not (active_error and not issubclass(active_error, Exception)):
+                if action_name == "favorite":
+                    current = get_favorite_status(dynamic_id, uid=my_uid)
+                elif action_name == "comment":
+                    current = get_comment_status(dynamic_id, uid=my_uid)
+                else:
+                    guard = get_guard(my_uid, dynamic_id)
+                    current = guard.repost_status if guard else None
+                try:
+                    finish_attempt(
+                        my_uid, dynamic_id, action_name, attempt_id,
+                        "confirmed" if current == "confirmed" else "unknown",
+                    )
+                except Exception:
+                    if active_error is None:
+                        raise
+                    logger.exception("人工重试审计收尾失败，保留原动作防重状态 dynamic_id=%s", dynamic_id)
 
     current_action: list[ActionName] = ["like"]
     report_step(1, "like")
@@ -1067,7 +1151,7 @@ def execute_full_participation(
         append_action(ActionResult("like", True, "已点赞，跳过"))
     else:
         current_action[0] = "like"
-        mutation(lambda: like_dynamic(client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer))
+        mutation(lambda _attempt: like_dynamic(client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
 
     report_step(2, "follow")
@@ -1075,7 +1159,7 @@ def execute_full_participation(
         append_action(ActionResult("follow", True, f"uid={context.sender_uid} 已关注，跳过"))
     else:
         current_action[0] = "follow"
-        mutation(lambda: follow_user(client, uid=context.sender_uid, csrf=csrf, referer=context.referer))
+        mutation(lambda _attempt: follow_user(client, uid=context.sender_uid, csrf=csrf, referer=context.referer))
     time.sleep(ACTION_INTERVAL_SEC)
 
     # A confirmed self-follow business error permanently invalidates the
@@ -1087,14 +1171,15 @@ def execute_full_participation(
     report_step(3, "favorite")
     if not context.favorite_available:
         append_action(ActionResult("favorite", True, "无收藏入口，跳过"))
-    elif context.favorited:
+    elif context.favorited and "favorite" not in manual_retry_actions:
         append_action(ActionResult("favorite", True, "已收藏，跳过"))
     else:
         current_action[0] = "favorite"
         mutation(
-            lambda: favorite_dynamic(
+            lambda attempt: favorite_dynamic(
                 client, dynamic_id=dynamic_id, csrf=csrf, referer=context.referer,
                 known_status=context.favorited,
+                manual_retry_attempt=attempt,
             )
         )
     time.sleep(ACTION_INTERVAL_SEC)
@@ -1105,13 +1190,14 @@ def execute_full_participation(
     else:
         current_action[0] = "repost"
         mutation(
-            lambda: repost_dynamic(
+            lambda attempt: repost_dynamic(
                 client,
                 dynamic_id=dynamic_id,
                 my_uid=my_uid,
                 csrf=csrf,
                 referer=context.referer,
                 content=text,
+                manual_retry_attempt=attempt,
             )
         )
     time.sleep(ACTION_INTERVAL_SEC)
@@ -1122,7 +1208,7 @@ def execute_full_participation(
     else:
         current_action[0] = "comment"
         mutation(
-            lambda: comment_dynamic(
+            lambda attempt: comment_dynamic(
                 client,
                 rid=context.comment_rid,
                 comment_type=context.comment_type,
@@ -1131,6 +1217,7 @@ def execute_full_participation(
                 referer=context.referer,
                 dynamic_id=dynamic_id,
                 uid=my_uid,
+                manual_retry_attempt=attempt,
             )
         )
 

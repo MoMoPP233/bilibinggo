@@ -43,7 +43,7 @@ export function renderStats(summary) {
 }
 
 export function buildActivityParticipateBtn(item) {
-  if (item.can_participate) {
+  if (item.can_participate || item.manual_retry_available) {
     return `<button class="btn btn-primary btn-compact btn-pill" data-action="participate" data-dynamic-id="${escapeHtml(item.dynamic_id)}">参与</button>`;
   }
   return `<span class="caption">—</span>`;

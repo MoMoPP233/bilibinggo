@@ -24,6 +24,17 @@ describe("guarded activity display", () => {
       .toContain("原始评论失败");
   });
 
+  it("shows the same ordinary participation button for a protected manual-only row", () => {
+    const html = buildActivityParticipateBtn({
+      dynamic_id: "1220000000000000001", can_participate: false,
+      manual_retry_available: true,
+    });
+    expect(html).toContain(">参与</button>");
+    expect(html).toContain('data-action="participate"');
+    expect(html).not.toContain("重新参与");
+    expect(html).not.toContain("重试可能重复");
+  });
+
   it("renders a local delete action beside the participation action", () => {
     const html = renderActivityTableRow({
       dynamic_id: "1220000000000000001",

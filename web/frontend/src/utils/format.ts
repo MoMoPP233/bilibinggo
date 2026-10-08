@@ -153,7 +153,7 @@ export function formatJobProgressDisplay(job: FormatJobLike): {
   const step = Number(job.progress_step) || 0;
   const total = Number(job.progress_total) || 0;
   const percent = calcJobProgressPercent(job);
-  if (job.action === "participate" || job.action === "participate_triple") {
+  if (job.action === "participate" || job.action === "manual_retry_unknown" || job.action === "participate_triple") {
     if (total > 0) {
       return { percent, value: `${step}/${total}`, suffix: " 步", showPercentSuffix: false };
     }
@@ -164,6 +164,7 @@ export function formatJobProgressDisplay(job: FormatJobLike): {
 
 export function formatProgressTitle(job: FormatJobLike): string {
   if (job.action === "participate") return "正在参与活动";
+  if (job.action === "manual_retry_unknown") return "正在重新参与活动";
   if (job.action === "participate_triple") {
     const lanes = parseTripleProgressLanes(job.progress_message);
     const count = lanes.length || Number(job.result?.targets?.length) || 3;
@@ -180,7 +181,7 @@ export function formatProgressDetail(job: FormatJobLike): string {
     if (total > 1 || stage === "分类中") return `${stage}：${current}/${total}`;
     return stage;
   }
-  if (job.action === "participate") {
+  if (job.action === "participate" || job.action === "manual_retry_unknown") {
     const message = sanitizeUserText(job.progress_message || job.message || "");
     if (message && !message.includes("|")) return message;
     const step = Number(job.progress_step) || 0;

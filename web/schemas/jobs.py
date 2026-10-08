@@ -15,6 +15,7 @@ ALLOWED_JOB_ACTIONS = frozenset(
         "following_feed_scan",
         "winner_deep_scan",
         "participate",
+        "manual_retry_unknown",
         "participate_triple",
         "cleanup_auto_maintain",
         "scan_expired_reposts",

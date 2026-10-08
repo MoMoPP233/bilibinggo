@@ -86,6 +86,23 @@ def record_pending(uid: str, dynamic_id: str) -> None:
             raise ParticipationGuardBlocked(uid, dynamic_id, _record(row).repost_status)
 
 
+def record_manual_retry_pending(uid: str, dynamic_id: str) -> None:
+    """Claim only an already uncertain repost; never clear a confirmed guard."""
+    uid, dynamic_id = _key(uid, dynamic_id)
+    with session_scope() as session:
+        result = session.execute(
+            update(ParticipationGuardRow)
+            .where(
+                ParticipationGuardRow.uid == uid,
+                ParticipationGuardRow.dynamic_id == dynamic_id,
+                ParticipationGuardRow.repost_status.in_({"pending", "unknown"}),
+            )
+            .values(repost_status="pending", updated_at=int(time.time()))
+        )
+        if result.rowcount != 1:
+            raise ParticipationGuardBlocked(uid, dynamic_id, "not_uncertain")
+
+
 def confirm_repost(uid: str, dynamic_id: str) -> None:
     uid, dynamic_id = _key(uid, dynamic_id)
     confirmed_at = int(time.time())
@@ -153,6 +170,19 @@ def load_blocked_guard_ids(uid: str) -> set[str]:
             record.dynamic_id for row in rows
             if (record := _record(row)).repost_status in BLOCKED_REPOST_STATUSES
         }
+
+
+def load_manual_retry_guard_ids(uid: str) -> set[str]:
+    """Only uncertain reposts eligible for a *manual UI entry*, never auto work."""
+    uid, _ = _key(uid, "listing")
+    with session_scope() as session:
+        rows = session.exec(
+            select(ParticipationGuardRow.dynamic_id).where(
+                ParticipationGuardRow.uid == uid,
+                ParticipationGuardRow.repost_status.in_({"pending", "unknown"}),
+            )
+        ).all()
+        return {str(dynamic_id) for dynamic_id in rows}
 
 
 def list_confirmed_guards(uid: str) -> list[ParticipationGuardRecord]:

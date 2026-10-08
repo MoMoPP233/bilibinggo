@@ -202,6 +202,7 @@ register_exception_handlers(app)
 _JOB_REQUIRES_LOGIN = frozenset(
     {
         "participate",
+        "manual_retry_unknown",
         "participate_triple",
         "refresh_all",
         "refresh_source",
@@ -1161,7 +1162,7 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
         require_login(account, message="请先扫码登录后再执行此操作")
     if request.action in _JOB_REQUIRES_LLM:
         require_llm_ready()
-    params = request.params or {}
+    params = dict(request.params or {})
     if request.action in {"sync_repost_history", "sync_assess_repost_history"} and params:
         raise AppError(ErrorCode.VALIDATION_ERROR, "该操作不接受额外参数")
     if request.action == "update_all_datasources" and params:
@@ -1178,13 +1179,40 @@ def api_start_job(request: JobRequest) -> dict[str, Any]:
             raise AppError(ErrorCode.VALIDATION_ERROR, "数据源 ID 无效")
     if request.action == "participate":
         dynamic_id = str(params.get("dynamic_id") or "").strip()
-        if not is_valid_dynamic_id(dynamic_id):
+        if (not is_valid_dynamic_id(dynamic_id)
+                or {"runtime_profile_id", "uid"} & set(params)
+                or ("manual_unknown_retry" in params and type(params["manual_unknown_retry"]) is not bool)):
             raise AppError(ErrorCode.VALIDATION_ERROR, "活动 ID 无效")
+        if params.get("manual_unknown_retry"):
+            uid = str(account.get("mid") or "")
+            if not uid.isascii() or not uid.isdigit() or int(uid) <= 0:
+                raise AppError(ErrorCode.VALIDATION_ERROR, "当前账号 UID 无法确认，未执行参与")
+            # Identity is server-attested at Job creation, never trusted from
+            # browser parameters; the worker rechecks before each step.
+            params["runtime_profile_id"] = get_runtime_profile_id()
+            params["uid"] = uid
+    if request.action == "manual_retry_unknown":
+        if (set(params) != {"dynamic_id", "runtime_profile_id", "uid"}
+                or not is_valid_dynamic_id(str(params.get("dynamic_id") or ""))
+                or params.get("runtime_profile_id") != get_runtime_profile_id()
+                or str(params.get("uid") or "") != str(account.get("mid") or "")):
+            raise AppError(ErrorCode.VALIDATION_ERROR, "重新参与目标或 Profile 无效")
     if runner.try_start(request.action, params, source="ui") is None:
         if restart_control.is_restart_pending():
             _raise_restart_pending()
         raise AppError(ErrorCode.JOB_BUSY, "已有任务正在运行")
     return {"ok": True, "job": runner.get_status().to_dict()}
+
+
+@app.get("/api/participation-unknown/{dynamic_id}", tags=["stable"])
+def api_participation_unknown(dynamic_id: str) -> dict[str, Any]:
+    if not is_valid_dynamic_id(dynamic_id):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "活动 ID 无效")
+    require_login(get_account_profile(), message="请先扫码登录后再执行此操作")
+    from src.manual_participation_retry import inspect_unknown_actions
+
+    return {"ok": True, "runtime_profile_id": get_runtime_profile_id(),
+            **inspect_unknown_actions(dynamic_id)}
 
 
 @app.post("/api/jobs/cancel", response_model=JobStartOut, tags=["stable"])

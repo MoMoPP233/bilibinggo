@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 import httpx
+from sqlmodel import select
 
 from src.bilibili_auth import require_login
 from src.bilibili_client import BilibiliClient
@@ -15,6 +16,8 @@ from src.bilibili_request_budget import RequestBudgetExhausted
 from src.comment_breaker import CommentLimitActive, is_comment_breaker_active
 from src.comment_confirmation import get_comment_status
 from src.favorite_confirmation import get_favorite_status
+from src.db.models import ParticipationActionRow
+from src.db.session import session_scope
 from src.lottery_actions import (
     ACTION_INTERVAL_SEC,
     DEFAULT_PARTICIPATE_TEXT,
@@ -70,6 +73,30 @@ RESERVE_CLICK_URL = "https://api.bilibili.com/x/dynamic/feed/reserve/click"
 RESERVE_RESERVED_STATUS = 2
 RESERVE_PARTICIPATE_STEPS = 2
 _execution_uid: ContextVar[str | None] = ContextVar("participation_uid", default=None)
+
+
+def _unprotected_legacy_unknown_action(
+    uid: str, dynamic_id: str, statuses: dict[str, str | None],
+) -> str | None:
+    """Fail closed for exact old UNKNOWN evidence lacking a durable action guard."""
+    with session_scope() as session:
+        snapshots = session.exec(
+            select(ParticipationActionRow.context_snapshot_json).where(
+                ParticipationActionRow.uid == uid,
+                ParticipationActionRow.dynamic_id == dynamic_id,
+            )
+        ).all()
+    for raw in snapshots:
+        try:
+            snapshot = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("旧参与记录无法判读，已禁止重复操作") from exc
+        if not isinstance(snapshot, dict) or snapshot.get("result_class") != "unknown":
+            continue
+        action = snapshot.get("unknown_action")
+        if action in statuses and statuses[action] not in {"pending", "unknown", "confirmed"}:
+            return action
+    return None
 
 
 def _mutation_result_unknown(exc: BaseException) -> bool:
@@ -373,6 +400,7 @@ def participate_five_action_lottery(
     dry_run: bool = False,
     persist: bool = True,
     on_step: Callable[[int, int, str, str], None] | None = None,
+    manual_retry_actions: frozenset[str] = frozenset(),
 ) -> ParticipateResult:
     if not dry_run and is_comment_breaker_active():
         return _deferred_comment_result(
@@ -483,7 +511,9 @@ def participate_five_action_lottery(
     if context.reposted is True:
         if not dry_run:
             confirm_repost(uid, dynamic_id)
-    elif context.liked is True and context.favorited is True:
+    elif context.liked is True and context.favorited is True and not (
+        manual_retry_actions & {"favorite", "repost"}
+    ):
         if not dry_run:
             mark_repost_suspected(uid, dynamic_id)
         result = _dedup_skip(
@@ -536,6 +566,7 @@ def participate_five_action_lottery(
             context=context,
             on_action=completed_actions.append,
             on_mutation_start=on_mutation_start,
+            manual_retry_actions=manual_retry_actions,
         )
     except Exception as exc:
         if isinstance(exc, CommentLimitActive):
@@ -1074,6 +1105,7 @@ def _participate_activity_unlocked(
     dry_run: bool = False,
     persist: bool = True,
     on_step: Callable[[int, int, str, str], None] | None = None,
+    manual_retry_actions: frozenset[str] = frozenset(),
 ) -> ParticipateResult:
     if not is_valid_dynamic_id(dynamic_id):
         raise ValueError("dynamic_id 无效")
@@ -1100,6 +1132,7 @@ def _participate_activity_unlocked(
             dry_run=dry_run,
             persist=persist,
             on_step=on_step,
+            manual_retry_actions=manual_retry_actions,
         )
     if lottery_type == "转发抽奖":
         return participate_five_action_lottery(
@@ -1110,6 +1143,7 @@ def _participate_activity_unlocked(
             dry_run=dry_run,
             persist=persist,
             on_step=on_step,
+            manual_retry_actions=manual_retry_actions,
         )
     if lottery_type == "预约抽奖":
         return participate_reserve_lottery(
@@ -1132,6 +1166,7 @@ def participate_activity(
     persist: bool = True,
     on_step: Callable[[int, int, str, str], None] | None = None,
     preflight: bool = False,
+    manual_unknown_retry: bool = False,
 ) -> ParticipateResult:
     """Web、自动与 CLI 共用入口：跨进程锁内先查本地，再访问当前目标。
 
@@ -1142,6 +1177,8 @@ def participate_activity(
         raise ValueError("dynamic_id 无效")
     if lottery_type not in PARTICIPATABLE_TYPES and lottery_type != "充电抽奖":
         raise RuntimeError(f"不支持的抽奖类型: {lottery_type}")
+    if manual_unknown_retry and lottery_type not in {"互动抽奖", "转发抽奖"}:
+        raise RuntimeError("该活动类型无法安全恢复未知动作，请人工核对")
     _, account_uid = require_login()  # 只读本地 Cookie，不发登录/目标状态请求。
     uid = str(account_uid)
 
@@ -1159,7 +1196,8 @@ def participate_activity(
                 if local is not None and local.user_status == "已参加":
                     return _dedup_skip(dynamic_id, lottery_type, "already_joined", "本地已记录参加，已跳过")
                 guard = get_guard(uid, dynamic_id)
-                if guard and guard.repost_status in {"pending", "unknown", "suspected"}:
+                if (guard and guard.repost_status in {"pending", "unknown", "suspected"}
+                        and not (manual_unknown_retry and guard.repost_status in {"pending", "unknown"})):
                     labels = {
                         "pending": "曾发起转发，结果尚未确认",
                         "unknown": "上次转发结果未知",
@@ -1169,18 +1207,40 @@ def participate_activity(
                         dynamic_id, lottery_type, f"repost_{guard.repost_status}",
                         f"{labels[guard.repost_status]}，禁止自动重发，需人工确认",
                     )
+                manual_actions: set[str] = set()
+                if manual_unknown_retry and guard and guard.repost_status in {"pending", "unknown"}:
+                    manual_actions.add("repost")
+                favorite_status: str | None = None
+                comment_status: str | None = None
                 if lottery_type in {"互动抽奖", "转发抽奖"}:
                     favorite_status = get_favorite_status(dynamic_id, uid=uid)
                     if favorite_status in {"pending", "unknown"}:
-                        return _dedup_skip(
-                            dynamic_id, lottery_type, f"favorite_{favorite_status}",
-                            "收藏结果未知，已阻止自动重试，需人工确认",
-                        )
+                        if manual_unknown_retry:
+                            manual_actions.add("favorite")
+                        else:
+                            return _dedup_skip(
+                                dynamic_id, lottery_type, f"favorite_{favorite_status}",
+                                "收藏结果未知，已阻止自动重试，需人工确认",
+                            )
                     comment_status = get_comment_status(dynamic_id, uid=uid)
                     if comment_status in {"pending", "unknown"}:
-                        return _dedup_skip(
-                            dynamic_id, lottery_type, f"comment_{comment_status}",
-                            "评论结果未知，已阻止自动重试",
+                        if manual_unknown_retry:
+                            manual_actions.add("comment")
+                        else:
+                            return _dedup_skip(
+                                dynamic_id, lottery_type, f"comment_{comment_status}",
+                                "评论结果未知，已阻止自动重试",
+                            )
+                    missing_guard = _unprotected_legacy_unknown_action(uid, dynamic_id, {
+                        "favorite": favorite_status,
+                        "comment": comment_status,
+                        "repost": guard.repost_status if guard else None,
+                    })
+                    if missing_guard is not None:
+                        labels = {"favorite": "收藏", "comment": "评论", "repost": "转发"}
+                        raise RuntimeError(
+                            f"旧参与记录显示{labels[missing_guard]}结果未知，但缺少可验证的持久防重状态；"
+                            "未发送请求，请人工核对"
                         )
                 checked_step(0, RESERVE_PARTICIPATE_STEPS if lottery_type == "预约抽奖" else 5,
                              "本地防重检查通过，正在检查当前目标…", "check")
@@ -1251,6 +1311,7 @@ def participate_activity(
                         reader, dynamic_id=dynamic_id, lottery_type=lottery_type,
                         action_text=action_text, dry_run=dry_run, persist=persist,
                         on_step=checked_step,
+                        manual_retry_actions=frozenset(manual_actions),
                     )
             finally:
                 _execution_uid.reset(token)

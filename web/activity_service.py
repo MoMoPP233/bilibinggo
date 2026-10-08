@@ -28,7 +28,7 @@ from src.comment_confirmation import is_comment_confirmed, load_comment_statuses
 from src.favorite_confirmation import FavoriteGuardStateError, load_favorite_statuses
 from src.invalid_activities import invalid_activity_ids
 from src.manual_ignored_activities import manual_ignore_ids
-from src.participation_guard import load_blocked_guard_ids
+from src.participation_guard import load_blocked_guard_ids, load_manual_retry_guard_ids
 from src.sources.common import is_valid_dynamic_id, normalize_activity_id
 from src.state_store import DATA_DIR, get_last_pipeline_persisted
 
@@ -234,12 +234,7 @@ def _load_activities_payload() -> dict:
 
 
 def _load_blocked_activity_ids() -> set[str]:
-    """Return uncertain participation IDs for the current Profile.
-
-    This is deliberately a presentation-layer read.  The durable guard rows
-    remain available to the participation flow and internal diagnostics; the
-    ordinary activity view simply has no user-facing category for them.
-    """
+    """Return protected repost IDs; only exact uncertain rows get a manual UI entry."""
     return load_blocked_guard_ids(participation_uid())
 
 
@@ -352,6 +347,11 @@ def _filtered_activity_rows(
     participations = load_participations()
     items = [item for item in (enriched.get("activities") or []) if isinstance(item, dict)]
     blocked_ids = _load_blocked_activity_ids()
+    current_uid = str(participation_uid())
+    valid_uid = current_uid.isascii() and current_uid.isdigit() and int(current_uid) > 0
+    manual_retry_ids = load_manual_retry_guard_ids(current_uid) if blocked_ids and valid_uid else set()
+    favorite_statuses = load_favorite_statuses(uid=current_uid) if valid_uid else {}
+    comment_statuses = load_comment_statuses(uid=current_uid) if valid_uid else {}
     invalid_ids = invalid_activity_ids()
     ignored_ids = manual_ignore_ids()
 
@@ -361,7 +361,28 @@ def _filtered_activity_rows(
         draw_window_value = ""
     for item in items:
         dynamic_id = str(item.get("dynamic_id") or "")
-        if dynamic_id in blocked_ids or dynamic_id in invalid_ids or dynamic_id in ignored_ids:
+        if dynamic_id in invalid_ids or dynamic_id in ignored_ids:
+            continue
+        previous = action_map.get(dynamic_id) or {}
+        previous_snapshot = previous.get("context_snapshot") or {}
+        legacy_unknown = (
+            previous_snapshot.get("result_class") == "unknown"
+            and (
+                (previous_snapshot.get("unknown_action") == "favorite"
+                 and favorite_statuses.get(dynamic_id) not in {"confirmed", "failed"})
+                or (previous_snapshot.get("unknown_action") == "comment"
+                    and comment_statuses.get(dynamic_id) not in {"confirmed", "failed"})
+            )
+        ) if isinstance(previous_snapshot, dict) else False
+        manual_retry_available = (
+            (dynamic_id in manual_retry_ids
+             or favorite_statuses.get(dynamic_id) in {"pending", "unknown"}
+             or comment_statuses.get(dynamic_id) in {"pending", "unknown"}
+             or legacy_unknown)
+            and str(item.get("draw_status") or "") == "active"
+            and not item.get("skipped")
+        )
+        if dynamic_id in blocked_ids and dynamic_id not in manual_retry_ids:
             # pending/unknown/suspected are protected backend states, not a
             # normal activity status.  Keep them out of every ordinary list
             # query so search, filters, sorting and pagination share one set.
@@ -373,9 +394,13 @@ def _filtered_activity_rows(
             continue
         activity_status = _resolve_activity_status(item, participation)
         can_participate = _can_participate(item, activity_status)
+        manual_retry_available = manual_retry_available and activity_status == "未参加"
         if not _should_list_activity(item, activity_status, can_participate):
             continue
         row = _normalize_activity(item, action_map, participation)
+        if manual_retry_available:
+            row["manual_retry_available"] = True
+            row["can_participate"] = False
         normalized.append(row)
 
     if draw_window_value:

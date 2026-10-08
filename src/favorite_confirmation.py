@@ -168,6 +168,16 @@ def get_favorite_status(dynamic_id: str, *, uid: str | int) -> str | None:
         return _get_favorite_status_unlocked(dynamic_id, uid=uid)
 
 
+def peek_favorite_status(dynamic_id: str, *, uid: str | int) -> str | None:
+    """Read-only manual UI preflight, including exact retained legacy evidence."""
+    owner, target = _uid_key(uid), _target_key(dynamic_id)
+    with favorite_mutation_gate(), user_data_lock():
+        record = _read_state_unlocked()["guards"].get(owner, {}).get(target)
+        if record is not None:
+            return record["status"]
+        return "unknown" if _legacy_unknown_exists(owner, target) else None
+
+
 def load_favorite_statuses(*, uid: str | int) -> dict[str, str]:
     """Read the durable ledger once for automatic candidate selection."""
     owner = _uid_key(uid)
@@ -194,4 +204,16 @@ def _set_favorite_status_unlocked(dynamic_id: str, *, uid: str | int, status: st
         if previous == status and status != "pending":
             return
         records[target] = {"status": status, "updated_at": int(time.time())}
+        _write_state_unlocked(state)
+
+
+def _claim_manual_favorite_pending_unlocked(dynamic_id: str, *, uid: str | int) -> None:
+    """Caller holds mutation gate and a durable, one-attempt authorization."""
+    owner, target = _uid_key(uid), _target_key(dynamic_id)
+    with user_data_lock():
+        state = _read_state_unlocked()
+        record = state["guards"].get(owner, {}).get(target)
+        if not record or record["status"] not in {"pending", "unknown"}:
+            raise FavoriteGuardStateError("收藏已不处于结果未知状态，禁止人工重发")
+        state["guards"][owner][target] = {"status": "pending", "updated_at": int(time.time())}
         _write_state_unlocked(state)

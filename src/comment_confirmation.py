@@ -118,6 +118,22 @@ def _set_comment_status_unlocked(dynamic_id: str, *, uid: str | int, status: str
         _write_state_unlocked(state)
 
 
+def _claim_manual_comment_pending_unlocked(dynamic_id: str, *, uid: str | int) -> None:
+    """Caller holds comment mutation gate and a durable one-attempt authorization."""
+    key, owner = _canonical_dynamic_id(dynamic_id), _uid_key(uid)
+    if not key or not owner:
+        raise CommentGuardStateError("评论防重身份无效，禁止人工重发")
+    with user_data_lock():
+        state = _read_state_unlocked()
+        if key in state["confirmed"]:
+            raise CommentGuardStateError("旧版已确认评论，禁止人工重发")
+        record = state["guards"].get(owner, {}).get(key)
+        if not record or record["status"] not in {"pending", "unknown"}:
+            raise CommentGuardStateError("评论已不处于结果未知状态，禁止人工重发")
+        state["guards"][owner][key] = {"status": "pending", "updated_at": time.time()}
+        _write_state_unlocked(state)
+
+
 def _is_comment_confirmed_unlocked(dynamic_id: str, *, uid: str | int | None = None) -> bool:
     return _get_comment_status_unlocked(dynamic_id, uid=uid) == "confirmed"
 

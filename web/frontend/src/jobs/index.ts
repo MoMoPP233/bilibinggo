@@ -19,6 +19,10 @@ import { loadWatchUsers } from "../watch/index";
 
 let qrcodeLastFocus = null;
 let lastLogDockJobState = "idle";
+const manualParticipateStarting = new Set<string>();
+export function participationClickParams(dynamicId: string) {
+  return { dynamic_id: dynamicId, manual_unknown_retry: true };
+}
 
 const JOB_TERMINAL_STATES = new Set(["success", "error", "cancelled", "interrupted"]);
 const ACCEPTED_TERMINAL_IDS_CAP = 24;
@@ -960,7 +964,7 @@ export function renderTripleParticipationResults(result) {
 }
 
 export function showParticipationResult(job) {
-  if (!jobResultBanner || (job.action !== "participate" && job.action !== "participate_triple")) return;
+  if (!jobResultBanner || !["participate", "manual_retry_unknown", "participate_triple"].includes(job.action)) return;
   if (job.result?.skipped) return;
   hideParticipationResult(true);
 
@@ -1085,7 +1089,7 @@ export function renderParticipateSteps(job) {
     renderTripleParticipateProgress(job);
     return;
   }
-  if (job.state !== "running" || job.action !== "participate") {
+  if (job.state !== "running" || (job.action !== "participate" && job.action !== "manual_retry_unknown")) {
     if (job.state === "running" && isRefreshPipelineAction(job.action)) {
       renderRefreshAllPipeline(job);
       return;
@@ -1221,7 +1225,7 @@ export function calcJobProgressPercent(job) {
     }
     if (step >= 4) return 100;
   }
-  if (job.action === "participate" || job.action === "participate_triple") {
+  if (job.action === "participate" || job.action === "manual_retry_unknown" || job.action === "participate_triple") {
     if (total <= 0) return 0;
     return Math.max(0, Math.min(100, Math.round((step / total) * 100)));
   }
@@ -1333,6 +1337,7 @@ export function updateProgressUI(job) {
   if (progressChip) {
     const chipMap = {
       participate: "参与任务",
+      manual_retry_unknown: "重新参与",
       participate_triple: "三连参与",
       refresh_all: "同步任务",
       refresh_source: "数据源更新",
@@ -1349,7 +1354,7 @@ export function updateProgressUI(job) {
   progressLabel.textContent = formatProgressTitle(job);
   if (progressDetail) {
     progressDetail.textContent = formatProgressDetail(job);
-    progressDetail.hidden = job.action === "participate";
+    progressDetail.hidden = job.action === "participate" || job.action === "manual_retry_unknown";
   }
   renderParticipateSteps(job);
   window.dispatchEvent(new CustomEvent("binggo:job-progress", { detail: job }));
@@ -1440,7 +1445,7 @@ export async function startJob(action, params = {}) {
       /* 继续发起新任务 */
     }
   }
-  if (action === "participate" || action === "participate_triple") {
+  if (action === "participate" || action === "manual_retry_unknown" || action === "participate_triple") {
     hideParticipationResult(true);
     state.smoothJobPercent = 0;
     state.activeJobKey = "";
@@ -1494,7 +1499,7 @@ export function collectFinishedDynamicIds(job) {
   if (job.action === "participate_triple") {
     return (job.result?.items || []).map((item) => item?.dynamic_id).filter(Boolean);
   }
-  if (job.action === "participate" && job.result?.dynamic_id) {
+  if ((job.action === "participate" || job.action === "manual_retry_unknown") && job.result?.dynamic_id) {
     return [job.result.dynamic_id];
   }
   return [];
@@ -1553,7 +1558,7 @@ export function formatFollowingFeedResult(job) {
 export async function handleJobCompletion(job) {
   dismissRunningToasts();
 
-  const isParticipation = job.action === "participate" || job.action === "participate_triple";
+  const isParticipation = job.action === "participate" || job.action === "manual_retry_unknown" || job.action === "participate_triple";
   const loginSuccessPending =
     job.action === "login" && job.state === "success" && !state.qrcodeDismissed;
   if (loginSuccessPending) {
@@ -1627,11 +1632,15 @@ export function bindActionButtons() {
       const action = button.dataset.action;
       const params = {};
       if (button.dataset.dynamicId) params.dynamic_id = button.dataset.dynamicId;
+      if (action === "participate") Object.assign(params, participationClickParams(String(params.dynamic_id || "")));
+      const participateId = (action === "participate" || action === "manual_retry_unknown") ? String(params.dynamic_id || "") : "";
+      if (participateId && manualParticipateStarting.has(participateId)) return;
+      if (participateId) manualParticipateStarting.add(participateId);
       if (button.dataset.sourceId) params.source_id = button.dataset.sourceId;
       if (action === "participate_triple") {
         Object.assign(params, buildActivityFilterJobParams());
       }
-      if (action === "participate") {
+      if (action === "participate" || action === "manual_retry_unknown") {
         setButtonLoading(button, true, { label: "参与中…" });
       }
       if (action === "participate_triple") {
@@ -1662,6 +1671,8 @@ export function bindActionButtons() {
         if (action === "participate_triple") {
           renderTripleParticipateBar(state.tripleTargets);
         }
+      } finally {
+        if (participateId) manualParticipateStarting.delete(participateId);
       }
     });
   });
@@ -1669,7 +1680,7 @@ export function bindActionButtons() {
 
 export function resolveJobPollIntervalMs(action) {
   if (action === "login") return 500;
-  if (action === "participate" || action === "participate_triple") return 400;
+  if (action === "participate" || action === "manual_retry_unknown" || action === "participate_triple") return 400;
   return 1000;
 }
 

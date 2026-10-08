@@ -136,6 +136,7 @@ def test_blocked_targets_are_hidden_but_are_not_selected(monkeypatch) -> None:
         return {FIRST_ID}
 
     monkeypatch.setattr(activity_service, "load_blocked_guard_ids", blocked)
+    monkeypatch.setattr(activity_service, "load_manual_retry_guard_ids", lambda _uid: set())
     rows = activity_service._filtered_activity_rows(status="未参加")
 
     assert seen_uids == ["123"]
