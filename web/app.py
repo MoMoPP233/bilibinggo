@@ -373,6 +373,21 @@ def api_runtime_ready() -> dict[str, Any]:
     }
 
 
+@app.get("/api/runtime/tray-health", tags=["stable"])
+def api_runtime_tray_health() -> dict[str, Any]:
+    """Local-only, frozen runtime identity plus a side-effect-free tray view."""
+    from src.dashboard_server import get_dashboard_port
+    from web.tray_health import current_tray_health
+
+    return {
+        "ready": True,
+        "profile_id": _runtime_binding_or_none(),
+        "instance_id": os.environ.get(RUNTIME_INSTANCE_ENV, ""),
+        "port": get_dashboard_port(),
+        **current_tray_health(),
+    }
+
+
 @app.post("/api/profiles/{profile_id}/launch", tags=["stable"])
 def api_launch_profile(profile_id: str, request: Request) -> dict[str, Any]:
     # LocalControlPlaneGuard rejects non-loopback Host/Origin. This high-impact

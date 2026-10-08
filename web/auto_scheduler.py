@@ -73,6 +73,18 @@ SCAN_STAGGER_MINUTES = 15
 _SCAN_RANK_CACHE_SECONDS = 15.0
 _SCAN_LABELS = {"refresh": "刷新批次", "winner": "中奖深探", "following": "关注补漏"}
 
+
+def _next_scannable_due(
+    candidates: list[tuple[str, str, datetime]], *, night_continue: bool,
+) -> datetime | None:
+    """Use the existing V111 due times, excluding participation and quiet slots."""
+    return min(
+        (due for kind, _label, due in candidates
+         if kind in {"refresh", "winner", "following"}
+         and not is_night_quiet(due, config=night_continue)),
+        default=None,
+    )
+
 _SLOT_STATE_FILE = "scheduler_slots.json"
 _SLOT_STATE_MAX_TASKS = 8
 _TRIPLE_NEXT_RUN = "triple_next_run"
@@ -269,6 +281,8 @@ class SchedulerStatus:
     tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
     night_continue_enabled: bool = False
     night_quiet: bool = False
+    last_successful_scan_at: str | None = None
+    next_scan_unix: int | None = None
 
     def to_dict(self, now: datetime | None = None, *, next_task_override: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
@@ -501,6 +515,25 @@ class AutoScheduler:
                 self._status.refresh_pipeline = _idle_pipeline()
             return self._status.to_dict(now, next_task_override=next_task)
 
+    def tray_snapshot(self) -> dict[str, Any]:
+        """Read only already-computed, Profile-local scheduler state for the tray.
+
+        Unlike get_status(), this never recalculates runtime ranks, reads slot
+        files, touches the registry, or changes any scheduler status.
+        """
+        with self._lock:
+            return {
+                "state": self._status.state,
+                "thread_alive": bool(self._thread and self._thread.is_alive()),
+                "last_tick_at": self._status.last_tick_at,
+                "last_successful_scan_at": self._status.last_successful_scan_at,
+                "next_scan_unix": self._status.next_scan_unix,
+                "scan_running": any(
+                    self._status.tasks.get(key, {}).get("status") == "running"
+                    for key in ("refresh", "winner", "following")
+                ),
+            }
+
     def start(self) -> dict[str, Any]:
         # 在 restart gate 内先把调度器状态变为 running；Profile 切换随后
         # 取得同一 gate 时一定能看到该状态，不能在 idle 检查后抢跑。
@@ -619,6 +652,9 @@ class AutoScheduler:
             if status == "running":
                 entry["last_started_at"] = now
                 entry["last_finished_at"] = None
+            elif status == "completed" and task in {"refresh", "winner", "following"}:
+                entry["last_finished_at"] = now
+                self._status.last_successful_scan_at = now
             elif status in {
                 "completed",
                 "skipped_busy",
@@ -897,9 +933,12 @@ class AutoScheduler:
         try:
             while not self._is_stale():
                 now = self._clock()
-                next_task, _candidates, scan_slots = self._runtime_next_task(now)
+                next_task, candidates, scan_slots = self._runtime_next_task(now)
+                night_continue = get_night_continue_enabled()
+                scan_due = _next_scannable_due(candidates, night_continue=night_continue)
                 with self._lock:
                     self._status.last_tick_at = _now_iso()
+                    self._status.next_scan_unix = int(scan_due.timestamp()) if scan_due else None
                     slot = _next_slot(now, task_override=next_task)
                     self._status.next_slot = slot
                     self._status.next_hint = slot.get("hint") or ""

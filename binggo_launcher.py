@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
 import logging
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 import webbrowser
+import urllib.request
 from pathlib import Path
 
 from src.restart_control import RESTART_EXIT_CODE, RESTART_SUPERVISED_ENV
@@ -27,6 +29,7 @@ SHUTDOWN_TIMEOUT_SEC = 15.0
 TRAY_CHECK_INTERVAL_SEC = 1.0
 TRAY_RECOVERY_ATTEMPTS = 3
 TRAY_RETRY_DELAY_SEC = 1.0
+TRAY_TOOLTIP_INTERVAL_SEC = 60.0
 CREATE_NO_WINDOW = 0x08000000
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 8181 if bool(getattr(sys, "frozen", False)) else 8787
@@ -395,6 +398,37 @@ def _start_supervised_tray(proc: subprocess.Popen[bytes], requested: threading.E
     return None
 
 
+def _read_tray_health() -> dict:
+    """Only this supervisor's loopback port and frozen Profile identity."""
+    request = urllib.request.Request(f"http://127.0.0.1:{DASHBOARD_PORT}/api/runtime/tray-health")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=0.5) as response:
+        payload = json.load(response)
+    if not isinstance(payload, dict) or not (
+        payload.get("ready") is True
+        and payload.get("profile_id") == RUNTIME_PROFILE_ID
+        and payload.get("instance_id") == INSTANCE_ID
+        and payload.get("port") == DASHBOARD_PORT
+    ):
+        raise ValueError("托盘状态响应的运行实例身份不匹配")
+    return payload
+
+
+def _refresh_tray_tooltip(tray) -> None:
+    try:
+        health = _read_tray_health()
+    except Exception as exc:
+        logging.getLogger(__name__).warning("当前账号托盘状态暂不可用：%s", exc)
+        health = None
+    try:
+        from src.windows_tray import health_tooltip
+
+        tray.update_title(health_tooltip(RUNTIME_PROFILE_ID, health))
+    except Exception:
+        # A text formatting/backend failure never counts as a missing tray.
+        logging.getLogger(__name__).exception("托盘状态文字更新失败；Dashboard 继续运行")
+
+
 def _startup_failure_message(*, log_path: Path, data_root: Path, exit_code: int | None) -> str:
     code_text = str(exit_code) if exit_code is not None else "仍在运行"
     return (
@@ -441,6 +475,7 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
 
         tray = None
         tray_failed = False
+        next_tooltip_at = 0.0
         exit_requested = threading.Event()
         try:
             if sys.platform == "win32":
@@ -462,12 +497,19 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
                     )
                     break
                 except subprocess.TimeoutExpired:
-                    if tray is None or exit_requested.is_set() or tray.is_healthy():
+                    if tray is None or exit_requested.is_set():
+                        continue
+                    if tray.is_healthy():
+                        now = time.monotonic()
+                        if now >= next_tooltip_at:
+                            next_tooltip_at = now + TRAY_TOOLTIP_INTERVAL_SEC
+                            _refresh_tray_tooltip(tray)
                         continue
                     if not tray.stop():
                         tray = None
                     else:
                         tray = _start_supervised_tray(proc, exit_requested)
+                        next_tooltip_at = 0.0
                     if tray is None and proc.poll() is None:
                         tray_failed = True
                         _request_tray_exit(proc, exit_requested)
