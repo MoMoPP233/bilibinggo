@@ -24,6 +24,9 @@ SOURCE_MUTEX_NAME = "Global\\BilibiliBinggoDashboard.Source.8787"
 SERVE_FLAG = "--serve"
 STARTUP_TIMEOUT_SEC = 45.0
 SHUTDOWN_TIMEOUT_SEC = 15.0
+TRAY_CHECK_INTERVAL_SEC = 1.0
+TRAY_RECOVERY_ATTEMPTS = 3
+TRAY_RETRY_DELAY_SEC = 1.0
 CREATE_NO_WINDOW = 0x08000000
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 8181 if bool(getattr(sys, "frozen", False)) else 8787
@@ -311,18 +314,27 @@ def _open_current_ui(*, new_window: bool = True) -> None:
         logging.getLogger(__name__).warning("默认浏览器未能打开；可从托盘重试：%s", exc)
 
 
-def _request_tray_exit(proc: subprocess.Popen[bytes], requested: threading.Event) -> None:
+def _request_tray_exit(proc: subprocess.Popen[bytes], requested: threading.Event) -> bool:
     if requested.is_set() or proc.poll() is not None:
-        return
+        return requested.is_set()
     requested.set()
     try:
         if proc.stdin is None:
             raise OSError("服务退出通道不可用")
         proc.stdin.write(b"shutdown\n")
         proc.stdin.flush()
+        return True
     except (OSError, ValueError) as exc:
         requested.clear()
+        # A broken control channel must not strand a child. EOF is also a
+        # graceful-shutdown signal for supervised services.
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
         _show_error(f"无法向当前账号发送安全退出请求：{exc}")
+        return False
 
 
 def _stop_process(proc: subprocess.Popen[bytes]) -> int | None:
@@ -344,18 +356,43 @@ def _stop_process(proc: subprocess.Popen[bytes]) -> int | None:
 
 
 def _finish_process_after_interrupt(proc: subprocess.Popen[bytes]) -> int | None:
-    """Ctrl+C 后先等待同控制台子进程自行优雅退出，超时才强制兜底。"""
+    """Ctrl+C requests the same cooperative exit as the tray, without killing a job."""
 
     exit_code = proc.poll()
     if exit_code is not None:
         return exit_code
-    try:
-        return proc.wait(timeout=SHUTDOWN_TIMEOUT_SEC)
-    except subprocess.TimeoutExpired:
-        return _stop_process(proc)
-    except KeyboardInterrupt:
-        # 用户再次按 Ctrl+C 时不再继续等待。
-        return _stop_process(proc)
+    _request_tray_exit(proc, threading.Event())
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            # A second Ctrl+C must not turn an in-flight mutation into UNKNOWN.
+            continue
+
+
+def _start_supervised_tray(proc: subprocess.Popen[bytes], requested: threading.Event):
+    """Recover only an observably failed icon; never inspect shell overflow UI."""
+    from src.windows_tray import WindowsTray
+
+    for attempt in range(TRAY_RECOVERY_ATTEMPTS):
+        if proc.poll() is not None:
+            return None
+        tray = WindowsTray(
+            RUNTIME_PROFILE_ID, INSTANCE_ID, _open_current_ui,
+            lambda: _request_tray_exit(proc, requested),
+        )
+        try:
+            if tray.start() and tray.is_healthy():
+                return tray
+        except Exception:
+            logging.getLogger(__name__).exception("Windows 托盘启动失败")
+        if not tray.stop():
+            # The old message loop could still own a shell icon. Do not
+            # register a second icon with the same Profile identity.
+            return None
+        if attempt + 1 < TRAY_RECOVERY_ATTEMPTS:
+            time.sleep(TRAY_RETRY_DELAY_SEC)
+    return None
 
 
 def _startup_failure_message(*, log_path: Path, data_root: Path, exit_code: int | None) -> str:
@@ -403,31 +440,49 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
                 raise
 
         tray = None
+        tray_failed = False
         exit_requested = threading.Event()
         try:
-            if sys.platform == "win32" and getattr(proc, "stdin", None) is not None:
-                try:
-                    from src.windows_tray import WindowsTray
-
-                    tray = WindowsTray(
-                        RUNTIME_PROFILE_ID, INSTANCE_ID, _open_current_ui,
-                        lambda: _request_tray_exit(proc, exit_requested),
-                    )
-                    tray.start()
-                except Exception:
-                    logging.getLogger(__name__).exception("Windows 托盘不可用；Dashboard 继续运行")
-            if not browser_opened:
+            if sys.platform == "win32":
+                tray = _start_supervised_tray(proc, exit_requested)
+                if tray is None and proc.poll() is None:
+                    tray_failed = True
+                    _request_tray_exit(proc, exit_requested)
+                    _show_error("当前账号的系统托盘无法启动；已请求安全退出，正在等待现有任务结束。")
+            if not browser_opened and not tray_failed:
                 _open_current_ui(new_window=False)
                 browser_opened = True
-            # 父 supervisor 必须明确等待当前 --serve 子进程结束；只有
-            # Ctrl+C 会中断这次等待，不能在浏览器打开后自行返回。
-            exit_code = proc.wait()
+            # A bounded wait lets the supervisor observe a dead pystray loop.
+            # It never interrupts a service job: shutdown is requested through
+            # the existing cooperative child channel, then waited to completion.
+            while True:
+                try:
+                    exit_code = proc.wait(
+                        timeout=TRAY_CHECK_INTERVAL_SEC if tray and not exit_requested.is_set() else None
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    if tray is None or exit_requested.is_set() or tray.is_healthy():
+                        continue
+                    if not tray.stop():
+                        tray = None
+                    else:
+                        tray = _start_supervised_tray(proc, exit_requested)
+                    if tray is None and proc.poll() is None:
+                        tray_failed = True
+                        _request_tray_exit(proc, exit_requested)
+                        _show_error("当前账号的系统托盘无法恢复；已请求安全退出，正在等待现有任务结束。")
         except KeyboardInterrupt:
             _finish_process_after_interrupt(proc)
             return 0
         finally:
             if tray is not None:
                 tray.stop()
+
+        # An already-accepted Profile switch owns exit code 75. Preserve it;
+        # the next supervised child must establish its own healthy tray.
+        if tray_failed and exit_code != RESTART_EXIT_CODE:
+            return 1
 
         # A concurrent Profile switch may already have committed exit code 75
         # before the tray command arrives. Preserve that existing transition;

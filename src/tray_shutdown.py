@@ -63,7 +63,13 @@ def start_shutdown_listener() -> None:
                 if command.strip() == "shutdown":
                     shutdown_current_service()
                     return
+            # The supervisor is the only writer of this pipe. EOF means its
+            # process (and tray) has gone away; do not leave an orphan service
+            # accepting new jobs under a now-unowned runtime.
+            _logger.error("supervisor 控制通道已关闭，服务开始安全退出")
+            shutdown_current_service()
         except Exception:
-            _logger.exception("托盘退出通道异常；服务保持运行")
+            _logger.exception("supervisor 控制通道异常，服务开始安全退出")
+            shutdown_current_service()
 
     threading.Thread(target=listen, name="binggo-tray-control", daemon=True).start()

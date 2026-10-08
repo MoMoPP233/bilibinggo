@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 import subprocess
 import sys
 import uuid
@@ -33,8 +34,12 @@ class _FakeProcess:
 class _InterruptingProcess(_FakeProcess):
     def __init__(self, graceful_result: int | BaseException) -> None:
         super().__init__(0)
+        self.stdin = io.BytesIO()
         self.graceful_result = graceful_result
         self.wait_timeouts: list[float | None] = []
+
+    def poll(self) -> int | None:
+        return None
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_count += 1
@@ -136,6 +141,7 @@ def test_supervisor_ctrl_c_waits_for_graceful_child_exit(
 
     monkeypatch.setattr(launcher, "_spawn_server_process", lambda: proc)
     monkeypatch.setattr(launcher, "_wait_for_server", lambda: True)
+    monkeypatch.setattr(launcher, "_start_supervised_tray", lambda *_args: type("Tray", (), {"stop": lambda self: True})())
     monkeypatch.setattr(launcher.webbrowser, "open", lambda _url: None)
     monkeypatch.setattr(
         launcher,
@@ -144,20 +150,29 @@ def test_supervisor_ctrl_c_waits_for_graceful_child_exit(
     )
 
     assert launcher._supervise_server(log_path=tmp_path / "app.log", data_root=tmp_path) == 0
-    assert proc.wait_timeouts == [None, launcher.SHUTDOWN_TIMEOUT_SEC]
+    assert proc.wait_timeouts == [launcher.TRAY_CHECK_INTERVAL_SEC, None]
+    assert proc.stdin.getvalue() == b"shutdown\n"
     assert forced_stops == []
 
 
-def test_supervisor_ctrl_c_forces_child_only_after_grace_timeout(
+def test_supervisor_repeated_ctrl_c_never_forces_inflight_child(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    timeout = subprocess.TimeoutExpired("serve", launcher.SHUTDOWN_TIMEOUT_SEC)
-    proc = _InterruptingProcess(timeout)
+    class RepeatedInterrupt(_InterruptingProcess):
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_count += 1
+            self.wait_timeouts.append(timeout)
+            if self.wait_count <= 2:
+                raise KeyboardInterrupt
+            return 0
+
+    proc = RepeatedInterrupt(0)
     forced_stops: list[_FakeProcess] = []
 
     monkeypatch.setattr(launcher, "_spawn_server_process", lambda: proc)
     monkeypatch.setattr(launcher, "_wait_for_server", lambda: True)
+    monkeypatch.setattr(launcher, "_start_supervised_tray", lambda *_args: type("Tray", (), {"stop": lambda self: True})())
     monkeypatch.setattr(launcher.webbrowser, "open", lambda _url: None)
     monkeypatch.setattr(
         launcher,
@@ -166,8 +181,9 @@ def test_supervisor_ctrl_c_forces_child_only_after_grace_timeout(
     )
 
     assert launcher._supervise_server(log_path=tmp_path / "app.log", data_root=tmp_path) == 0
-    assert proc.wait_timeouts == [None, launcher.SHUTDOWN_TIMEOUT_SEC]
-    assert forced_stops == [proc]
+    assert proc.wait_timeouts == [launcher.TRAY_CHECK_INTERVAL_SEC, None, None]
+    assert proc.stdin.getvalue() == b"shutdown\n"
+    assert forced_stops == []
 
 
 def test_supervisor_ctrl_c_during_startup_wait_stops_child(

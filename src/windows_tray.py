@@ -66,10 +66,10 @@ class WindowsTray:
             if self._ready.is_set() and self._icon is not None and self._icon.visible:
                 return True
             self.stop()
-            _logger.warning("Windows 托盘未能及时就绪；Dashboard 继续运行")
+            _logger.warning("Windows 托盘未能及时就绪")
             return False
         except Exception:
-            _logger.exception("Windows 托盘初始化失败；Dashboard 继续运行")
+            _logger.exception("Windows 托盘初始化失败")
             self.stop()
             return False
 
@@ -90,13 +90,27 @@ class WindowsTray:
         try:
             icon.run(setup=setup)
         except Exception:
-            _logger.exception("Windows 托盘消息循环异常；Dashboard 继续运行")
+            _logger.exception("Windows 托盘消息循环异常")
             self._setup_done.set()
 
-    def stop(self) -> None:
+    def is_healthy(self) -> bool:
+        """Observable pystray state, not Windows' user-controlled overflow setting."""
+        icon, thread = self._icon, self._thread
+        try:
+            return bool(self._ready.is_set() and thread and thread.is_alive()
+                        and icon is not None and icon.visible)
+        except Exception:
+            return False
+
+    def stop(self) -> bool:
         if self._icon is not None:
             try:
                 self._icon.stop()
             except Exception:
                 _logger.exception("移除 Windows 托盘图标失败")
         self._icon = None
+        self._ready.clear()
+        thread = self._thread
+        if thread is not None and thread.ident is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        return thread is None or not thread.is_alive()

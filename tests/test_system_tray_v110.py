@@ -62,7 +62,7 @@ def test_tray_starts_only_after_ready_and_stops_with_service(fake_tray, monkeypa
     events = []
     class Proc:
         stdin = io.BytesIO()
-        def wait(self):
+        def wait(self, timeout=None):
             events.append("wait")
             return 0
         def poll(self):
@@ -79,7 +79,7 @@ def test_tray_starts_only_after_ready_and_stops_with_service(fake_tray, monkeypa
 def test_browser_failure_keeps_runtime_and_tray(fake_tray, monkeypatch, tmp_path):
     class Proc:
         stdin = io.BytesIO()
-        def wait(self):
+        def wait(self, timeout=None):
             assert FakeIcon.icons and not FakeIcon.icons[0].stopped.is_set()
             return 0
         def poll(self):
@@ -97,6 +97,16 @@ def test_browser_client_closing_does_not_send_shutdown(fake_tray):
     assert tray.start()
     assert FakeIcon.icons[-1].visible is True
     assert requests == []
+    tray.stop()
+
+
+def test_tray_health_observes_message_loop_exit_not_only_ready(fake_tray):
+    tray = windows_tray.WindowsTray("account-1", "i1", lambda: None, lambda: None)
+    assert tray.start() and tray.is_healthy()
+    FakeIcon.icons[-1].stop()
+    assert tray._thread is not None
+    tray._thread.join(timeout=2)
+    assert not tray.is_healthy()
     tray.stop()
 
 
@@ -301,7 +311,7 @@ def test_packaging_includes_icon_and_tray_backend():
 def test_service_failure_removes_tray(fake_tray, monkeypatch, tmp_path):
     class Proc:
         stdin = io.BytesIO()
-        def wait(self):
+        def wait(self, timeout=None):
             return 9
         def poll(self):
             return None
@@ -320,7 +330,7 @@ def test_tray_request_does_not_swallow_profile_restart(fake_tray, monkeypatch, t
         stdin = io.BytesIO()
         def __init__(self, code):
             self.code = code
-        def wait(self):
+        def wait(self, timeout=None):
             if self.code == RESTART_EXIT_CODE:
                 FakeIcon.icons[-1].menu[1].callback(None, None)
             return self.code
