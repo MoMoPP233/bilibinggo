@@ -62,7 +62,12 @@ def main() -> int:
                 "生产请先: cd web/frontend && npm ci && npm run build",
                 file=sys.stderr,
             )
-        restart_requested = run_dashboard_server()
+        from src.tray_shutdown import TRAY_CONTROL_ENV, start_shutdown_listener
+
+        if os.environ.get(TRAY_CONTROL_ENV) == "1":
+            restart_requested = run_dashboard_server(on_registered=start_shutdown_listener)
+        else:
+            restart_requested = run_dashboard_server()
         if restart_requested:
             from src.restart_control import RESTART_EXIT_CODE
 

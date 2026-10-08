@@ -458,6 +458,15 @@ class AutoScheduler:
         self._schedule_auto_snapshot(force=True)
         return self.get_status()
 
+    def wait_until_stopped(self, *, timeout_sec: float) -> bool:
+        """Wait for the current scheduler worker, without holding its state lock."""
+        with self._lock:
+            thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=max(0.0, timeout_sec))
+        return not thread.is_alive()
+
     def _fatal(self, message: str) -> None:
         # 旧代线程晚到的致命错误不得停机/污染新一代调度器。
         if self._is_stale():

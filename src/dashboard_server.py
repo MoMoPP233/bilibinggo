@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import Callable
 
 from src.app_paths import is_frozen
 from src.restart_control import restart_control
@@ -53,7 +54,7 @@ def _ensure_stdio() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
-def run_dashboard_server(*, log_level: str = "info") -> bool:
+def run_dashboard_server(*, log_level: str = "info", on_registered: Callable[[], None] | None = None) -> bool:
     """Run Uvicorn and report whether the supervisor should restart it.
 
     ``restart_control.request_restart`` flips ``Server.should_exit`` only after
@@ -77,6 +78,8 @@ def run_dashboard_server(*, log_level: str = "info") -> bool:
     server = uvicorn.Server(config)
     restart_control.register_server(server)
     try:
+        if on_registered is not None:
+            on_registered()
         server.run()
     finally:
         restart_requested = restart_control.finish_server(server)

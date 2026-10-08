@@ -18,6 +18,7 @@ datas = [
     # 生产前端：仅 dist + favicon（勿打包 frontend/node_modules 或 backup）
     (str(root / "web" / "static" / "dist"), "web/static/dist"),
     (str(root / "web" / "static" / "favicon.svg"), "web/static"),
+    (str(root / "packaging" / "assets" / "app-icon.png"), "packaging/assets"),
     (str(root / "config" / "cookies.txt.example"), "config"),
     (str(root / "config" / "llm.env.example"), "config"),
     (str(root / "config" / "sources.yaml"), "config"),
@@ -50,6 +51,8 @@ hiddenimports = [
     "qrcode",
     "PIL",
     "PIL.Image",
+    "pystray",
+    "pystray._win32",
     "multipart",
     "email_validator",
     "web.app",

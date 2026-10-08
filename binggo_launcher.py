@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import hashlib
+import logging
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import webbrowser
@@ -275,19 +277,52 @@ def _server_process_args() -> list[str]:
 
 def _spawn_server_process() -> subprocess.Popen[bytes]:
     from src.app_paths import bundle_root
+    from src.tray_shutdown import TRAY_CONTROL_ENV
 
     env = os.environ.copy()
     env[RESTART_SUPERVISED_ENV] = "1"
+    env[TRAY_CONTROL_ENV] = "1"
     if RUNTIME_PROFILE_ID:
         from src.runtime_instances import RUNTIME_INSTANCE_ENV, RUNTIME_PORT_ENV, RUNTIME_PROFILE_ENV
 
         env[RUNTIME_PROFILE_ENV] = RUNTIME_PROFILE_ID
         env[RUNTIME_PORT_ENV] = str(DASHBOARD_PORT)
         env[RUNTIME_INSTANCE_ENV] = INSTANCE_ID
-    kwargs: dict = {"cwd": str(bundle_root()), "env": env}
+    kwargs: dict = {"cwd": str(bundle_root()), "env": env, "stdin": subprocess.PIPE}
     if sys.platform == "win32" and (bool(getattr(sys, "frozen", False)) or not OPEN_BROWSER):
         kwargs["creationflags"] = CREATE_NO_WINDOW
     return subprocess.Popen(_server_process_args(), **kwargs)
+
+
+def _open_current_ui(*, new_window: bool = True) -> None:
+    """Use this supervisor's frozen runtime identity, never active_profile.json."""
+    try:
+        if RUNTIME_PROFILE_ID:
+            from src.runtime_instances import get_runtime_instance
+
+            current = get_runtime_instance(RUNTIME_PROFILE_ID)
+            if not current or not current["ready"] or current["instance_id"] != INSTANCE_ID or current["port"] != DASHBOARD_PORT:
+                _show_error("当前账号服务尚未就绪，稍后请从托盘重试打开界面。")
+                return
+        opened = webbrowser.open(DASHBOARD_URL, new=1) if new_window else webbrowser.open(DASHBOARD_URL)
+        if not opened:
+            logging.getLogger(__name__).warning("默认浏览器未能打开；可从托盘重试")
+    except Exception as exc:
+        logging.getLogger(__name__).warning("默认浏览器未能打开；可从托盘重试：%s", exc)
+
+
+def _request_tray_exit(proc: subprocess.Popen[bytes], requested: threading.Event) -> None:
+    if requested.is_set() or proc.poll() is not None:
+        return
+    requested.set()
+    try:
+        if proc.stdin is None:
+            raise OSError("服务退出通道不可用")
+        proc.stdin.write(b"shutdown\n")
+        proc.stdin.flush()
+    except (OSError, ValueError) as exc:
+        requested.clear()
+        _show_error(f"无法向当前账号发送安全退出请求：{exc}")
 
 
 def _stop_process(proc: subprocess.Popen[bytes]) -> int | None:
@@ -367,16 +402,37 @@ def _supervise_server(*, log_path: Path, data_root: Path) -> int:
                 _stop_process(proc)
                 raise
 
-        if not browser_opened:
-            webbrowser.open(DASHBOARD_URL)
-            browser_opened = True
-
+        tray = None
+        exit_requested = threading.Event()
         try:
+            if sys.platform == "win32" and getattr(proc, "stdin", None) is not None:
+                try:
+                    from src.windows_tray import WindowsTray
+
+                    tray = WindowsTray(
+                        RUNTIME_PROFILE_ID, INSTANCE_ID, _open_current_ui,
+                        lambda: _request_tray_exit(proc, exit_requested),
+                    )
+                    tray.start()
+                except Exception:
+                    logging.getLogger(__name__).exception("Windows 托盘不可用；Dashboard 继续运行")
+            if not browser_opened:
+                _open_current_ui(new_window=False)
+                browser_opened = True
             # 父 supervisor 必须明确等待当前 --serve 子进程结束；只有
             # Ctrl+C 会中断这次等待，不能在浏览器打开后自行返回。
             exit_code = proc.wait()
         except KeyboardInterrupt:
             _finish_process_after_interrupt(proc)
+            return 0
+        finally:
+            if tray is not None:
+                tray.stop()
+
+        # A concurrent Profile switch may already have committed exit code 75
+        # before the tray command arrives. Preserve that existing transition;
+        # only a normal child exit confirms the tray shutdown won.
+        if exit_requested.is_set() and exit_code != RESTART_EXIT_CODE:
             return 0
 
         if exit_code != RESTART_EXIT_CODE:
@@ -432,7 +488,9 @@ def run_server_mode() -> int:
         setup_logging(console=False)
         logger = get_logger("launcher")
         logger.info("Binggo 服务进程启动，监听 %s", get_dashboard_url())
-        restart_requested = run_dashboard_server()
+        from src.tray_shutdown import start_shutdown_listener
+
+        restart_requested = run_dashboard_server(on_registered=start_shutdown_listener)
         return RESTART_EXIT_CODE if restart_requested else 0
     except (OSError, RuntimeError) as exc:
         _show_error(str(exc))

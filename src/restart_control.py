@@ -86,6 +86,22 @@ class RestartControl:
             self._server.should_exit = True
             return True
 
+    def begin_shutdown(self) -> bool:
+        """Close the new-work gate before stopping this service's scheduler/jobs."""
+        with self._gate:
+            if self._restart_pending or self._server is None:
+                return False
+            self._restart_pending = True
+            return True
+
+    def request_shutdown(self) -> bool:
+        """Gracefully stop Uvicorn without the supervisor restart exit code."""
+        with self._gate:
+            if not self._restart_pending or self._server is None:
+                return False
+            self._server.should_exit = True
+            return True
+
     def finish_server(self, server: _ExitAwareServer) -> bool:
         """Unregister ``server`` and report whether its supervisor should respawn it."""
 
