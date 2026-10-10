@@ -141,6 +141,25 @@ def load_comment_breaker() -> dict[str, Any]:
         return state
 
 
+def probe_comment_guard_evidence() -> tuple[set[str], dict[str, str]]:
+    """Old probes had no UID guard: keep their uncertainty Profile-wide.
+
+    New probes are explicitly tied to a durable UID-scoped guard. Never infer
+    the owner of an old exclusion from today's login or erase it on recovery.
+    Caller may already hold the mutation gate (do not reacquire its OS lock).
+    """
+    with _thread_lock, user_data_lock():
+        state = _state_with_defaults(_read_state_unlocked())
+        guarded = state.get("guarded_probe_dynamic_ids") or {}
+        if not isinstance(guarded, dict):
+            guarded = {}
+        owners = {
+            str(target): str(uid) for target, uid in guarded.items()
+            if str(uid).isascii() and str(uid).isdigit() and int(str(uid)) > 0
+        }
+        return set(state[PROBE_EXCLUDED_DYNAMIC_IDS_KEY]) - set(owners), owners
+
+
 def is_comment_breaker_active() -> bool:
     return bool(load_comment_breaker().get("active"))
 
@@ -208,7 +227,8 @@ def _trigger_comment_limit_unlocked(
         "last_probe_at": current.get("last_probe_at"),
         "last_probe_result": current.get("last_probe_result"),
         "last_probe_dynamic_id": current.get("last_probe_dynamic_id"),
-        PROBE_EXCLUDED_DYNAMIC_IDS_KEY: [] if not already_active else list(current.get(PROBE_EXCLUDED_DYNAMIC_IDS_KEY) or []),
+        PROBE_EXCLUDED_DYNAMIC_IDS_KEY: list(current.get(PROBE_EXCLUDED_DYNAMIC_IDS_KEY) or []),
+        "guarded_probe_dynamic_ids": dict(current.get("guarded_probe_dynamic_ids") or {}),
     }
     with user_data_lock():
         _write_state_unlocked(state)
@@ -230,7 +250,8 @@ def clear_comment_breaker() -> dict[str, Any]:
                 "last_probe_at": current.get("last_probe_at"),
                 "last_probe_result": current.get("last_probe_result"),
                 "last_probe_dynamic_id": current.get("last_probe_dynamic_id"),
-                PROBE_EXCLUDED_DYNAMIC_IDS_KEY: [],
+                PROBE_EXCLUDED_DYNAMIC_IDS_KEY: list(current.get(PROBE_EXCLUDED_DYNAMIC_IDS_KEY) or []),
+                "guarded_probe_dynamic_ids": dict(current.get("guarded_probe_dynamic_ids") or {}),
             }
             _write_state_unlocked(state)
     return dict(state)
@@ -286,6 +307,7 @@ def record_comment_probe_result(
     *,
     now: int | None = None,
     last_seen: bool = False,
+    uid: int | str | None = None,
 ) -> dict[str, Any]:
     """Persist one probe result and schedule the next 12014 recovery probe."""
     stamp = int(time.time() if now is None else now)
@@ -295,6 +317,15 @@ def record_comment_probe_result(
             state["last_probe_result"] = str(result)
             if str(result) in {"unknown", "inconclusive"}:
                 _exclude_probe_dynamic(state, state.get("last_probe_dynamic_id"))
+                # Only actual UID-owned durable records justify treating an
+                # exclusion as a modern probe; a caller-provided UID alone is
+                # not ownership evidence for legacy unknowns.
+                from src.comment_confirmation import _read_state_unlocked as read_guards
+
+                target = str(state.get("last_probe_dynamic_id") or "")
+                record = read_guards()["guards"].get(str(uid), {}).get(target, {})
+                if record.get("status") in {"pending", "unknown", "confirmed", "failed"}:
+                    state.setdefault("guarded_probe_dynamic_ids", {})[target] = str(uid)
             if str(result) == "12014":
                 # Every next probe is relative to the last real probe, never
                 # to the original breaker trigger or a nominal probe count.

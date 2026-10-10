@@ -13,24 +13,24 @@ if str(ROOT) not in sys.path:
 
 from src.bilibili_client import BilibiliClient
 from src.sources.common import load_previous_output, normalize_activity_id
-from src.state_store import DATA_DIR
+from src import app_paths
+from src.platform_risk import risk_code_of
+from src.user_data_io import atomic_write_json
 from src.watch_feed import SPACE_FEED_URL, extract_forward_orig_id
 
-CANDIDATES_PATH = ROOT / "config" / "watch_users_candidates.json"
 REACTION_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail/reaction"
 STAT_URL = "https://api.bilibili.com/x/relation/stat"
 MIN_FOLLOWING = 1000
 TARGET_COUNT = 30
 
-SOURCE_FILES = tuple(
-    DATA_DIR / "output" / f"ds{i}_latest.json" for i in range(1, 7)
-)
+def candidates_path() -> Path:
+    return app_paths.config_dir() / "watch_users_candidates.json"
 
 
 def collect_lottery_ids(limit: int = 50) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
-    for path in SOURCE_FILES:
+    for path in (app_paths.data_dir() / "output" / f"ds{i}_latest.json" for i in range(1, 7)):
         payload = load_previous_output(path) or {}
         for url in payload.get("activity_links") or []:
             dynamic_id = normalize_activity_id(str(url))
@@ -104,7 +104,9 @@ def forward_ratio(client: BilibiliClient, mid: int) -> float:
             wbi=True,
             retries=2,
         )
-    except Exception:
+    except Exception as exc:
+        if risk_code_of(exc) is not None:
+            raise
         return 0.0
     items = (data.get("data") or {}).get("items") or []
     sample = items[:25]
@@ -125,7 +127,8 @@ def main() -> int:
 
 
 def _main_impl() -> int:
-    payload = json.loads(CANDIDATES_PATH.read_text(encoding="utf-8"))
+    path = candidates_path()
+    payload = json.loads(path.read_text(encoding="utf-8"))
     existing = payload.get("users") or []
     existing_mids = {int(u["mid"]) for u in existing}
     need = TARGET_COUNT - len(existing)
@@ -143,6 +146,8 @@ def _main_impl() -> int:
             try:
                 users = fetch_forward_users(client, dynamic_id, max_pages=4)
             except Exception as exc:
+                if risk_code_of(exc) is not None:
+                    raise
                 print(f"[{index}] skip {dynamic_id}: {exc}", flush=True)
                 time.sleep(0.5)
                 continue
@@ -195,8 +200,8 @@ def _main_impl() -> int:
     payload["filter"] = f"following >= {MIN_FOLLOWING}"
     payload["replenished_at"] = int(time.time())
     payload["replenished_users"] = added
-    CANDIDATES_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"完成：共 {len(payload['users'])} 人 → {CANDIDATES_PATH}", flush=True)
+    atomic_write_json(path, payload)
+    print(f"完成：共 {len(payload['users'])} 人 → {path}", flush=True)
     return 0
 
 

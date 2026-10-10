@@ -612,7 +612,15 @@ def main() -> int:
     parser.add_argument("--port", type=int)
     parser.add_argument("--instance-id")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--init-profile-db", help=argparse.SUPPRESS)
     args = parser.parse_args([value for value in sys.argv[1:] if value != SERVE_FLAG])
+
+    if args.init_profile_db is not None:
+        if args.profile or args.port is not None or args.instance_id or args.no_browser or SERVE_FLAG in sys.argv:
+            parser.error("Profile DB 初始化不可与运行参数混用")
+        from src.profile_db_init import main as initialize_profile_db
+
+        return initialize_profile_db(args.init_profile_db)
 
     try:
         if bool(getattr(sys, "frozen", False)):

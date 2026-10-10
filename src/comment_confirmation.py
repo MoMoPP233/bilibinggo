@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.bilibili_auth import get_login_uid
-from src.comment_breaker import comment_mutation_gate
+from src.comment_breaker import comment_mutation_gate, probe_comment_guard_evidence
 from src.data_paths import get_profile_dir
 from src.sources.common import normalize_activity_id
 from src.user_data_io import atomic_write_json
@@ -69,6 +69,13 @@ def _statuses_unlocked(uid: str | int | None) -> dict[str, str]:
     owner = _uid_key(uid)
     records = state["guards"].get(owner, {}) if owner else {}
     statuses = {key: record["status"] for key, record in records.items()}
+    legacy, probe_owners = probe_comment_guard_evidence()
+    for key in legacy:
+        if statuses.get(key) != "confirmed":
+            statuses[key] = "unknown"
+    for key, probe_owner in probe_owners.items():
+        if probe_owner == owner and key not in statuses:
+            statuses[key] = "unknown"
     # V1 had no UID. By explicit compatibility policy its positive evidence
     # remains Profile-wide; do not guess ownership or manufacture unknowns
     # from old logs. All new records are stored only in UID-scoped guards.

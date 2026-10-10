@@ -24,6 +24,9 @@ from src.lottery_api import reset_detail_api_state
 from src.lottery_classifier import PARTICIPATABLE_TYPES, LotteryType, is_charging_lottery_activity
 from src.participation_store import load_participations
 from src.status_refresh import refresh_local_activity_statuses
+from src import app_paths
+from src.platform_risk import risk_code_of
+from src.user_data_io import atomic_write_json
 
 
 def list_all_enrichable_tasks() -> list[tuple[str, LotteryType]]:
@@ -83,6 +86,17 @@ def _main_impl() -> int:
             print(f"[{index}/{len(tasks)}] 已删除 {dynamic_id}", file=sys.stderr, flush=True)
             continue
         except Exception as exc:
+            if risk_code_of(exc) is not None:
+                if newly_enriched:
+                    try:
+                        save_enriched(_build_result(
+                            _all_enriched_activities(existing_by_id=existing_by_id, newly_enriched=newly_enriched, participations=participations),
+                            enriched_at=enriched_at, new_count=ok, complete=False,
+                            new_enriched_ids=sorted(newly_enriched),
+                        ))
+                    except Exception as storage_exc:
+                        raise exc from storage_exc
+                raise
             failed.append(
                 {
                     "dynamic_id": dynamic_id,
@@ -123,8 +137,8 @@ def _main_impl() -> int:
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failed:
-        fail_path = ROOT / "data" / "output" / "rebuild_all_failures.json"
-        fail_path.write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding="utf-8")
+        fail_path = app_paths.data_dir() / "output" / "rebuild_all_failures.json"
+        atomic_write_json(fail_path, failed)
         print(f"失败明细已写入: {fail_path}", file=sys.stderr)
     return 0 if len(failed) == 0 else 1
 

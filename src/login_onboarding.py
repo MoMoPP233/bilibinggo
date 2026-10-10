@@ -15,10 +15,12 @@
 """
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -172,29 +174,34 @@ def _init_profile_db(profile_dir: Path) -> None:
     """在独立子进程中为指定 Profile 目录初始化 DB（不触碰当前 runtime 引擎/状态）。"""
     root = Path(__file__).resolve().parents[1]
     db_file = (profile_dir / "binggo.db").resolve()
-    code = (
-        "import sys; sys.path.insert(0, r'%s')\n"
-        "from pathlib import Path\n"
-        "from src.db import engine as eng\n"
-        "eng.db_path = lambda: Path(r'%s')\n"
-        "from src.db import schema as schema_mod\n"
-        "schema_mod.init_db()\n"
-    ) % (str(root), str(db_file))
+    frozen = bool(getattr(sys, "frozen", False))
+    command = ([sys.executable, "--init-profile-db", str(profile_dir.resolve())]
+               if frozen else [sys.executable, "-m", "src.profile_db_init", str(profile_dir.resolve())])
     env = dict(os.environ)
     env.pop("BINGGO_HOME", None)
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(root),
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, env=env,
+            cwd=str(Path(sys.executable).parent if frozen else root), timeout=120,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if frozen and os.name == "nt" else {}),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OnboardingError("profile_init_failed", "新 Profile 数据库初始化子进程失败") from exc
     if result.returncode != 0:
         raise OnboardingError(
             "profile_init_failed",
             f"新 Profile 数据库初始化失败（{result.stderr.strip()[-200:] or '未知错误'}）",
         )
+    # An exit code is not proof of a usable database (especially after a
+    # mismatched packaged entry). Verify before the atomic Profile publish.
+    from src.db.schema import SCHEMA_VERSION
+    try:
+        with closing(sqlite3.connect(f"{db_file.as_uri()}?mode=ro", uri=True)) as connection:
+            version = connection.execute("SELECT version FROM schema_meta WHERE id=1").fetchone()
+            if version != (SCHEMA_VERSION,):
+                raise ValueError("数据库版本不符")
+    except (sqlite3.Error, ValueError) as exc:
+        raise OnboardingError("profile_init_failed", "新 Profile 数据库校验失败，未发布账号") from exc
 
 
 def _publish_new_profile(*, uid: str, nickname: str, cookie_str: str, attempt_id: str) -> str:

@@ -1,4 +1,4 @@
-"""从活动转发列表中发现常参与抽奖的用户，写入 config/watch_users.json。"""
+"""从活动转发列表中发现常参与抽奖的用户，导出当前 Profile 的 watch_users.json。"""
 
 from __future__ import annotations
 
@@ -15,19 +15,13 @@ if str(ROOT) not in sys.path:
 
 from src.bilibili_client import BilibiliClient
 from src.sources.common import load_previous_output, normalize_activity_id
-from src.state_store import DATA_DIR
+from src import app_paths
+from src.platform_risk import risk_code_of
+from src.user_data_io import atomic_write_json
 from src.watch_feed import SPACE_FEED_URL, extract_forward_orig_id
 
-WATCH_USERS_PATH = ROOT / "config" / "watch_users.json"
 REACTION_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail/reaction"
 
-LOTTERY_SOURCE_FILES = (
-    DATA_DIR / "output" / "ds2_latest.json",
-    DATA_DIR / "output" / "ds3_latest.json",
-    DATA_DIR / "output" / "ds5_latest.json",
-    DATA_DIR / "output" / "ds6_latest.json",
-    DATA_DIR / "output" / "ds7_latest.json",
-)
 
 DEFAULT_LIMIT = 30
 DEFAULT_LOTTERY_LIMIT = 35
@@ -38,7 +32,7 @@ FORWARD_RATIO_SAMPLE = 25
 def collect_lottery_dynamic_ids(*, lottery_limit: int) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
-    for path in LOTTERY_SOURCE_FILES:
+    for path in (app_paths.data_dir() / "output" / f"ds{i}_latest.json" for i in (2, 3, 5, 6, 7)):
         payload = load_previous_output(path) or {}
         for url in payload.get("activity_links") or []:
             dynamic_id = normalize_activity_id(str(url))
@@ -105,7 +99,9 @@ def measure_forward_ratio(client: BilibiliClient, mid: int) -> float:
             referer=referer,
             wbi=True,
         )
-    except Exception:
+    except Exception as exc:
+        if risk_code_of(exc) is not None:
+            raise
         return 0.0
     items = (data.get("data") or {}).get("items") or []
     sample = items[:FORWARD_RATIO_SAMPLE]
@@ -169,21 +165,19 @@ def discover_watch_users(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="发现常参与抽奖的用户并写入 config/watch_users.json")
+    parser = argparse.ArgumentParser(description="发现常参与抽奖的用户并导出当前 Profile 的 watch_users.json")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="写入用户数量")
     parser.add_argument("--lottery-limit", type=int, default=DEFAULT_LOTTERY_LIMIT, help="扫描活动动态数量上限")
     parser.add_argument("--reaction-pages", type=int, default=DEFAULT_REACTION_PAGES, help="每个活动抓取的转发列表页数")
-    parser.add_argument("--output", type=Path, default=WATCH_USERS_PATH, help="输出 JSON 路径")
+    parser.add_argument("--output", type=Path, default=None, help="输出 JSON 路径（默认当前 Profile）")
     args = parser.parse_args()
 
     payload = discover_watch_users(
-        limit=args.limit,
-        lottery_limit=args.lottery_limit,
-        reaction_pages=args.reaction_pages,
+        limit=args.limit, lottery_limit=args.lottery_limit, reaction_pages=args.reaction_pages,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已写入 {len(payload['users'])} 个用户 → {args.output}")
+    path = args.output if args.output is not None else app_paths.config_dir() / "watch_users.json"
+    atomic_write_json(path, payload)
+    print(f"已写入 {len(payload['users'])} 个用户 → {path}")
     return 0
 
 

@@ -750,8 +750,8 @@ class WinnerScanService:
         """Resolve one newly discovered DM sender without fan-out.
 
         Cache hits are local-only. A UID is attempted at most once per scan; a
-        platform-risk response disables all subsequent nickname lookups while
-        leaving the winner candidate on the UID fallback path.
+        ordinary lookup failure leaves the candidate on the UID fallback path;
+        formal risk must stop the entire scan, not just nickname enrichment.
         """
         if sender_uid <= 0 or blocked[0]:
             return ""
@@ -793,6 +793,7 @@ class WinnerScanService:
         except Exception as exc:  # noqa: BLE001 - enrichment must never drop a candidate
             if risk_code_of(exc) is not None:
                 blocked[0] = True
+                raise
             return ""
 
     # -- 单来源实现（各自独立成功/失败与推进） --
@@ -1144,6 +1145,7 @@ class WinnerScanService:
         *,
         state: dict[str, Any],
         existing: dict[str, dict[str, Any]],
+        notify: bool = True,
     ) -> tuple[int, list[str], int, dict[str, Any]]:
         """返回 (newly_saved, found_keys, auto_reply_skipped, pagination)。
 
@@ -1214,14 +1216,6 @@ class WinnerScanService:
                 event_id = f"winning_candidate:{key}"
                 sender_uid = int(session.talker_id)
                 sender_name = entry.talker_name or session.talker_name or _sender_name_from_raw(entry.raw)
-                if not sender_name:
-                    sender_name = self._lookup_nickname(
-                        client,
-                        sender_uid,
-                        cache=nickname_cache,
-                        attempted=nickname_attempted,
-                        blocked=nickname_lookup_blocked,
-                    )
                 existing[key] = {
                     "key": key,
                     "source_type": "dm",
@@ -1239,6 +1233,22 @@ class WinnerScanService:
                 }
                 newly_saved += 1
                 found_keys.append(key)
+                if not sender_name:
+                    try:
+                        existing[key]["sender"]["name"] = self._lookup_nickname(
+                            client, sender_uid, cache=nickname_cache,
+                            attempted=nickname_attempted, blocked=nickname_lookup_blocked,
+                        )
+                    except Exception as exc:
+                        if risk_code_of(exc) is not None:
+                            # Preserve the fact already discovered and its V84
+                            # preparation without sending notifications or
+                            # advancing the incomplete DM checkpoint.
+                            try:
+                                self._save_new_candidates(existing, found_keys, notify=notify)
+                            except Exception as storage_exc:
+                                raise exc from storage_exc
+                        raise
         if newly_filtered:
             merged: list[str] = []
             seen: set[str] = set()
@@ -1428,7 +1438,7 @@ class WinnerScanService:
                 raise RuntimeError("任务已取消")
             try:
                 saved, keys, auto_reply_skipped, dm_pagination = self._scan_dm_source(
-                    active_client, state=state, existing=existing
+                    active_client, state=state, existing=existing, notify=notify,
                 )
                 self._save_new_candidates(existing, keys, notify=notify)
                 self._dispatch_new(existing, keys, notify=notify)
@@ -1454,6 +1464,10 @@ class WinnerScanService:
                 }
             except Exception as exc:
                 if risk_code_of(exc) is not None:
+                    try:
+                        self._record_source_error(state, "dm", exc)
+                    except Exception as storage_exc:
+                        raise exc from storage_exc
                     raise
                 partial = True
                 self._record_source_error(state, "dm", exc)

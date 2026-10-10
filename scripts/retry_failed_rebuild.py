@@ -24,8 +24,13 @@ from src.lottery_api import reset_detail_api_state
 from src.lottery_classifier import LotteryType
 from src.participation_store import load_participations
 from src.status_refresh import refresh_local_activity_statuses
+from src import app_paths
+from src.platform_risk import risk_code_of
+from src.user_data_io import atomic_write_json
 
-FAILURE_PATH = ROOT / "data" / "output" / "rebuild_all_failures.json"
+
+def failure_path() -> Path:
+    return app_paths.data_dir() / "output" / "rebuild_all_failures.json"
 
 
 def main() -> int:
@@ -40,11 +45,12 @@ def main() -> int:
 
 
 def _main_impl() -> int:
-    if not FAILURE_PATH.exists():
+    path = failure_path()
+    if not path.exists():
         print(json.dumps({"ok": True, "message": "无失败记录", "total": 0}, ensure_ascii=False))
         return 0
 
-    failures = json.loads(FAILURE_PATH.read_text(encoding="utf-8"))
+    failures = json.loads(path.read_text(encoding="utf-8"))
     task_map = dict(list_all_enrichable_tasks())
     tasks: list[tuple[str, LotteryType]] = []
     for item in failures:
@@ -77,6 +83,17 @@ def _main_impl() -> int:
             existing_by_id.pop(dynamic_id, None)
             continue
         except Exception as exc:
+            if risk_code_of(exc) is not None:
+                if newly_enriched:
+                    try:
+                        save_enriched(_build_result(
+                            _all_enriched_activities(existing_by_id=existing_by_id, newly_enriched=newly_enriched, participations=participations),
+                            enriched_at=enriched_at, new_count=ok, complete=False,
+                            new_enriched_ids=sorted(newly_enriched),
+                        ))
+                    except Exception as storage_exc:
+                        raise exc from storage_exc
+                raise
             still_failed.append({"dynamic_id": dynamic_id, "lottery_type": lottery_type, "error": str(exc)})
             print(f"[{index}/{len(tasks)}] 仍失败 {dynamic_id}: {exc}", file=sys.stderr, flush=True)
             continue
@@ -102,9 +119,9 @@ def _main_impl() -> int:
     summary = {"ok": len(still_failed) == 0, "retried": len(tasks), "succeeded": ok, "failed": len(still_failed), "status_refresh": status}
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if still_failed:
-        FAILURE_PATH.write_text(json.dumps(still_failed, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, still_failed)
     else:
-        FAILURE_PATH.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
     return 0 if len(still_failed) == 0 else 1
 
 

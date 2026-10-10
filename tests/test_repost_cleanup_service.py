@@ -168,6 +168,10 @@ def test_manual_review_delete_requires_extra_confirmation(monkeypatch) -> None:
     )
     monkeypatch.setattr("src.repost_cleanup.claim_delete_pending", lambda *args, **kwargs: True)
     monkeypatch.setattr("src.repost_cleanup.mark_delete_result", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "src.repost_cleanup._assess_original",
+        lambda *args, **kwargs: CandidateAssessment("manual_review", "fresh manual review"),
+    )
 
     fake = _FakeClient()
     unconfirmed = delete_reposts([REPOST_ID], client_factory=lambda: fake)

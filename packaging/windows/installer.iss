@@ -29,8 +29,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#AppExeName}
 PrivilegesRequired=lowest
 AppMutex=Global\BilibiliBinggoDashboard
-CloseApplications=force
-RestartApplications=yes
+; Never let Restart Manager forcibly terminate multi-Profile mutations.
+CloseApplications=no
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -52,24 +53,41 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-function KillBinggoProcesses(): Boolean;
+function BinggoStopped(): Boolean;
 var
-  ResultCode: Integer;
+  Locator, Services, Processes: Variant;
 begin
-  { 结束主进程与 --serve 子进程，避免覆盖 Binggo.exe 时拒绝访问 (Win32 error 5) }
-  Exec('taskkill.exe', '/F /IM {#AppExeName} /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(800);
-  Result := True;
+  Result := False;
+  try
+    { Read-only process inventory: any installed/portable Binggo instance,
+      including a service without its supervisor, prevents replacement. }
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Services := Locator.ConnectServer('', 'root\CIMV2');
+    Processes := Services.ExecQuery('SELECT ProcessId FROM Win32_Process WHERE Name="{#AppExeName}"');
+    Result := Processes.Count = 0;
+  except
+    { Unknown process state is not permission to overwrite a running app. }
+    Log('Cannot verify Binggo process state: ' + GetExceptionMessage);
+  end;
 end;
 
 function InitializeSetup(): Boolean;
 begin
-  KillBinggoProcesses();
-  Result := True;
+  Result := BinggoStopped();
+  if not Result then
+    MsgBox('Binggo is still running, or its process state cannot be verified. Please safely exit EVERY account using its tray menu, then run Setup again. No account process will be forcibly stopped.', mbError, MB_OK);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  KillBinggoProcesses();
   Result := '';
+  if not BinggoStopped() then
+    Result := 'Please safely exit all Binggo accounts from their tray menus before installing. If process verification fails, installation is blocked to protect running tasks and databases.';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := BinggoStopped();
+  if not Result then
+    MsgBox('Please safely exit all Binggo accounts before uninstalling. No account process will be forcibly stopped.', mbError, MB_OK);
 end;

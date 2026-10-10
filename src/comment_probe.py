@@ -19,6 +19,7 @@ from src.comment_breaker import (
 from src.comment_confirmation import confirm_comment
 from src.lottery_actions import comment_dynamic_probe
 from src.participate_text import resolve_comment_rid_and_type, resolve_participate_text_for_activity
+from src.platform_risk import risk_code_of
 
 logger = get_logger("comment_probe")
 
@@ -69,11 +70,17 @@ def run_comment_recovery_probe(
                 uid=uid,
             )
         except Exception as exc:
+            if risk_code_of(exc) is not None:
+                try:
+                    record_comment_probe_result("unknown", now=now, uid=uid)
+                except Exception as storage_exc:
+                    raise exc from storage_exc
+                raise
             if _unknown_exception(exc):
-                record_comment_probe_result("unknown", now=now)
+                record_comment_probe_result("unknown", now=now, uid=uid)
                 logger.info("评论探测：结果未知，1小时后换一条再试")
                 return {"claimed": True, "result": "unknown", "dynamic_id": dynamic_id}
-            record_comment_probe_result("inconclusive", now=now)
+            record_comment_probe_result("inconclusive", now=now, uid=uid)
             logger.info("评论探测：本条无法判断，1小时后换一条再试")
             return {"claimed": True, "result": "inconclusive", "dynamic_id": dynamic_id}
 
@@ -89,6 +96,6 @@ def run_comment_recovery_probe(
             record_comment_probe_result("12014", now=now, last_seen=True)
             logger.info("评论探测：仍受限，1小时后再次探测")
             return {"claimed": True, "result": "12014", "dynamic_id": dynamic_id}
-        record_comment_probe_result("inconclusive", now=now)
+        record_comment_probe_result("inconclusive", now=now, uid=uid)
         logger.info("评论探测：本条无法判断，1小时后换一条再试")
         return {"claimed": True, "result": "inconclusive", "dynamic_id": dynamic_id}

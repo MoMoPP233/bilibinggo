@@ -994,27 +994,50 @@ def comment_dynamic_probe(
         _, current_uid = require_login()
         if uid is not None and str(uid) != str(current_uid):
             raise RuntimeError("评论期间登录账号发生变化，已停止操作")
-        status = _get_comment_status_unlocked(
-            dynamic_id or f"reply:{comment_type}:{rid}", uid=current_uid,
-        )
+        if not is_comment_breaker_active():
+            return ActionResult("comment", False, "恢复探测已取消")
+        target = dynamic_id or f"reply:{comment_type}:{rid}"
+        status = _get_comment_status_unlocked(target, uid=current_uid)
         if status == "confirmed":
             return ActionResult("comment", True, "已评论，跳过")
         if status in {"pending", "unknown"}:
             return ActionResult("comment", False, "评论结果未知，已阻止自动重试")
-        if not is_comment_breaker_active():
-            return ActionResult("comment", False, "恢复探测已取消")
-        payload = client.post_form(
-            COMMENT_URL,
-            {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
-            referer=referer,
-            raise_on_code=False,
-            retries=0,
-        )
-    code = _api_code(payload)
-    if code == 0:
-        return ActionResult("comment", True, message[:80])
-    if code == 12051:
-        return ActionResult("comment", True, "已有相同评论")
+        # Recovery is a real mutation, with the same durable barrier as an
+        # ordinary comment. A breaker claim alone is not a permanent guard.
+        _set_comment_status_unlocked(target, uid=current_uid, status="pending")
+        try:
+            payload = client.post_form(
+                COMMENT_URL,
+                {"oid": rid, "type": comment_type, "message": message, "csrf": csrf},
+                referer=referer,
+                raise_on_code=False,
+                retries=0,
+            )
+        except Exception as exc:
+            try:
+                _set_comment_status_unlocked(target, uid=current_uid, status="unknown")
+            except Exception:
+                logger.exception("评论探测状态写入失败，保留 pending 禁止重发")
+            _log_comment_post_exception(exc)
+            raise
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if type(code) is not int:
+            _set_comment_status_unlocked(target, uid=current_uid, status="unknown")
+            return ActionResult("comment", False, "评论探测结果未知：响应缺少有效 code")
+        if code in {0, 12051}:
+            _set_comment_status_unlocked(target, uid=current_uid, status="confirmed")
+            return ActionResult("comment", True, message[:80] if code == 0 else "已有相同评论")
+        rejected = code in {12014, 12078, -101, 401, -352, -509}
+        try:
+            _set_comment_status_unlocked(
+                target, uid=current_uid, status="failed" if rejected else "unknown",
+            )
+        except Exception:
+            # A terminal write failure must not replace a real formal/auth
+            # response with a local error. The existing pending still blocks.
+            _raise_payload_auth(payload, "评论")
+            _raise_payload_risk(payload, "评论")
+            raise
     _raise_payload_auth(payload, "评论")
     _raise_payload_risk(payload, "评论")
     return ActionResult("comment", False, f"code={code} {_api_message(payload)}".strip())

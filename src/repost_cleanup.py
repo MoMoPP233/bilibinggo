@@ -2635,7 +2635,7 @@ def delete_reposts(
                         raise ValueError(
                             "该候选为人工确认项，必须先确认已人工检查原动态且不再需要保留"
                         )
-                elif level == "safe":
+                if level in {"manual_review", "safe"}:
                     recheck = _assess_original(
                         client,
                         original_id=original_id,
@@ -2643,11 +2643,17 @@ def delete_reposts(
                         now_ts=int(time.time()),
                         activities_map=activities_map,
                     )
-                    if recheck.level != "safe":
+                    allowed = {"safe", "manual_review"} if level == "manual_review" else {"safe"}
+                    if recheck.level not in allowed:
                         raise ValueError(recheck.reason)
                 else:
                     raise ValueError("候选评估等级无效，禁止删除")
 
+                # Rechecks may involve remote reads: validate the frozen
+                # identity again at the mutation boundary, not just at entry.
+                csrf = _assert_frozen_runtime(
+                    profile_id=profile_id, database_path=database_path, uid=uid,
+                )
                 # 先持久化 pending；占用失败时绝不能发送删除请求。
                 if not claim_delete_pending(uid, repost_id, requested_at=int(time.time())):
                     raise ValueError("未能持久化 delete_pending，已禁止发送删除请求")
